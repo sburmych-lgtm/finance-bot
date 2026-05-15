@@ -27,11 +27,27 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
-DB_FILE = 'finance.db'
-SETTINGS_FILE = 'settings.json'
+DATA_DIR = os.environ.get('DATA_DIR', '.')
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_FILE = os.environ.get('DB_FILE', os.path.join(DATA_DIR, 'finance.db'))
+SETTINGS_FILE = os.environ.get('SETTINGS_FILE', os.path.join(DATA_DIR, 'settings.json'))
+ADMIN_IDS = {x.strip() for x in os.environ.get('ADMIN_IDS', '').split(',') if x.strip()}
 
 # Lock for database operations
 db_lock = asyncio.Lock()
+
+
+def is_admin(user_id) -> bool:
+    return str(user_id) in ADMIN_IDS
+
+
+async def has_access(user_id) -> bool:
+    """Зараз тримаємо бот у FREE-режимі для всіх. Інфраструктура для майбутнього paywall —
+    адмін без обмежень; пейволу нема, тому решта також пропускається. Коли увімкнемо
+    монетизацію — змінимо False default + перевірка expires_at."""
+    if is_admin(user_id):
+        return True
+    return True  # FREE for everyone until monetization is turned on
 
 # Exchange rate cache
 exchange_rates_cache = {
@@ -163,8 +179,73 @@ class Database:
             ON time_tracks(user_id, date)
         ''')
 
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id TEXT PRIMARY KEY,
+                plan TEXT NOT NULL DEFAULT 'free',
+                expires_at DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                language_code TEXT,
+                first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         self.conn.commit()
         logger.info("Database initialized successfully")
+
+    async def upsert_user(self, user):
+        if not user:
+            return
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT INTO users (user_id, username, first_name, last_name, language_code)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username=excluded.username,
+                    first_name=excluded.first_name,
+                    last_name=excluded.last_name,
+                    language_code=excluded.language_code,
+                    last_seen=CURRENT_TIMESTAMP
+            ''', (str(user.id), user.username, user.first_name, user.last_name, user.language_code))
+            self.conn.commit()
+
+    async def get_all_user_ids(self):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT user_id FROM users")
+            return [row[0] for row in cursor.fetchall()]
+
+    async def get_subscription(self, user_id):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT * FROM subscriptions WHERE user_id = ?", (str(user_id),))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    async def set_subscription(self, user_id, plan, expires_at=None):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT INTO subscriptions (user_id, plan, expires_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    plan=excluded.plan,
+                    expires_at=excluded.expires_at,
+                    updated_at=CURRENT_TIMESTAMP
+            ''', (str(user_id), plan, expires_at))
+            self.conn.commit()
 
     async def add_transaction(self, user_id, amount, currency, amount_uah, t_type,
                              category, description, date, timestamp):
@@ -833,6 +914,7 @@ def generate_text_chart(data_dict, total, title):
 # ========== COMMAND HANDLERS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
+    await db.upsert_user(update.effective_user)
     await update.message.reply_text(
         "👋 Привіт! Я бот для обліку фінансів та часу @Olesia_money_bot\n\n"
         "📝 Ви можете:\n"
@@ -871,7 +953,14 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Додавайте свої категорії часу\n"
         "• Видаляйте непотрібні\n"
         "• Змінюйте емодзі\n\n"
-        "💾 Всі дані зберігаються надійно в базі даних",
+        "💾 Всі дані зберігаються надійно в базі даних\n\n"
+        "🔒 **ПРИВАТНІСТЬ:**\n"
+        "• Дані кожного користувача ізольовані за Telegram ID\n"
+        "• БД зберігається на Railway (хмарний хостинг, Europe/Kyiv TZ)\n"
+        "• Power Olesia не має доступу до даних інших користувачів\n"
+        "• `/clear` (через меню) видаляє всі ваші дані без можливості відновлення\n"
+        "• Адміністратор отримує щодобовий зашифрований бекап БД\n"
+        "• Telegram бачить лише ваші повідомлення боту, не БД",
         reply_markup=get_main_keyboard(),
         parse_mode='Markdown'
     )
@@ -2188,19 +2277,119 @@ async def show_ai_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show admin statistics — only for ADMIN_IDS"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Команда доступна лише адміністратору.")
+        return
+    user_ids = await db.get_all_user_ids()
+    cursor = db.conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM transactions")
+    tx_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM time_tracks")
+    tt_count = cursor.fetchone()[0]
+    await update.message.reply_text(
+        f"📊 *Admin stats*\n\n"
+        f"👥 Users: {len(user_ids)}\n"
+        f"💸 Transactions: {tx_count}\n"
+        f"⏱️ Time tracks: {tt_count}\n"
+        f"📁 DB: `{DB_FILE}`\n"
+        f"🔑 Admins: {len(ADMIN_IDS)}",
+        parse_mode='Markdown'
+    )
+
+
+async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcast message to all users — admin only"""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Команда доступна лише адміністратору.")
+        return
+    full_text = update.message.text or ''
+    parts = full_text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "Використання: /broadcast <текст>\n"
+            "Приклад: /broadcast 🛠 Бот оновлено, доступні нові функції."
+        )
+        return
+    message_text = parts[1]
+    user_ids = await db.get_all_user_ids()
+    if not user_ids:
+        await update.message.reply_text("📭 Поки що немає користувачів у БД.")
+        return
+    sent, failed = 0, 0
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=message_text)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            failed += 1
+            logger.warning(f"broadcast failed for {uid}: {e}")
+    await update.message.reply_text(f"📣 Розсилка завершена. Надіслано: {sent}, помилок: {failed}.")
+
+
+async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Send finance.db to first admin chat once per day"""
+    if not ADMIN_IDS:
+        return
+    admin_id = sorted(ADMIN_IDS)[0]
+    try:
+        if not os.path.exists(DB_FILE):
+            return
+        ts = datetime.now(KYIV_TZ).strftime('%Y%m%d-%H%M')
+        with open(DB_FILE, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=int(admin_id),
+                document=f,
+                filename=f'finance-backup-{ts}.db',
+                caption=f'🗄 Daily DB backup ({ts} Kyiv)'
+            )
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, 'rb') as f:
+                await context.bot.send_document(
+                    chat_id=int(admin_id),
+                    document=f,
+                    filename=f'settings-backup-{ts}.json'
+                )
+        logger.info(f"daily backup sent to {admin_id}")
+    except Exception as e:
+        logger.warning(f"backup failed: {e}")
+
+
+async def post_init_notify(application: Application):
+    """Notify admins that bot has started"""
+    if not ADMIN_IDS:
+        return
+    for admin_id in ADMIN_IDS:
+        try:
+            await application.bot.send_message(
+                chat_id=int(admin_id),
+                text=f"✅ Бот запущено та працює.\n"
+                     f"📁 DB: `{DB_FILE}`\n"
+                     f"👥 Admins: {len(ADMIN_IDS)}",
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.warning(f"post_init notify failed for {admin_id}: {e}")
+
+
 def main():
     """Start the bot"""
+    import datetime as _dt
     TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '8304522900:AAE9C8QXWjwo1BJ0Xwg2Vt5tXMcS3MSpOlk')
 
     if TOKEN == '8304522900:AAE9C8QXWjwo1BJ0Xwg2Vt5tXMcS3MSpOlk':
         logger.warning("⚠️ Using hardcoded token!")
 
-    application = Application.builder().token(TOKEN).build()
+    application = Application.builder().token(TOKEN).post_init(post_init_notify).build()
 
     # Commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("info", show_info))
     application.add_handler(CommandHandler("settings", show_settings))
+    application.add_handler(CommandHandler("admin_stats", admin_stats))
+    application.add_handler(CommandHandler("broadcast", admin_broadcast))
 
     # Callbacks
     application.add_handler(CallbackQueryHandler(handle_callback))
@@ -2208,9 +2397,19 @@ def main():
     # Text messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
 
+    # Daily DB backup at 03:00 Kyiv time
+    if application.job_queue and ADMIN_IDS:
+        application.job_queue.run_daily(
+            daily_backup_job,
+            time=_dt.time(hour=3, minute=0, tzinfo=KYIV_TZ),
+            name='daily_backup'
+        )
+        logger.info("Daily backup scheduled at 03:00 Kyiv")
+
     logger.info("🤖 Бот @Olesia_money_bot запущено!")
     logger.info(f"📊 Database: {DB_FILE}")
     logger.info(f"⚙️ Settings: {SETTINGS_FILE}")
+    logger.info(f"🔑 Admin IDs: {len(ADMIN_IDS)} configured")
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
