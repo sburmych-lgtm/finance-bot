@@ -264,9 +264,26 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📣 Розсилка завершена. Надіслано: {sent}, помилок: {failed}.")
 
 
+CYRILLIC_COMMAND_ROUTES = {}  # filled in main() to avoid forward refs
+
+
+async def cyrillic_command_dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or '').strip()
+    parts = text.split()
+    cmd = parts[0].lower() if parts else ''
+    handler = CYRILLIC_COMMAND_ROUTES.get(cmd)
+    if not handler:
+        return
+    context.args = parts[1:]
+    await handler(update, context)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    text = update.message.text
+    text = update.message.text or ''
+
+    if text.startswith('/'):
+        return
 
     transaction = parse_transaction(text)
 
@@ -329,17 +346,22 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("balance", balance))
-    application.add_handler(CommandHandler("баланс", balance))
     application.add_handler(CommandHandler("history", history))
-    application.add_handler(CommandHandler("історія", history))
     application.add_handler(CommandHandler("report", report))
-    application.add_handler(CommandHandler("звіт", report))
     application.add_handler(CommandHandler("clear", clear_data))
-    application.add_handler(CommandHandler("очистити", clear_data))
     application.add_handler(CommandHandler("help", start))
-    application.add_handler(CommandHandler("допомога", start))
     application.add_handler(CommandHandler("myid", my_id))
     application.add_handler(CommandHandler("broadcast", broadcast))
+
+    CYRILLIC_COMMAND_ROUTES.update({
+        '/баланс': balance,
+        '/історія': history,
+        '/звіт': report,
+        '/очистити': clear_data,
+        '/допомога': start,
+    })
+    cyrillic_pattern = r'^/(баланс|історія|звіт|очистити|допомога)(\s|$)'
+    application.add_handler(MessageHandler(filters.Regex(cyrillic_pattern), cyrillic_command_dispatch))
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
