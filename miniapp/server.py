@@ -58,10 +58,10 @@ def build_app() -> web.Application:
     app.router.add_get('/', index)
     app.router.add_get('/index.html', index)
     app.router.add_get('/health', health)
-    # Static assets — css/, js/, assets/
-    app.router.add_static('/css/', os.path.join(ROOT, 'css'), show_index=False)
-    app.router.add_static('/js/',  os.path.join(ROOT, 'js'),  show_index=False)
-    app.router.add_static('/assets/', os.path.join(ROOT, 'assets'), show_index=False)
+    for url, dirname in (('/css/', 'css'), ('/js/', 'js'), ('/assets/', 'assets')):
+        full = os.path.join(ROOT, dirname)
+        if os.path.isdir(full):
+            app.router.add_static(url, full, show_index=False)
     return app
 
 
