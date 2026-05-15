@@ -1,6 +1,10 @@
 .env
 *.env
 transactions.json
+finance.db
+*.db
+settings.json
+users.json
 __pycache__/
 *.pyc
 .venv/
