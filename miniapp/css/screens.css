@@ -1,0 +1,97 @@
+/* Ruby Finance — screen-specific tweaks */
+
+.empty-state {
+  text-align: center;
+  padding: var(--sp-8) var(--sp-4);
+  color: var(--ruby-muted);
+}
+.empty-state .icon {
+  width: 64px; height: 64px;
+  display: grid; place-items: center;
+  margin: 0 auto var(--sp-4);
+  border-radius: 50%;
+  background: rgba(216,181,109,.08);
+  border: 1px solid var(--ruby-line);
+  color: var(--ruby-gold);
+  font-family: var(--font-display);
+  font-size: 28px;
+  font-weight: 700;
+}
+.empty-state h3 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--fs-20);
+  color: var(--ruby-ivory);
+  font-weight: 700;
+  letter-spacing: var(--tracking-tight);
+}
+.empty-state p {
+  margin: var(--sp-2) 0 var(--sp-4);
+  font-size: var(--fs-13);
+  color: var(--ruby-muted);
+}
+
+/* Add screen */
+.add-amount-panel {
+  padding: var(--sp-5);
+  border-radius: var(--r-2xl);
+  background: rgba(255,255,255,.038);
+  border: 1px solid var(--ruby-line-soft);
+  margin-bottom: var(--sp-3);
+}
+.amount-display {
+  text-align: center;
+  font-family: var(--font-display);
+  font-size: 56px;
+  font-weight: 700;
+  letter-spacing: var(--tracking-hero);
+  color: var(--ruby-ivory);
+  line-height: 1;
+  padding: var(--sp-4) 0;
+}
+.amount-display .currency {
+  font-size: 24px;
+  color: var(--ruby-gold);
+  margin-left: 6px;
+  font-weight: 600;
+}
+.amount-display.dim { color: var(--ruby-dim); }
+
+.kind-pills {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+.kind-pill {
+  padding: 14px 12px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--ruby-line-soft);
+  background: rgba(255,255,255,.04);
+  color: var(--ruby-muted);
+  font-size: var(--fs-13);
+  font-weight: 800;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+  transition: all var(--t-fast) var(--ease-out);
+}
+.kind-pill.active.expense {
+  color: var(--ruby-ivory);
+  background: linear-gradient(135deg, var(--ruby-burgundy), var(--ruby-primary));
+  border-color: rgba(216,181,109,.36);
+  box-shadow: var(--shadow-crimson);
+}
+.kind-pill.active.income {
+  color: var(--ruby-ivory);
+  background: linear-gradient(135deg, #1a4a26, #2b6b3d);
+  border-color: rgba(216,181,109,.36);
+}
+
+/* Reports */
+.report-row { display: flex; gap: var(--sp-4); align-items: center; padding: var(--sp-2) 0; }
+.report-row .donut { flex: 0 0 auto; }
+.report-row .legend { flex: 1; }
+
+/* Settings list */
+.setting-section { margin-top: var(--sp-6); }
+.setting-section .section-title { padding-left: var(--sp-1); }

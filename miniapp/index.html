@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="uk" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
+  <meta name="theme-color" content="#0A0608" />
+  <title>Ruby Finance</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Inter:wght@500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./css/tokens.css" />
+  <link rel="stylesheet" href="./css/components.css" />
+  <link rel="stylesheet" href="./css/screens.css" />
+</head>
+<body>
+  <main id="root">
+    <header class="app-header">
+      <div class="brand">
+        <div class="monogram" aria-hidden="true">R</div>
+        <div class="wordmark">
+          <div class="eyebrow">Ruby Finance</div>
+          <div class="screen-title" id="screenTitle">Огляд</div>
+        </div>
+      </div>
+      <button class="ghost-btn" id="themeToggle" aria-label="Перемкнути тему">☾</button>
+    </header>
+
+    <div class="content">
+      <!-- Screens are rendered into these containers by JS -->
+      <section class="screen active" data-screen="home" id="screen-home">
+        <div class="balance-card">
+          <div class="balance-label">Баланс цього місяця</div>
+          <div class="balance-value sk" style="height:44px; width:60%;">&nbsp;</div>
+          <div class="balance-sub sk" style="height:16px; width:40%; margin-top:8px;">&nbsp;</div>
+          <div class="metric-row">
+            <div class="metric"><span>Доходи</span><strong class="sk" style="height:20px;">&nbsp;</strong></div>
+            <div class="metric"><span>Витрати</span><strong class="sk" style="height:20px;">&nbsp;</strong></div>
+          </div>
+        </div>
+        <div class="quick-actions">
+          <button class="quick-action" data-go="add" data-kind="expense">
+            <span class="icon">−</span><span class="label">Витрата</span><span class="sub">додати</span>
+          </button>
+          <button class="quick-action" data-go="add" data-kind="income">
+            <span class="icon">+</span><span class="label">Дохід</span><span class="sub">додати</span>
+          </button>
+          <button class="quick-action" data-go="reports">
+            <span class="icon">R</span><span class="label">Звіт</span><span class="sub">за місяць</span>
+          </button>
+        </div>
+        <div class="section-head">
+          <div class="section-title">Останні операції</div>
+          <button class="section-link" data-go="history">Усі →</button>
+        </div>
+        <div class="row-list" id="recent-list"></div>
+      </section>
+
+      <section class="screen" data-screen="add"     id="screen-add"></section>
+      <section class="screen" data-screen="reports" id="screen-reports"></section>
+      <section class="screen" data-screen="history" id="screen-history"></section>
+      <section class="screen" data-screen="settings" id="screen-settings"></section>
+    </div>
+
+    <nav class="bottom-nav" role="navigation" aria-label="Головна навігація">
+      <button class="nav-item active" data-nav="home">
+        <span class="nav-icon">⌂</span>Огляд
+      </button>
+      <button class="nav-item" data-nav="add">
+        <span class="nav-icon">+</span>Додати
+      </button>
+      <button class="nav-item" data-nav="reports">
+        <span class="nav-icon">▦</span>Звіти
+      </button>
+      <button class="nav-item" data-nav="history">
+        <span class="nav-icon">≡</span>Історія
+      </button>
+      <button class="nav-item" data-nav="settings">
+        <span class="nav-icon">⚙</span>Меню
+      </button>
+    </nav>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </main>
+
+  <script>
+    // API base — runtime-injected by server (or fall back to same origin)
+    window.__RUBY_API_BASE__ = window.__RUBY_API_BASE__ || '';
+    // Theme toggle (Telegram drives colors via CSS vars; this is a local override)
+    document.getElementById('themeToggle').addEventListener('click', () => {
+      const root = document.documentElement;
+      const cur = root.dataset.theme === 'light' ? 'light' : 'dark';
+      const next = cur === 'dark' ? 'light' : 'dark';
+      root.dataset.theme = next;
+      document.getElementById('themeToggle').textContent = next === 'dark' ? '☾' : '☀';
+      if (window.Telegram?.WebApp?.HapticFeedback) {
+        try { window.Telegram.WebApp.HapticFeedback.selectionChanged(); } catch (_) {}
+      }
+    });
+  </script>
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>

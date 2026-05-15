@@ -1,0 +1,524 @@
+/* Ruby Finance — Base components */
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; padding: 0; min-height: 100%; }
+body {
+  background: var(--tg-bg);
+  color: var(--tg-text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-15);
+  line-height: var(--lh-base);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  padding-top: var(--safe-top);
+  padding-bottom: calc(var(--nav-h) + var(--safe-bottom) + var(--sp-4));
+  overscroll-behavior-y: contain;
+}
+
+/* Ambient background — radial crimson glow, gold corner */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(circle at 20% 0%,  rgba(155, 27, 48, 0.32), transparent 32%),
+    radial-gradient(circle at 85% 12%, rgba(216, 181, 109, 0.12), transparent 26%),
+    radial-gradient(circle at 50% 100%, rgba(110, 15, 31, 0.32), transparent 38%);
+}
+
+#root, main { position: relative; z-index: 1; }
+
+/* ── Header ─────────────────────────────────────────────────── */
+.app-header {
+  padding: var(--sp-3) var(--sp-5) var(--sp-2);
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--sp-3);
+}
+.brand { display: flex; align-items: center; gap: var(--sp-3); }
+.brand .monogram {
+  width: 40px; height: 40px;
+  display: grid; place-items: center;
+  background:
+    linear-gradient(145deg, rgba(216,181,109,.22), rgba(110,15,31,.55)),
+    var(--ruby-graphite);
+  border: 1px solid var(--ruby-line);
+  border-radius: var(--r-md);
+  color: var(--ruby-gold);
+  font-family: var(--font-display);
+  font-size: var(--fs-20);
+  font-weight: 700;
+  letter-spacing: var(--tracking-tight);
+  box-shadow: var(--shadow-gold);
+}
+.brand .wordmark { display: flex; flex-direction: column; }
+.brand .eyebrow {
+  font-size: var(--fs-12);
+  letter-spacing: var(--tracking-eyebrow);
+  text-transform: uppercase;
+  color: var(--ruby-gold);
+  font-weight: 700;
+  line-height: 1;
+}
+.brand .screen-title {
+  font-family: var(--font-display);
+  font-size: var(--fs-24);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--tracking-tight);
+  color: var(--ruby-ivory);
+  font-weight: 700;
+  margin-top: 2px;
+}
+.ghost-btn {
+  width: 40px; height: 40px;
+  border: 1px solid var(--ruby-line);
+  background: rgba(255,255,255,.04);
+  color: var(--ruby-gold);
+  border-radius: var(--r-md);
+  display: grid; place-items: center;
+  cursor: pointer;
+  transition: transform var(--t-fast) var(--ease-out),
+              background var(--t-fast) var(--ease-out);
+}
+.ghost-btn:active { transform: scale(0.96); background: rgba(255,255,255,.08); }
+
+/* ── Cards & panels ─────────────────────────────────────────── */
+.panel, .card {
+  border-radius: var(--r-2xl);
+  background: rgba(255,255,255,.038);
+  border: 1px solid var(--ruby-line-soft);
+  box-shadow: var(--shadow-card);
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+}
+
+/* ── Balance card (hero) ───────────────────────────────────── */
+.balance-card {
+  position: relative; overflow: hidden;
+  padding: var(--sp-6);
+  border-radius: var(--r-2xl);
+  background:
+    radial-gradient(circle at 88% 6%, rgba(216,181,109,.34), transparent 28%),
+    linear-gradient(135deg, #2A0710 0%, #6E0F1F 50%, #100507 100%);
+  border: 1px solid rgba(216,181,109,.28);
+  box-shadow: var(--shadow-card);
+  min-height: 200px;
+}
+.balance-card::before {
+  content: "";
+  position: absolute; inset: 12px;
+  border-radius: calc(var(--r-2xl) - 12px);
+  border: 1px solid rgba(216,181,109,.14);
+  pointer-events: none;
+}
+.balance-label {
+  font-size: var(--fs-12);
+  letter-spacing: var(--tracking-eyebrow);
+  text-transform: uppercase;
+  color: var(--ruby-muted);
+  font-weight: 700;
+}
+.balance-value {
+  margin-top: var(--sp-3);
+  font-family: var(--font-display);
+  font-size: var(--fs-44);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--tracking-hero);
+  color: var(--ruby-ivory);
+  font-weight: 700;
+}
+.balance-sub {
+  margin-top: var(--sp-2);
+  color: var(--ruby-gold);
+  font-size: var(--fs-13);
+  font-weight: 700;
+}
+.balance-card .metric-row {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: var(--sp-3); margin-top: var(--sp-6);
+}
+.metric-row .metric {
+  padding: var(--sp-3);
+  border-radius: var(--r-lg);
+  background: rgba(255,255,255,.05);
+  border: 1px solid rgba(216,181,109,.14);
+}
+.metric span {
+  display: block;
+  color: var(--ruby-muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-eyebrow);
+  font-weight: 700;
+}
+.metric strong {
+  display: block;
+  margin-top: 6px;
+  color: var(--ruby-ivory);
+  font-size: var(--fs-17);
+  font-weight: 750;
+  letter-spacing: var(--tracking-tight);
+}
+
+/* ── Section heading ────────────────────────────────────────── */
+.section-head {
+  margin: var(--sp-6) var(--sp-1) var(--sp-3);
+  display: flex; align-items: baseline; justify-content: space-between;
+}
+.section-title {
+  font-size: var(--fs-15);
+  font-weight: 800;
+  color: var(--ruby-ivory);
+  letter-spacing: -0.01em;
+}
+.section-link {
+  background: transparent; border: 0;
+  color: var(--ruby-gold);
+  font-size: var(--fs-13); font-weight: 800;
+  cursor: pointer;
+}
+
+/* ── Quick actions ──────────────────────────────────────────── */
+.quick-actions {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--sp-2);
+  margin: var(--sp-4) 0;
+}
+.quick-action {
+  min-height: 86px;
+  border: 1px solid var(--ruby-line-soft);
+  background: rgba(255,255,255,.04);
+  color: var(--ruby-ivory);
+  border-radius: var(--r-xl);
+  padding: var(--sp-3);
+  text-align: left;
+  cursor: pointer;
+  transition: transform var(--t-fast) var(--ease-out),
+              background var(--t-fast) var(--ease-out),
+              border-color var(--t-fast) var(--ease-out);
+}
+.quick-action:active { transform: scale(0.97); background: rgba(255,255,255,.08); }
+.quick-action .icon {
+  width: 32px; height: 32px;
+  display: grid; place-items: center;
+  border-radius: var(--r-md);
+  border: 1px solid var(--ruby-line);
+  color: var(--ruby-gold);
+  font-family: var(--font-display);
+  font-size: var(--fs-17);
+  font-weight: 800;
+  margin-bottom: var(--sp-3);
+}
+.quick-action .label {
+  display: block;
+  font-size: var(--fs-13);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: var(--ruby-ivory);
+}
+.quick-action .sub {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--ruby-muted);
+  font-weight: 600;
+}
+
+/* ── Rows / lists ──────────────────────────────────────────── */
+.row-list { display: flex; flex-direction: column; gap: var(--sp-2); }
+.row {
+  display: grid;
+  grid-template-columns: 44px 1fr auto;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border-radius: var(--r-xl);
+  background: rgba(255,255,255,.038);
+  border: 1px solid var(--ruby-line-soft);
+  transition: background var(--t-fast) var(--ease-out);
+}
+.row:active { background: rgba(255,255,255,.06); }
+.row .avatar {
+  width: 44px; height: 44px;
+  display: grid; place-items: center;
+  border-radius: var(--r-md);
+  background: linear-gradient(145deg, rgba(216,181,109,.14), rgba(110,15,31,.20));
+  border: 1px solid var(--ruby-line-soft);
+  color: var(--ruby-gold);
+  font-size: var(--fs-17);
+  font-weight: 800;
+}
+.row .row-title {
+  font-size: var(--fs-14);
+  font-weight: 800;
+  color: var(--ruby-ivory);
+  letter-spacing: -0.02em;
+}
+.row .row-meta {
+  margin-top: 2px;
+  color: var(--ruby-muted);
+  font-size: var(--fs-12);
+  font-weight: 600;
+}
+.row .row-chevron { color: var(--ruby-dim); font-size: var(--fs-17); }
+.amount { font-size: var(--fs-14); font-weight: 850; letter-spacing: -0.02em; }
+.amount.income  { color: var(--ruby-success); }
+.amount.expense { color: var(--ruby-danger); }
+
+/* ── Segmented control ──────────────────────────────────────── */
+.segmented {
+  display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
+  gap: 4px; padding: 4px;
+  border-radius: var(--r-lg);
+  background: rgba(255,255,255,.04);
+  border: 1px solid var(--ruby-line-soft);
+  margin-bottom: var(--sp-4);
+}
+.segment {
+  border: 0; background: transparent;
+  border-radius: var(--r-md);
+  padding: 10px 8px;
+  color: var(--ruby-muted);
+  font-size: var(--fs-12); font-weight: 800;
+  cursor: pointer;
+  transition: all var(--t-fast) var(--ease-out);
+}
+.segment.active {
+  color: var(--ruby-gold);
+  background: linear-gradient(145deg, rgba(216,181,109,.14), rgba(110,15,31,.34));
+  box-shadow: inset 0 0 0 1px rgba(216,181,109,.22);
+}
+
+/* ── Forms ──────────────────────────────────────────────────── */
+.field { display: grid; gap: 8px; margin-bottom: var(--sp-3); }
+.field label {
+  font-size: 10px;
+  letter-spacing: var(--tracking-eyebrow);
+  text-transform: uppercase;
+  font-weight: 800;
+  color: var(--ruby-gold);
+}
+.input, input[type="text"], input[type="number"], select, textarea {
+  width: 100%;
+  border: 1px solid var(--ruby-line-soft);
+  background: rgba(255,255,255,.04);
+  color: var(--ruby-ivory);
+  min-height: 52px;
+  padding: 14px 16px;
+  border-radius: var(--r-lg);
+  outline: none;
+  font-size: var(--fs-15);
+  font-weight: 700;
+  font-family: var(--font-ui);
+  transition: border-color var(--t-fast) var(--ease-out),
+              background var(--t-fast) var(--ease-out);
+}
+.input:focus, input:focus, select:focus, textarea:focus {
+  border-color: var(--ruby-gold);
+  background: rgba(255,255,255,.06);
+}
+.amount-input {
+  min-height: 80px;
+  font-family: var(--font-display);
+  font-size: var(--fs-44);
+  font-weight: 800;
+  letter-spacing: var(--tracking-hero);
+  text-align: center;
+}
+.chip-grid { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.chip {
+  border: 1px solid var(--ruby-line-soft);
+  background: rgba(255,255,255,.04);
+  color: var(--ruby-muted);
+  border-radius: var(--r-pill);
+  padding: 10px 14px;
+  font-size: var(--fs-12);
+  font-weight: 800;
+  cursor: pointer;
+  transition: all var(--t-fast) var(--ease-out);
+}
+.chip.active {
+  color: var(--ruby-gold);
+  border-color: var(--ruby-gold);
+  background: rgba(216,181,109,.10);
+}
+
+/* ── Buttons ────────────────────────────────────────────────── */
+.btn {
+  width: 100%;
+  min-height: 56px;
+  border-radius: var(--r-lg);
+  border: 1px solid transparent;
+  font-size: var(--fs-14); font-weight: 800;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: transform var(--t-fast) var(--ease-out),
+              opacity var(--t-fast) var(--ease-out);
+}
+.btn:active { transform: scale(0.985); }
+.btn-primary {
+  color: var(--ruby-ivory);
+  background: linear-gradient(135deg, var(--ruby-burgundy), var(--ruby-primary));
+  border-color: rgba(216,181,109,.38);
+  box-shadow: var(--shadow-crimson);
+}
+.btn-secondary {
+  color: var(--ruby-ivory);
+  background: rgba(255,255,255,.06);
+  border-color: var(--ruby-line);
+}
+.btn-ghost {
+  color: var(--ruby-gold);
+  background: transparent;
+  border-color: var(--ruby-line);
+}
+
+/* ── Bottom navigation (floating glass) ─────────────────────── */
+.bottom-nav {
+  position: fixed;
+  left: var(--sp-3); right: var(--sp-3);
+  bottom: calc(var(--safe-bottom) + var(--sp-3));
+  height: var(--nav-h);
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 2px;
+  padding: var(--sp-2);
+  border-radius: var(--r-2xl);
+  background: rgba(10,6,8,.78);
+  border: 1px solid var(--ruby-line);
+  box-shadow: 0 18px 58px rgba(0,0,0,.46);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  z-index: 10;
+}
+[data-theme="light"] .bottom-nav { background: rgba(255,253,252,.84); }
+.nav-item {
+  border: 0; background: transparent;
+  color: var(--ruby-muted);
+  cursor: pointer;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  border-radius: var(--r-md);
+  padding: 6px 2px;
+  font-size: 10px; font-weight: 800; letter-spacing: 0.02em;
+  transition: color var(--t-fast) var(--ease-out);
+}
+.nav-item .nav-icon {
+  width: 22px; height: 22px;
+  display: grid; place-items: center;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  font-family: var(--font-display);
+  font-size: 12px; font-weight: 900;
+}
+.nav-item.active { color: var(--ruby-gold); }
+.nav-item.active .nav-icon {
+  border-color: var(--ruby-line);
+  background: rgba(216,181,109,.10);
+}
+
+/* ── Toast ──────────────────────────────────────────────────── */
+.toast {
+  position: fixed;
+  left: var(--sp-4); right: var(--sp-4);
+  bottom: calc(var(--nav-h) + var(--safe-bottom) + var(--sp-6));
+  padding: 14px 16px;
+  border-radius: var(--r-lg);
+  background: rgba(10,6,8,.92);
+  border: 1px solid var(--ruby-line);
+  color: var(--ruby-ivory);
+  font-size: var(--fs-13);
+  font-weight: 800;
+  box-shadow: var(--shadow-deep);
+  opacity: 0;
+  transform: translateY(12px);
+  transition: opacity var(--t-base) var(--ease-out),
+              transform var(--t-base) var(--ease-out);
+  pointer-events: none;
+  z-index: 20;
+}
+.toast.show { opacity: 1; transform: translateY(0); }
+
+/* ── Skeleton loader ────────────────────────────────────────── */
+.sk {
+  background: linear-gradient(90deg, rgba(255,255,255,.04), rgba(255,255,255,.08), rgba(255,255,255,.04));
+  background-size: 200% 100%;
+  animation: sk 1.4s linear infinite;
+  border-radius: 8px;
+}
+@keyframes sk { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
+/* ── Screen routing ─────────────────────────────────────────── */
+.screen { display: none; animation: appear var(--t-base) var(--ease-out); }
+.screen.active { display: block; }
+@keyframes appear {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.content { padding: 0 var(--sp-4); max-width: 480px; margin: 0 auto; }
+
+/* ── Donut + bars (reports) ─────────────────────────────────── */
+.donut {
+  width: 120px; height: 120px;
+  border-radius: 50%;
+  position: relative;
+  box-shadow: 0 14px 36px rgba(0,0,0,.28);
+}
+.donut::after {
+  content: ""; position: absolute; inset: 22px;
+  border-radius: 50%;
+  background: var(--ruby-ink);
+  border: 1px solid var(--ruby-line-soft);
+}
+.legend { display: flex; flex-direction: column; gap: 8px; }
+.legend-item {
+  display: grid; grid-template-columns: 10px 1fr auto;
+  gap: 10px; align-items: center;
+  color: var(--ruby-muted);
+  font-size: var(--fs-12); font-weight: 700;
+}
+.legend-item strong { color: var(--ruby-ivory); font-weight: 800; }
+.swatch { width: 10px; height: 10px; border-radius: 50%; }
+.bars { display: flex; flex-direction: column; gap: var(--sp-3); }
+.bar-meta {
+  display: flex; justify-content: space-between;
+  font-size: var(--fs-12); font-weight: 700;
+  color: var(--ruby-muted);
+}
+.bar-meta strong { color: var(--ruby-ivory); }
+.bar-track {
+  margin-top: 6px;
+  height: 8px;
+  border-radius: var(--r-pill);
+  background: rgba(255,255,255,.06);
+  overflow: hidden;
+}
+.bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--ruby-burgundy), var(--ruby-gold));
+}
+
+/* ── Numpad ─────────────────────────────────────────────────── */
+.numpad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--sp-2);
+  margin-top: var(--sp-4);
+}
+.numkey {
+  min-height: 56px;
+  border-radius: var(--r-lg);
+  background: rgba(255,255,255,.05);
+  border: 1px solid var(--ruby-line-soft);
+  color: var(--ruby-ivory);
+  font-size: var(--fs-20);
+  font-weight: 700;
+  font-family: var(--font-display);
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease-out),
+              transform var(--t-fast) var(--ease-out);
+}
+.numkey:active { background: rgba(255,255,255,.10); transform: scale(0.97); }
+.numkey.action { color: var(--ruby-gold); background: rgba(216,181,109,.08); }

@@ -2,6 +2,9 @@ import logging
 import os
 import sqlite3
 import json
+import hmac
+import hashlib
+from urllib.parse import parse_qsl, unquote
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -11,12 +14,13 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import re
 from collections import defaultdict
 import asyncio
 import aiohttp
+from aiohttp import web
 
 # Logging setup
 logging.basicConfig(
@@ -24,6 +28,61 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+
+# ========== TELEGRAM INIT DATA VALIDATION ==========
+def validate_init_data(raw_init_data: str, bot_token: str) -> dict | None:
+    """Validate Telegram Mini App initData per official HMAC-SHA256 spec.
+
+    Returns parsed dict (with user already JSON-decoded) on success, None on failure.
+    """
+    try:
+        params = dict(parse_qsl(raw_init_data, keep_blank_values=True))
+    except Exception:
+        return None
+
+    received_hash = params.pop('hash', None)
+    if not received_hash:
+        return None
+
+    # Check auth_date freshness (24 h window)
+    auth_date_str = params.get('auth_date', '')
+    try:
+        auth_ts = int(auth_date_str)
+        if datetime.now(timezone.utc).timestamp() - auth_ts > 86400:
+            return None
+    except (ValueError, TypeError):
+        return None
+
+    # Build data-check-string: sorted key=value pairs joined by \n
+    data_check_string = '\n'.join(
+        f'{k}={v}' for k, v in sorted(params.items())
+    )
+
+    secret_key = hmac.new(
+        b'WebAppData',
+        bot_token.encode(),
+        hashlib.sha256
+    ).digest()
+
+    expected_hash = hmac.new(
+        secret_key,
+        data_check_string.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected_hash, received_hash):
+        return None
+
+    # Decode user JSON if present
+    if 'user' in params:
+        try:
+            params['user'] = json.loads(params['user'])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return params
+
 
 # Configuration
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -2374,6 +2433,286 @@ async def post_init_notify(application: Application):
             logger.warning(f"post_init notify failed for {admin_id}: {e}")
 
 
+# ========== API SERVER (Mini App) ==========
+
+_SKIP_AUTH_PATHS = {'/api/health', '/api/exchange-rates'}
+
+
+@web.middleware
+async def cors_middleware(request: web.Request, handler):
+    """Add CORS headers to every response, handle OPTIONS preflight."""
+    if request.method == 'OPTIONS':
+        resp = web.Response(status=204)
+    else:
+        resp = await handler(request)
+
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Telegram-Init-Data'
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+    return resp
+
+
+@web.middleware
+async def init_data_middleware(request: web.Request, handler):
+    """Validate Telegram initData; attach user_id and tg_user to request."""
+    if request.method == 'OPTIONS':
+        return await handler(request)
+
+    if request.path in _SKIP_AUTH_PATHS:
+        return await handler(request)
+
+    raw = (
+        request.headers.get('X-Telegram-Init-Data')
+        or request.rel_url.query.get('initData', '')
+    )
+
+    bot_token = os.getenv('TELEGRAM_BOT_TOKEN', '')
+    parsed = validate_init_data(raw, bot_token) if raw else None
+
+    if parsed is None:
+        return web.json_response({'detail': 'Invalid initData'}, status=401)
+
+    tg_user = parsed.get('user') or {}
+    request['user_id'] = str(tg_user.get('id', ''))
+    request['tg_user'] = tg_user
+    return await handler(request)
+
+
+# ---- helpers ----
+
+class _UserObj:
+    """Minimal object that satisfies db.upsert_user(user) interface."""
+    __slots__ = ('id', 'username', 'first_name', 'last_name', 'language_code')
+
+    def __init__(self, d: dict):
+        self.id = d.get('id', 0)
+        self.username = d.get('username')
+        self.first_name = d.get('first_name')
+        self.last_name = d.get('last_name')
+        self.language_code = d.get('language_code')
+
+
+def _json_response(data, status=200):
+    return web.json_response(data, status=status)
+
+
+async def _ensure_fresh_rates():
+    """Update exchange rates if stale (>30 min) or never fetched."""
+    last = exchange_rates_cache.get('last_update')
+    if last is None or (datetime.now(KYIV_TZ) - last).total_seconds() > 1800:
+        await update_exchange_rates()
+
+
+# ---- route handlers ----
+
+async def api_health(request: web.Request):
+    return _json_response({'ok': True, 'service': 'ruby-finance-api'})
+
+
+async def api_me(request: web.Request):
+    tg_user = request['tg_user']
+    uid = request['user_id']
+    return _json_response({
+        'id': uid,
+        'username': tg_user.get('username'),
+        'first_name': tg_user.get('first_name'),
+        'last_name': tg_user.get('last_name'),
+        'is_admin': uid in ADMIN_IDS,
+    })
+
+
+async def api_exchange_rates(request: web.Request):
+    await _ensure_fresh_rates()
+    last = exchange_rates_cache.get('last_update')
+    return _json_response({
+        'USD': exchange_rates_cache.get('USD'),
+        'EUR': exchange_rates_cache.get('EUR'),
+        'updated_at': last.isoformat() if last else None,
+    })
+
+
+async def api_balance(request: web.Request):
+    user_id = request['user_id']
+    now = datetime.now(KYIV_TZ)
+    try:
+        year = int(request.rel_url.query.get('year', now.year))
+        month = int(request.rel_url.query.get('month', now.month))
+    except ValueError:
+        return _json_response({'detail': 'Invalid year/month'}, status=400)
+
+    rows = await db.get_transactions(user_id, year=year, month=month)
+    income = sum(r['amount_uah'] for r in rows if r['type'] == 'income')
+    expense = sum(r['amount_uah'] for r in rows if r['type'] == 'expense')
+    return _json_response({
+        'income': round(income, 2),
+        'expense': round(expense, 2),
+        'balance': round(income - expense, 2),
+        'currency': 'UAH',
+    })
+
+
+async def api_get_transactions(request: web.Request):
+    user_id = request['user_id']
+    try:
+        limit = min(int(request.rel_url.query.get('limit', 15)), 100)
+    except ValueError:
+        limit = 15
+
+    rows = await db.get_transactions(user_id, limit=limit)
+    result = [
+        {
+            'id': r['id'],
+            'amount': r['amount'],
+            'currency': r['currency'],
+            'amount_uah': r['amount_uah'],
+            'type': r['type'],
+            'category': r['category'],
+            'description': r['description'],
+            'date': r['date'],
+            'timestamp': r['timestamp'],
+        }
+        for r in rows
+    ]
+    return _json_response(result)
+
+
+async def api_post_transaction(request: web.Request):
+    user_id = request['user_id']
+    tg_user = request['tg_user']
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+
+    t_type = body.get('type')
+    if t_type not in ('income', 'expense'):
+        return _json_response({'detail': 'type must be income or expense'}, status=400)
+
+    try:
+        amount = float(body['amount'])
+    except (KeyError, TypeError, ValueError):
+        return _json_response({'detail': 'amount required and must be a number'}, status=400)
+
+    currency = str(body.get('currency', 'UAH')).upper()
+    if currency not in ('UAH', 'USD', 'EUR'):
+        return _json_response({'detail': 'currency must be UAH, USD, or EUR'}, status=400)
+
+    category = str(body.get('category', 'Інше'))
+    description = body.get('description', '')
+
+    rate = await get_exchange_rate(currency)
+    amount_uah = round(convert_to_uah(amount, currency, rate), 2)
+
+    now = datetime.now(KYIV_TZ)
+    date_str = now.strftime('%Y-%m-%d')
+    ts_str = now.strftime('%Y-%m-%d %H:%M:%S')
+
+    row_id = await db.add_transaction(
+        user_id, amount, currency, amount_uah,
+        t_type, category, description, date_str, ts_str
+    )
+
+    await db.upsert_user(_UserObj(tg_user))
+
+    logger.info(f"API POST /api/transactions user={user_id} id={row_id} {t_type} {amount} {currency}")
+    return _json_response({
+        'id': row_id,
+        'amount': amount,
+        'currency': currency,
+        'amount_uah': amount_uah,
+        'type': t_type,
+        'category': category,
+        'description': description,
+        'date': date_str,
+        'timestamp': ts_str,
+    }, status=201)
+
+
+async def api_delete_transaction(request: web.Request):
+    user_id = request['user_id']
+    try:
+        tx_id = int(request.match_info['id'])
+    except (KeyError, ValueError):
+        return _json_response({'detail': 'Invalid id'}, status=400)
+
+    # Verify ownership
+    rows = await db.get_transactions(user_id)
+    owned = any(r['id'] == tx_id for r in rows)
+    if not owned:
+        return _json_response({'detail': 'Not found'}, status=404)
+
+    await db.delete_transaction(tx_id)
+    logger.info(f"API DELETE /api/transactions/{tx_id} user={user_id}")
+    return web.Response(status=204)
+
+
+async def api_monthly_report(request: web.Request):
+    user_id = request['user_id']
+    now = datetime.now(KYIV_TZ)
+    try:
+        year = int(request.rel_url.query.get('year', now.year))
+        month = int(request.rel_url.query.get('month', now.month))
+    except ValueError:
+        return _json_response({'detail': 'Invalid year/month'}, status=400)
+
+    rows = await db.get_transactions(user_id, year=year, month=month)
+    income_by_cat: dict[str, float] = {}
+    expense_by_cat: dict[str, float] = {}
+    total_income = 0.0
+    total_expense = 0.0
+
+    for r in rows:
+        cat = r['category']
+        amt = r['amount_uah']
+        if r['type'] == 'income':
+            income_by_cat[cat] = round(income_by_cat.get(cat, 0.0) + amt, 2)
+            total_income += amt
+        else:
+            expense_by_cat[cat] = round(expense_by_cat.get(cat, 0.0) + amt, 2)
+            total_expense += amt
+
+    return _json_response({
+        'income_by_category': income_by_cat,
+        'expense_by_category': expense_by_cat,
+        'total_income': round(total_income, 2),
+        'total_expense': round(total_expense, 2),
+        'transaction_count': len(rows),
+    })
+
+
+async def api_categories(request: web.Request):
+    expense_names = [k for k in CATEGORIES.get('expense', {}).keys()]
+    income_names = [k for k in CATEGORIES.get('income', {}).keys()]
+    return _json_response({'expense': expense_names, 'income': income_names})
+
+
+async def api_settings(request: web.Request):
+    s = SETTINGS if SETTINGS else DEFAULT_SETTINGS
+    return _json_response({
+        'employees': s.get('employees', []),
+        'tax_config': s.get('tax_config', {}),
+    })
+
+
+def build_api_app() -> web.Application:
+    """Build and return the aiohttp API application."""
+    app = web.Application(middlewares=[cors_middleware, init_data_middleware])
+    app.router.add_route('GET', '/api/health', api_health)
+    app.router.add_route('GET', '/api/me', api_me)
+    app.router.add_route('GET', '/api/exchange-rates', api_exchange_rates)
+    app.router.add_route('GET', '/api/balance', api_balance)
+    app.router.add_route('GET', '/api/transactions', api_get_transactions)
+    app.router.add_route('POST', '/api/transactions', api_post_transaction)
+    app.router.add_route('DELETE', '/api/transactions/{id}', api_delete_transaction)
+    app.router.add_route('GET', '/api/reports/monthly', api_monthly_report)
+    app.router.add_route('GET', '/api/categories', api_categories)
+    app.router.add_route('GET', '/api/settings', api_settings)
+    # Catch-all OPTIONS for CORS preflight on any path
+    app.router.add_route('OPTIONS', '/{path_info:.*}', lambda r: web.Response(status=204))
+    return app
+
+
 def main():
     """Start the bot"""
     import datetime as _dt
@@ -2411,7 +2750,30 @@ def main():
     logger.info(f"⚙️ Settings: {SETTINGS_FILE}")
     logger.info(f"🔑 Admin IDs: {len(ADMIN_IDS)} configured")
 
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    api_app = build_api_app()
+    port = int(os.environ.get('PORT', 8080))
+
+    async def run_all():
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+        runner = web.AppRunner(api_app, access_log=logger)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        logger.info(f"API server started on port {port}")
+
+        stop = asyncio.Event()
+        try:
+            await stop.wait()
+        finally:
+            await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
+            await runner.cleanup()
+
+    asyncio.run(run_all())
 
 
 if __name__ == '__main__':

@@ -1,0 +1,119 @@
+/* Ruby Finance — Design Tokens
+   Luxury fintech palette with deep crimson + champagne accents.
+   Dark-first; light variant inverts via [data-theme="light"]. */
+
+:root {
+  color-scheme: dark;
+
+  /* ── Brand palette ─────────────────────────────────────────── */
+  --ruby-ink:        #0A0608;   /* obsidian black, app background */
+  --ruby-graphite:   #14101A;   /* secondary surfaces            */
+  --ruby-fog:        #1E1820;   /* tertiary surfaces             */
+  --ruby-line:       rgba(216, 181, 109, 0.18);
+  --ruby-line-soft:  rgba(247, 241, 231, 0.08);
+
+  --ruby-oxblood:    #3A0B14;
+  --ruby-burgundy:   #6E0F1F;
+  --ruby-primary:    #9B1B30;   /* signature crimson — CTA       */
+  --ruby-primary-hot:#C2243B;   /* hover/active state            */
+
+  --ruby-gold:       #D8B56D;   /* champagne hairline accents    */
+  --ruby-gold-soft:  #F2E3BE;
+  --ruby-ivory:      #F7F1E7;   /* primary text                  */
+  --ruby-muted:      #B8A99D;   /* secondary text                */
+  --ruby-dim:        #7A6E66;   /* tertiary text                 */
+
+  --ruby-success:    #6FB67E;
+  --ruby-danger:     #D45A4F;
+  --ruby-warning:    #E8B863;
+
+  /* ── Telegram theme bridge ─────────────────────────────────── */
+  --tg-bg:          var(--tg-theme-bg-color,            var(--ruby-ink));
+  --tg-bg-sec:      var(--tg-theme-secondary-bg-color,  var(--ruby-graphite));
+  --tg-text:        var(--tg-theme-text-color,          var(--ruby-ivory));
+  --tg-hint:        var(--tg-theme-hint-color,          var(--ruby-muted));
+  --tg-link:        var(--tg-theme-link-color,          var(--ruby-gold));
+  --tg-button:      var(--tg-theme-button-color,        var(--ruby-primary));
+  --tg-button-text: var(--tg-theme-button-text-color,   var(--ruby-ivory));
+
+  /* ── Typography ────────────────────────────────────────────── */
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+             "Inter", "Segoe UI", "Roboto", system-ui, sans-serif;
+  --font-display: "Cormorant Garamond", "Georgia", "Times New Roman", serif;
+  --font-mono: "SF Mono", "JetBrains Mono", "Menlo", monospace;
+
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-14: 14px;
+  --fs-15: 15px;
+  --fs-17: 17px;
+  --fs-20: 20px;
+  --fs-24: 24px;
+  --fs-32: 32px;
+  --fs-44: 44px;
+
+  --lh-tight: 1.05;
+  --lh-snug:  1.25;
+  --lh-base:  1.5;
+
+  --tracking-eyebrow: 0.16em;
+  --tracking-tight:  -0.04em;
+  --tracking-hero:   -0.06em;
+
+  /* ── Spacing scale (4px base) ──────────────────────────────── */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+
+  /* ── Radius ────────────────────────────────────────────────── */
+  --r-sm:  10px;
+  --r-md:  14px;
+  --r-lg:  18px;
+  --r-xl:  24px;
+  --r-2xl: 32px;
+  --r-pill: 999px;
+
+  /* ── Shadows / depth ──────────────────────────────────────── */
+  --shadow-card: 0 18px 44px rgba(0, 0, 0, 0.36);
+  --shadow-gold: 0 16px 38px rgba(216, 181, 109, 0.14);
+  --shadow-crimson: 0 18px 38px rgba(155, 27, 48, 0.36);
+  --shadow-deep:  0 32px 88px rgba(0, 0, 0, 0.54);
+
+  /* ── Motion ────────────────────────────────────────────────── */
+  --ease-out: cubic-bezier(.22,.61,.36,1);
+  --t-fast:  120ms;
+  --t-base:  220ms;
+  --t-slow:  360ms;
+
+  /* ── Layout chrome ─────────────────────────────────────────── */
+  --nav-h: 76px;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --ruby-ink:       #FBF6EE;
+  --ruby-graphite:  #FFFDFC;
+  --ruby-fog:       #F7EFE4;
+  --ruby-line:      rgba(122, 16, 32, 0.18);
+  --ruby-line-soft: rgba(122, 16, 32, 0.08);
+  --ruby-oxblood:   #5B101D;
+  --ruby-burgundy:  #7A1020;
+  --ruby-primary:   #9E2434;
+  --ruby-primary-hot:#B22A3F;
+  --ruby-gold:      #A77E2D;
+  --ruby-gold-soft: #70531F;
+  --ruby-ivory:     #181112;
+  --ruby-muted:     #5F4E45;
+  --ruby-dim:       #8A776B;
+  --shadow-card:    0 18px 44px rgba(58, 11, 20, 0.12);
+  --shadow-gold:    0 14px 34px rgba(167, 126, 45, 0.16);
+  --shadow-crimson: 0 16px 34px rgba(155, 27, 48, 0.20);
+}
