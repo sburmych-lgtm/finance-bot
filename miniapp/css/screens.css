@@ -96,6 +96,90 @@
 .setting-section { margin-top: var(--sp-6); }
 .setting-section .section-title { padding-left: var(--sp-1); }
 
+/* Settings sub-screen back header */
+.settings-back {
+  display: grid;
+  grid-template-columns: 40px 1fr;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+.settings-back-title {
+  font-family: var(--font-display);
+  font-size: var(--fs-20);
+  color: var(--ruby-ivory);
+  letter-spacing: -0.02em;
+}
+.settings-back .ghost-btn {
+  font-family: var(--font-display);
+  font-size: var(--fs-20);
+  line-height: 1;
+}
+
+/* Month picker (Reports) */
+.month-picker {
+  display: grid;
+  grid-template-columns: 44px 1fr 44px;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+.month-picker .ghost-btn {
+  font-family: var(--font-display);
+  font-size: var(--fs-20);
+  line-height: 1;
+}
+.month-label {
+  text-align: center;
+  font-family: var(--font-display);
+  font-size: var(--fs-17);
+  letter-spacing: -0.02em;
+  color: var(--ruby-ivory);
+  text-transform: capitalize;
+}
+
+/* Tab strip — horizontally scrollable */
+.tab-strip {
+  display: flex;
+  gap: var(--sp-2);
+  overflow-x: auto;
+  padding: 4px 4px;
+  margin: 0 calc(-1 * var(--sp-4)) var(--sp-3);
+  padding-inline: var(--sp-4);
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.tab-strip::-webkit-scrollbar { display: none; }
+.tab-strip .tab {
+  flex: 0 0 auto;
+  border: 1px solid var(--ruby-line-soft);
+  background: rgba(255,255,255,.04);
+  color: var(--ruby-muted);
+  border-radius: var(--r-pill);
+  padding: 8px 16px;
+  font-size: var(--fs-12);
+  font-weight: 800;
+  cursor: pointer;
+  transition: all var(--t-fast) var(--ease-out);
+  letter-spacing: 0.01em;
+}
+.tab-strip .tab.active {
+  color: var(--ruby-gold);
+  border-color: var(--ruby-gold);
+  background: rgba(216,181,109,.12);
+}
+
+/* Key-value rows (tax / accounting tables) */
+.kv {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px dashed var(--ruby-line-soft);
+  font-size: var(--fs-13);
+}
+.kv:last-child { border-bottom: 0; }
+.kv span { color: var(--ruby-muted); font-weight: 600; }
+.kv strong { color: var(--ruby-ivory); font-weight: 800; }
+
 /* AI card on Reports */
 .ai-card { padding: var(--sp-4); }
 .ai-card-row { display: grid; grid-template-columns: 44px 1fr; gap: var(--sp-3); align-items: flex-start; }

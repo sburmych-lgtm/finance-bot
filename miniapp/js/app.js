@@ -23,23 +23,29 @@ export const Store = {
   transactions: [],
   categories: null,
   rates: { USD: 41.5, EUR: 45.2 },
+  timeCategories: null,
+  employees: [],
   screen: 'home',
 
   async hydrate() {
     const now = new Date();
     try {
-      const [me, balance, txs, cats, rates] = await Promise.all([
+      const [me, balance, txs, cats, rates, tCats, emps] = await Promise.all([
         Api.me().catch(() => null),
         Api.getBalance(now.getFullYear(), now.getMonth() + 1).catch(() => null),
         Api.listTransactions(15).catch(() => []),
         Api.categories().catch(() => null),
         Api.exchangeRates().catch(() => null),
+        Api.timeCategories().catch(() => null),
+        Api.employees().catch(() => []),
       ]);
       this.user = me;
       this.balance = balance;
       this.transactions = txs || [];
       this.categories = cats;
       if (rates) Object.assign(this.rates, rates);
+      this.timeCategories = tCats;
+      this.employees = emps || [];
     } catch (e) {
       console.warn('hydrate failed', e);
     }

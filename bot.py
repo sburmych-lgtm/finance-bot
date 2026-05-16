@@ -2448,7 +2448,7 @@ async def cors_middleware(request: web.Request, handler):
 
     resp.headers['Access-Control-Allow-Origin'] = '*'
     resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Telegram-Init-Data'
-    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PATCH, DELETE, OPTIONS'
     return resp
 
 
@@ -2702,6 +2702,475 @@ async def api_settings(request: web.Request):
     })
 
 
+# ---- helpers for parity endpoints ----
+
+def _parse_year_month(request: web.Request):
+    """Parse year/month query params, defaulting to current Kyiv month."""
+    now = datetime.now(KYIV_TZ)
+    try:
+        year = int(request.rel_url.query.get('year', now.year))
+        month = int(request.rel_url.query.get('month', now.month))
+    except (TypeError, ValueError):
+        return None, None, _json_response({'detail': 'Invalid year/month'}, status=400)
+    if not (1 <= month <= 12):
+        return None, None, _json_response({'detail': 'month must be 1-12'}, status=400)
+    return year, month, None
+
+
+# ---- reports parity ----
+
+async def api_report_employees(request: web.Request):
+    """Mirror show_employee_report: per-employee income/salary/profit/ROI."""
+    user_id = request['user_id']
+    year, month, err = _parse_year_month(request)
+    if err is not None:
+        return err
+
+    transactions = await db.get_transactions(user_id, year=year, month=month)
+
+    employees = []
+    for emp in EMPLOYEES:
+        income_cat = f'Від {emp}'
+        salary_cat = f'ЗП {emp}'
+        income = sum(t['amount_uah'] for t in transactions
+                     if t['type'] == 'income' and t['category'] == income_cat)
+        salary = sum(t['amount_uah'] for t in transactions
+                     if t['type'] == 'expense' and t['category'] == salary_cat)
+        if income > 0 or salary > 0:
+            profit = income - salary
+            roi = ((income - salary) / salary * 100) if salary > 0 else 0
+            employees.append({
+                'name': emp,
+                'income': round(income, 2),
+                'salary': round(salary, 2),
+                'profit': round(profit, 2),
+                'roi': round(roi, 2),
+            })
+
+    return _json_response(employees)
+
+
+async def api_report_tax(request: web.Request):
+    """Mirror show_tax_report: ФОП-3 single tax + fixed ЄСВ."""
+    user_id = request['user_id']
+    year, month, err = _parse_year_month(request)
+    if err is not None:
+        return err
+
+    transactions = await db.get_transactions(user_id, year=year, month=month)
+    total_income = sum(t['amount_uah'] for t in transactions if t['type'] == 'income')
+    total_expense = sum(t['amount_uah'] for t in transactions if t['type'] == 'expense')
+    profit = total_income - total_expense
+
+    single_tax_rate = TAX_CONFIG['single_tax_rate']
+    esv_fixed = TAX_CONFIG['esv_fixed']
+    single_tax = total_income * single_tax_rate
+    total_tax = single_tax + esv_fixed
+
+    import calendar
+    last_day = calendar.monthrange(year, month)[1]
+    period_from = f"{year:04d}-{month:02d}-01"
+    period_to = f"{year:04d}-{month:02d}-{last_day:02d}"
+
+    return _json_response({
+        'year': year,
+        'month': month,
+        'month_name': MONTH_NAMES[month],
+        'total_income': round(total_income, 2),
+        'total_expense': round(total_expense, 2),
+        'profit': round(profit, 2),
+        'single_tax_rate': single_tax_rate,
+        'esv_fixed': esv_fixed,
+        'single_tax': round(single_tax, 2),
+        'total_tax': round(total_tax, 2),
+        'after_tax': round(profit - total_tax, 2),
+        'period_from': period_from,
+        'period_to': period_to,
+    })
+
+
+async def api_report_accounting(request: web.Request):
+    """Mirror show_accounting_report: opening/closing balance + Dt/Ct entries."""
+    user_id = request['user_id']
+    year, month, err = _parse_year_month(request)
+    if err is not None:
+        return err
+
+    transactions = await db.get_transactions(user_id, year=year, month=month)
+    total_income = sum(t['amount_uah'] for t in transactions if t['type'] == 'income')
+    total_expense = sum(t['amount_uah'] for t in transactions if t['type'] == 'expense')
+    profit = total_income - total_expense
+
+    prev_transactions = await db.get_all_transactions(user_id)
+    prev_income = 0.0
+    prev_expense = 0.0
+    month_start = datetime(year, month, 1)
+    for t in prev_transactions:
+        t_date = datetime.strptime(t['date'], '%Y-%m-%d')
+        if t_date < month_start:
+            if t['type'] == 'income':
+                prev_income += t['amount_uah']
+            else:
+                prev_expense += t['amount_uah']
+
+    opening_balance = prev_income - prev_expense
+    closing_balance = opening_balance + profit
+
+    entries = [
+        {'debit': '301', 'credit': '701', 'amount': round(total_income, 2),
+         'label': 'Надходження доходу'},
+        {'debit': '901', 'credit': '301', 'amount': round(total_expense, 2),
+         'label': 'Видатки'},
+    ]
+
+    return _json_response({
+        'total_income': round(total_income, 2),
+        'total_expense': round(total_expense, 2),
+        'profit': round(profit, 2),
+        'opening_balance': round(opening_balance, 2),
+        'closing_balance': round(closing_balance, 2),
+        'entries': entries,
+        'result': 'profit' if profit > 0 else 'loss',
+    })
+
+
+async def api_report_time(request: web.Request):
+    """Mirror show_time_monthly_report: per-category time + productivity buckets."""
+    user_id = request['user_id']
+    year, month, err = _parse_year_month(request)
+    if err is not None:
+        return err
+
+    time_tracks = await db.get_time_tracks(user_id, year=year, month=month)
+
+    time_by_cat: dict[str, int] = {}
+    total_minutes = 0
+    for track in time_tracks:
+        total_minutes += track['minutes']
+        time_by_cat[track['category']] = time_by_cat.get(track['category'], 0) + track['minutes']
+
+    import calendar
+    days_in_month = calendar.monthrange(year, month)[1]
+    total_hours = total_minutes / 60
+    avg_per_day = total_hours / days_in_month if days_in_month else 0
+
+    productive_cats = ['Робота', 'Навчання', 'Підвищення кваліфікації',
+                       'Уроки історії', 'Уроки англійської', 'Зал']
+    unproductive_cats = ['Скрол стрічки', 'Розваги']
+    rest_cats = ['Сон', 'Їжа', 'Відпустка']
+
+    productive_minutes = sum(time_by_cat.get(c, 0) for c in productive_cats)
+    unproductive_minutes = sum(time_by_cat.get(c, 0) for c in unproductive_cats)
+    rest_minutes = sum(time_by_cat.get(c, 0) for c in rest_cats)
+    untracked_minutes = days_in_month * 24 * 60 - total_minutes
+
+    by_category = []
+    for cat, minutes in sorted(time_by_cat.items(), key=lambda x: x[1], reverse=True):
+        emoji = TIME_CATEGORIES.get(cat, {}).get('emoji', '⏱️')
+        pct = (minutes / total_minutes * 100) if total_minutes > 0 else 0
+        by_category.append({
+            'name': cat,
+            'emoji': emoji,
+            'minutes': minutes,
+            'hours': round(minutes / 60, 2),
+            'percentage': round(pct, 2),
+        })
+
+    return _json_response({
+        'total_minutes': total_minutes,
+        'total_hours': round(total_hours, 2),
+        'days_in_month': days_in_month,
+        'avg_per_day_hours': round(avg_per_day, 2),
+        'by_category': by_category,
+        'productive_minutes': productive_minutes,
+        'unproductive_minutes': unproductive_minutes,
+        'rest_minutes': rest_minutes,
+        'untracked_minutes': untracked_minutes,
+    })
+
+
+# ---- categories CRUD ----
+
+async def api_categories_full(request: web.Request):
+    """Return the entire CATEGORIES dict (expense + income, with metadata)."""
+    return _json_response(CATEGORIES)
+
+
+async def api_categories_create(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+
+    cat_type = body.get('type')
+    if cat_type not in ('income', 'expense'):
+        return _json_response({'detail': 'type must be income or expense'}, status=400)
+
+    name = (body.get('name') or '').strip()
+    if not name:
+        return _json_response({'detail': 'name required'}, status=400)
+
+    bucket = CATEGORIES.setdefault(cat_type, {})
+    if name in bucket:
+        return _json_response({'detail': 'category already exists'}, status=409)
+
+    entry = {
+        'emoji': body.get('emoji', '📦'),
+        'keywords': body.get('keywords', []) or [],
+    }
+    bucket[name] = entry
+    SETTINGS.setdefault('categories', {}).setdefault(cat_type, {})[name] = entry
+    save_settings(SETTINGS)
+    return _json_response({'type': cat_type, 'name': name, **entry}, status=201)
+
+
+async def api_categories_update(request: web.Request):
+    cat_type = request.match_info.get('type')
+    name = unquote(request.match_info.get('name', ''))
+    if cat_type not in ('income', 'expense'):
+        return _json_response({'detail': 'type must be income or expense'}, status=400)
+
+    bucket = CATEGORIES.get(cat_type, {})
+    if name not in bucket:
+        return _json_response({'detail': 'category not found'}, status=404)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+
+    current = bucket[name]
+    new_emoji = body.get('emoji', current.get('emoji', '📦'))
+    new_keywords = body.get('keywords', current.get('keywords', []))
+    new_name = (body.get('new_name') or name).strip() or name
+
+    if new_name != name and new_name in bucket:
+        return _json_response({'detail': 'target name already exists'}, status=409)
+    if name == 'Інше' and new_name != 'Інше':
+        return _json_response({'detail': 'cannot rename "Інше"'}, status=400)
+
+    new_entry = {'emoji': new_emoji, 'keywords': new_keywords or []}
+
+    # Rebuild preserving order
+    new_bucket = {}
+    for k, v in bucket.items():
+        if k == name:
+            new_bucket[new_name] = new_entry
+        else:
+            new_bucket[k] = v
+    CATEGORIES[cat_type] = new_bucket
+    SETTINGS.setdefault('categories', {})[cat_type] = new_bucket
+    save_settings(SETTINGS)
+    return _json_response({'type': cat_type, 'name': new_name, **new_entry})
+
+
+async def api_categories_delete(request: web.Request):
+    cat_type = request.match_info.get('type')
+    name = unquote(request.match_info.get('name', ''))
+    if cat_type not in ('income', 'expense'):
+        return _json_response({'detail': 'type must be income or expense'}, status=400)
+    if name == 'Інше':
+        return _json_response({'detail': 'cannot delete "Інше"'}, status=400)
+
+    bucket = CATEGORIES.get(cat_type, {})
+    if name not in bucket:
+        return _json_response({'detail': 'category not found'}, status=404)
+
+    del bucket[name]
+    SETTINGS.setdefault('categories', {}).setdefault(cat_type, {}).pop(name, None)
+    save_settings(SETTINGS)
+    return web.Response(status=204)
+
+
+# ---- employees CRUD ----
+
+async def api_employees_list(request: web.Request):
+    return _json_response(SETTINGS.get('employees', []))
+
+
+async def api_employees_create(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+
+    name = (body.get('name') or '').strip()
+    if not name:
+        return _json_response({'detail': 'name required'}, status=400)
+
+    employees_list = SETTINGS.setdefault('employees', [])
+    if name in employees_list:
+        return _json_response({'detail': 'employee already exists'}, status=409)
+
+    employees_list.append(name)
+    EMPLOYEES.clear()
+    EMPLOYEES.extend(employees_list)
+    rebuild_employee_categories()
+    save_settings(SETTINGS)
+    return _json_response({'name': name}, status=201)
+
+
+async def api_employees_delete(request: web.Request):
+    name = unquote(request.match_info.get('name', ''))
+    employees_list = SETTINGS.setdefault('employees', [])
+    if name not in employees_list:
+        return _json_response({'detail': 'employee not found'}, status=404)
+
+    employees_list.remove(name)
+    EMPLOYEES.clear()
+    EMPLOYEES.extend(employees_list)
+    rebuild_employee_categories()
+    save_settings(SETTINGS)
+    return web.Response(status=204)
+
+
+# ---- time categories CRUD ----
+
+async def api_time_categories_list(request: web.Request):
+    return _json_response(SETTINGS.get('time_categories', TIME_CATEGORIES))
+
+
+async def api_time_categories_create(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+
+    name = (body.get('name') or '').strip()
+    if not name:
+        return _json_response({'detail': 'name required'}, status=400)
+
+    bucket = SETTINGS.setdefault('time_categories', {})
+    if name in bucket:
+        return _json_response({'detail': 'time category already exists'}, status=409)
+
+    entry = {'emoji': body.get('emoji', '⏱️')}
+    bucket[name] = entry
+    TIME_CATEGORIES[name] = entry
+    save_settings(SETTINGS)
+    return _json_response({'name': name, **entry}, status=201)
+
+
+async def api_time_categories_delete(request: web.Request):
+    name = unquote(request.match_info.get('name', ''))
+    if name == 'Інше':
+        return _json_response({'detail': 'cannot delete "Інше"'}, status=400)
+
+    bucket = SETTINGS.setdefault('time_categories', {})
+    if name not in bucket:
+        return _json_response({'detail': 'time category not found'}, status=404)
+
+    del bucket[name]
+    TIME_CATEGORIES.pop(name, None)
+    save_settings(SETTINGS)
+    return web.Response(status=204)
+
+
+# ---- time tracks ----
+
+async def api_time_tracks_list(request: web.Request):
+    user_id = request['user_id']
+    now = datetime.now(KYIV_TZ)
+    year = request.rel_url.query.get('year')
+    month = request.rel_url.query.get('month')
+    limit_raw = request.rel_url.query.get('limit')
+
+    try:
+        year_val = int(year) if year else None
+        month_val = int(month) if month else None
+        limit_val = min(int(limit_raw), 500) if limit_raw else None
+    except ValueError:
+        return _json_response({'detail': 'Invalid year/month/limit'}, status=400)
+
+    rows = await db.get_time_tracks(user_id, year=year_val, month=month_val, limit=limit_val)
+    return _json_response([dict(r) for r in rows])
+
+
+async def api_time_tracks_create(request: web.Request):
+    user_id = request['user_id']
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+
+    try:
+        minutes = int(body['minutes'])
+    except (KeyError, TypeError, ValueError):
+        return _json_response({'detail': 'minutes required and must be an integer'}, status=400)
+    if minutes <= 0:
+        return _json_response({'detail': 'minutes must be positive'}, status=400)
+
+    category = str(body.get('category', '')).strip()
+    if not category:
+        return _json_response({'detail': 'category required'}, status=400)
+
+    description = body.get('description', '')
+
+    now = datetime.now(KYIV_TZ)
+    date_str = now.strftime('%Y-%m-%d')
+    ts_str = now.strftime('%Y-%m-%d %H:%M:%S')
+
+    row_id = await db.add_time_track(user_id, minutes, category, description, date_str, ts_str)
+    logger.info(f"API POST /api/time-tracks user={user_id} id={row_id} {minutes}min {category}")
+    return _json_response({
+        'id': row_id,
+        'user_id': user_id,
+        'minutes': minutes,
+        'category': category,
+        'description': description,
+        'date': date_str,
+        'timestamp': ts_str,
+    }, status=201)
+
+
+async def api_time_tracks_delete(request: web.Request):
+    user_id = request['user_id']
+    try:
+        track_id = int(request.match_info['id'])
+    except (KeyError, ValueError):
+        return _json_response({'detail': 'Invalid id'}, status=400)
+
+    rows = await db.get_all_time_tracks(user_id)
+    owned = any(r['id'] == track_id for r in rows)
+    if not owned:
+        return _json_response({'detail': 'Not found'}, status=404)
+
+    await db.delete_time_track(track_id)
+    logger.info(f"API DELETE /api/time-tracks/{track_id} user={user_id}")
+    return web.Response(status=204)
+
+
+# ---- tax settings ----
+
+async def api_settings_tax_update(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+
+    if 'single_tax_rate' in body:
+        try:
+            rate = float(body['single_tax_rate'])
+        except (TypeError, ValueError):
+            return _json_response({'detail': 'single_tax_rate must be a number'}, status=400)
+        if rate < 0 or rate > 1:
+            return _json_response({'detail': 'single_tax_rate must be between 0 and 1'}, status=400)
+        TAX_CONFIG['single_tax_rate'] = rate
+
+    if 'esv_fixed' in body:
+        try:
+            esv = float(body['esv_fixed'])
+        except (TypeError, ValueError):
+            return _json_response({'detail': 'esv_fixed must be a number'}, status=400)
+        if esv < 0:
+            return _json_response({'detail': 'esv_fixed must be >= 0'}, status=400)
+        TAX_CONFIG['esv_fixed'] = esv
+
+    SETTINGS['tax_config'] = TAX_CONFIG
+    save_settings(SETTINGS)
+    return _json_response(TAX_CONFIG)
+
+
 def build_api_app() -> web.Application:
     """Build and return the aiohttp API application."""
     app = web.Application(middlewares=[cors_middleware, init_data_middleware])
@@ -2715,6 +3184,33 @@ def build_api_app() -> web.Application:
     app.router.add_route('GET', '/api/reports/monthly', api_monthly_report)
     app.router.add_route('GET', '/api/categories', api_categories)
     app.router.add_route('GET', '/api/settings', api_settings)
+
+    # ---- new parity routes ----
+    # reports
+    app.router.add_route('GET', '/api/reports/employees', api_report_employees)
+    app.router.add_route('GET', '/api/reports/tax', api_report_tax)
+    app.router.add_route('GET', '/api/reports/accounting', api_report_accounting)
+    app.router.add_route('GET', '/api/reports/time', api_report_time)
+    # categories CRUD
+    app.router.add_route('GET', '/api/categories/full', api_categories_full)
+    app.router.add_route('POST', '/api/categories', api_categories_create)
+    app.router.add_route('PATCH', '/api/categories/{type}/{name}', api_categories_update)
+    app.router.add_route('DELETE', '/api/categories/{type}/{name}', api_categories_delete)
+    # employees CRUD
+    app.router.add_route('GET', '/api/employees', api_employees_list)
+    app.router.add_route('POST', '/api/employees', api_employees_create)
+    app.router.add_route('DELETE', '/api/employees/{name}', api_employees_delete)
+    # time categories CRUD
+    app.router.add_route('GET', '/api/time-categories', api_time_categories_list)
+    app.router.add_route('POST', '/api/time-categories', api_time_categories_create)
+    app.router.add_route('DELETE', '/api/time-categories/{name}', api_time_categories_delete)
+    # time tracks
+    app.router.add_route('GET', '/api/time-tracks', api_time_tracks_list)
+    app.router.add_route('POST', '/api/time-tracks', api_time_tracks_create)
+    app.router.add_route('DELETE', '/api/time-tracks/{id}', api_time_tracks_delete)
+    # tax settings
+    app.router.add_route('PATCH', '/api/settings/tax', api_settings_tax_update)
+
     # Catch-all OPTIONS for CORS preflight on any path
     app.router.add_route('OPTIONS', '/{path_info:.*}', lambda r: web.Response(status=204))
     return app
