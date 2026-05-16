@@ -39,16 +39,20 @@ BUILD = (
 
 
 # ── Rewriters ────────────────────────────────────────────────────
-# Match `from './foo.js'` / `from "../bar.js"` / `import('./baz.js')`
+# Match three import shapes:
+#   from './foo.js'          (bare / named / default / namespace)
+#   import('./bar.js')       (dynamic)
+#   import './side-fx.js'    (side-effect-only, no `from`)
+# Both quote styles, both relative prefixes.
 _JS_IMPORT_RE = re.compile(
-    r"""(from\s+|import\s*\(\s*)(['"])([./][^'"?#]+\.js)(['"]\)?)""",
+    r"""((?:from|import)\s+|import\s*\(\s*)(['"])([./][^'"?#]+\.js)\2""",
     re.MULTILINE,
 )
 
 
 def _bust_js_imports(text: str) -> str:
     """Append ?v=BUILD to every relative .js import in the given source."""
-    return _JS_IMPORT_RE.sub(rf"\1\2\3?v={BUILD}\4", text)
+    return _JS_IMPORT_RE.sub(rf"\1\2\3?v={BUILD}\2", text)
 
 
 def _bust_html(text: str) -> str:

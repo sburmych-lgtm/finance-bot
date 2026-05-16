@@ -190,6 +190,13 @@ class Database:
         """Initialize database and create tables"""
         self.conn = sqlite3.connect(self.db_file, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # WAL mode lets the daily backup read a consistent snapshot while
+        # writers (add_transaction etc.) continue without blocking.
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception as e:
+            logger.warning(f'could not enable WAL: {e}')
         cursor = self.conn.cursor()
 
         # Transactions table
@@ -345,7 +352,8 @@ class Database:
             query += " ORDER BY timestamp DESC"
 
             if limit:
-                query += f" LIMIT {limit}"
+                query += " LIMIT ?"
+                params.append(int(limit))
 
             cursor.execute(query, params)
             rows = cursor.fetchall()
@@ -366,7 +374,8 @@ class Database:
             query += " ORDER BY timestamp DESC"
 
             if limit:
-                query += f" LIMIT {limit}"
+                query += " LIMIT ?"
+                params.append(int(limit))
 
             cursor.execute(query, params)
             rows = cursor.fetchall()
@@ -381,19 +390,33 @@ class Database:
         """Get all time tracks for user"""
         return await self.get_time_tracks(user_id)
 
-    async def delete_transaction(self, transaction_id):
-        """Delete specific transaction by ID"""
+    async def delete_transaction(self, transaction_id, user_id=None):
+        """Delete a transaction. If user_id is given, scope the delete
+        to that owner — preferred path from the API. Bot's inline-button
+        flows call without user_id for backward compatibility."""
         async with db_lock:
             cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
+            if user_id is not None:
+                cursor.execute(
+                    "DELETE FROM transactions WHERE id = ? AND user_id = ?",
+                    (transaction_id, str(user_id)),
+                )
+            else:
+                cursor.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
             self.conn.commit()
             return cursor.rowcount > 0
 
-    async def delete_time_track(self, track_id):
-        """Delete specific time track by ID"""
+    async def delete_time_track(self, track_id, user_id=None):
+        """Delete a time track. user_id scopes it to the owner (API path)."""
         async with db_lock:
             cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM time_tracks WHERE id = ?", (track_id,))
+            if user_id is not None:
+                cursor.execute(
+                    "DELETE FROM time_tracks WHERE id = ? AND user_id = ?",
+                    (track_id, str(user_id)),
+                )
+            else:
+                cursor.execute("DELETE FROM time_tracks WHERE id = ?", (track_id,))
             self.conn.commit()
             return cursor.rowcount > 0
 
@@ -451,9 +474,16 @@ def load_settings():
 
 
 def save_settings(settings):
-    """Save settings to file"""
-    with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+    """Save settings to file *atomically*.
+    Write to <file>.tmp first, then os.replace — guarantees that no concurrent
+    request ever sees a half-written settings.json (which would corrupt on
+    next load_settings and silently revert all custom data to DEFAULT_SETTINGS).
+    """
+    tmp = SETTINGS_FILE + '.tmp'
+    os.makedirs(os.path.dirname(tmp) or '.', exist_ok=True)
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, SETTINGS_FILE)
 
 
 # Load settings and create dynamic categories
@@ -465,7 +495,10 @@ SETTINGS = load_settings()
 EMPLOYEES = list(SETTINGS['employees'])
 TAX_CONFIG = SETTINGS['tax_config']
 CATEGORIES = SETTINGS['categories']
-TIME_CATEGORIES = SETTINGS.get('time_categories', DEFAULT_SETTINGS['time_categories'])
+# If settings.json lacks 'time_categories', fall back to a *copy* of
+# DEFAULT_SETTINGS['time_categories'] — never an alias, or any subsequent
+# mutation would silently corrupt the module-level defaults dict.
+TIME_CATEGORIES = SETTINGS.get('time_categories') or dict(DEFAULT_SETTINGS['time_categories'])
 
 # Add employee categories dynamically
 def rebuild_employee_categories():
@@ -2441,18 +2474,41 @@ async def post_init_notify(application: Application):
 
 _SKIP_AUTH_PATHS = {'/api/health', '/api/exchange-rates'}
 
+# Origins that legitimately host our Mini App.
+# Telegram WebView (iOS/Android native) does not send Origin (or sends 'null'),
+# so we let those through too — the initData HMAC remains the real auth gate.
+_CORS_ALLOW = {
+    'https://web.telegram.org',
+    'https://web.telegram.com',
+    'https://t.me',
+    'https://finance-bot-production-5de8.up.railway.app',
+}
+
 
 @web.middleware
 async def cors_middleware(request: web.Request, handler):
-    """Add CORS headers to every response, handle OPTIONS preflight."""
+    """Add CORS headers, handle OPTIONS preflight. Reflects allow-listed
+    origins so cross-site pages can't read authenticated responses; missing
+    Origin (Telegram iOS/Android WebView) is allowed because there's no
+    cross-origin attack surface in that case."""
+    origin = request.headers.get('Origin', '')
+
     if request.method == 'OPTIONS':
         resp = web.Response(status=204)
     else:
         resp = await handler(request)
 
-    resp.headers['Access-Control-Allow-Origin'] = '*'
+    if not origin or origin == 'null':
+        # Native Telegram WebView — no browser CORS context, safe to allow.
+        allow = '*'
+    elif origin in _CORS_ALLOW:
+        allow = origin
+    else:
+        allow = 'null'  # blocks the browser from reading the body
+    resp.headers['Access-Control-Allow-Origin'] = allow
     resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Telegram-Init-Data'
     resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PATCH, DELETE, OPTIONS'
+    resp.headers['Vary'] = 'Origin'
     return resp
 
 
@@ -2477,15 +2533,19 @@ async def init_data_middleware(request: web.Request, handler):
         return web.json_response({'detail': 'Invalid initData'}, status=401)
 
     tg_user = parsed.get('user') or {}
-    request['user_id'] = str(tg_user.get('id', ''))
+    user_id_val = tg_user.get('id')
+    # Reject auth that passes HMAC but carries no user.id — without this guard
+    # every such request would aggregate into one shared "" bucket in the DB.
+    if not user_id_val:
+        return web.json_response({'detail': 'user id missing'}, status=401)
+    request['user_id'] = str(user_id_val)
     request['tg_user'] = tg_user
     # Auto-register the user so /admin_stats reflects real activity, even if
     # they only ever launched the Mini App and never sent /start.
-    if tg_user.get('id'):
-        try:
-            await db.upsert_user(_UserObj(tg_user))
-        except Exception as e:
-            logger.warning(f'upsert_user via middleware failed: {e}')
+    try:
+        await db.upsert_user(_UserObj(tg_user))
+    except Exception as e:
+        logger.warning(f'upsert_user via middleware failed: {e}')
     return await handler(request)
 
 
@@ -2647,13 +2707,11 @@ async def api_delete_transaction(request: web.Request):
     except (KeyError, ValueError):
         return _json_response({'detail': 'Invalid id'}, status=400)
 
-    # Verify ownership
-    rows = await db.get_transactions(user_id)
-    owned = any(r['id'] == tx_id for r in rows)
-    if not owned:
+    # Scoped DELETE — rowcount tells us atomically whether anything matched.
+    # No race window between Python-level check and SQL delete.
+    deleted = await db.delete_transaction(tx_id, user_id=user_id)
+    if not deleted:
         return _json_response({'detail': 'Not found'}, status=404)
-
-    await db.delete_transaction(tx_id)
     logger.info(f"API DELETE /api/transactions/{tx_id} user={user_id}")
     return web.Response(status=204)
 
@@ -3134,12 +3192,9 @@ async def api_time_tracks_delete(request: web.Request):
     except (KeyError, ValueError):
         return _json_response({'detail': 'Invalid id'}, status=400)
 
-    rows = await db.get_all_time_tracks(user_id)
-    owned = any(r['id'] == track_id for r in rows)
-    if not owned:
+    deleted = await db.delete_time_track(track_id, user_id=user_id)
+    if not deleted:
         return _json_response({'detail': 'Not found'}, status=404)
-
-    await db.delete_time_track(track_id)
     logger.info(f"API DELETE /api/time-tracks/{track_id} user={user_id}")
     return web.Response(status=204)
 
@@ -3157,8 +3212,11 @@ async def api_settings_tax_update(request: web.Request):
             rate = float(body['single_tax_rate'])
         except (TypeError, ValueError):
             return _json_response({'detail': 'single_tax_rate must be a number'}, status=400)
-        if rate < 0 or rate > 1:
-            return _json_response({'detail': 'single_tax_rate must be between 0 and 1'}, status=400)
+        # Sane Ukrainian-FOP range — silently allowing 0% or >25% creates
+        # nonsense reports and we'd rather force the user to think.
+        if rate < 0.01 or rate > 0.25:
+            return _json_response(
+                {'detail': 'single_tax_rate must be between 0.01 (1%) and 0.25 (25%)'}, status=400)
         TAX_CONFIG['single_tax_rate'] = rate
 
     if 'esv_fixed' in body:
@@ -3166,8 +3224,9 @@ async def api_settings_tax_update(request: web.Request):
             esv = float(body['esv_fixed'])
         except (TypeError, ValueError):
             return _json_response({'detail': 'esv_fixed must be a number'}, status=400)
-        if esv < 0:
-            return _json_response({'detail': 'esv_fixed must be >= 0'}, status=400)
+        if esv < 0 or esv > 50000:
+            return _json_response(
+                {'detail': 'esv_fixed must be between 0 and 50000 UAH'}, status=400)
         TAX_CONFIG['esv_fixed'] = esv
 
     SETTINGS['tax_config'] = TAX_CONFIG
