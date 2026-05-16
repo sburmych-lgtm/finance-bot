@@ -53,8 +53,21 @@ async def health(_request: web.Request) -> web.Response:
     return web.json_response({'ok': True, 'service': 'ruby-finance-miniapp', 'api_base': API_BASE or None})
 
 
+@web.middleware
+async def no_cache_middleware(request: web.Request, handler):
+    """Force Telegram WebView to refetch JS/CSS on every load.
+    The Mini App lifecycle is short — bytes are tiny, latency tolerable,
+    and stale code breaks features silently. Always serve fresh."""
+    response = await handler(request)
+    if isinstance(response, web.StreamResponse):
+        response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    return response
+
+
 def build_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[no_cache_middleware])
     app.router.add_get('/', index)
     app.router.add_get('/index.html', index)
     app.router.add_get('/health', health)
