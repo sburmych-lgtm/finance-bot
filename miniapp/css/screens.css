@@ -95,3 +95,105 @@
 /* Settings list */
 .setting-section { margin-top: var(--sp-6); }
 .setting-section .section-title { padding-left: var(--sp-1); }
+
+/* AI card on Reports */
+.ai-card { padding: var(--sp-4); }
+.ai-card-row { display: grid; grid-template-columns: 44px 1fr; gap: var(--sp-3); align-items: flex-start; }
+.ai-card-icon {
+  width: 44px; height: 44px;
+  display: grid; place-items: center;
+  border-radius: var(--r-md);
+  background: linear-gradient(145deg, rgba(216,181,109,.22), rgba(110,15,31,.55));
+  border: 1px solid var(--ruby-line);
+  font-size: 22px;
+}
+.ai-card-title {
+  font-size: var(--fs-14);
+  font-weight: 800;
+  color: var(--ruby-ivory);
+  letter-spacing: -0.02em;
+}
+.ai-card-sub {
+  margin-top: 4px;
+  font-size: var(--fs-12);
+  color: var(--ruby-muted);
+  line-height: 1.5;
+}
+
+/* AI modal */
+.ai-modal {
+  position: fixed; inset: 0;
+  display: none;
+  z-index: 50;
+}
+.ai-modal.show { display: block; }
+.ai-modal-backdrop {
+  position: absolute; inset: 0;
+  background: rgba(10, 6, 8, 0.75);
+  backdrop-filter: blur(8px);
+}
+.ai-modal-panel {
+  position: absolute;
+  inset-inline: var(--sp-4);
+  bottom: calc(var(--safe-bottom) + var(--sp-4));
+  max-height: 80vh;
+  display: flex; flex-direction: column;
+  border-radius: var(--r-2xl);
+  background: var(--ruby-ink);
+  border: 1px solid var(--ruby-gold);
+  box-shadow: var(--shadow-deep);
+  overflow: hidden;
+  animation: slideUp var(--t-base) var(--ease-out);
+}
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.ai-modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: var(--sp-4);
+  border-bottom: 1px solid var(--ruby-line-soft);
+}
+.ai-modal-title {
+  font-family: var(--font-display);
+  font-size: var(--fs-20);
+  color: var(--ruby-ivory);
+  font-weight: 700;
+}
+.ai-modal-close {
+  width: 32px; height: 32px;
+  border: 1px solid var(--ruby-line);
+  background: rgba(255,255,255,.04);
+  color: var(--ruby-gold);
+  border-radius: var(--r-md);
+  font-size: 18px;
+  cursor: pointer;
+}
+.ai-modal-body { padding: var(--sp-4); overflow-y: auto; }
+.ai-modal-hint {
+  color: var(--ruby-muted);
+  font-size: var(--fs-13);
+  margin: 0 0 var(--sp-3);
+}
+.ai-modal-pre {
+  background: var(--ruby-graphite);
+  border: 1px solid var(--ruby-line-soft);
+  border-radius: var(--r-md);
+  padding: var(--sp-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ruby-ivory);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  max-height: 360px;
+  overflow-y: auto;
+  margin: 0;
+}
+.ai-modal-foot {
+  display: grid; grid-template-columns: 1fr 1.5fr;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4) var(--sp-4);
+  border-top: 1px solid var(--ruby-line-soft);
+}
+.ai-modal-foot .btn { min-height: 48px; }
