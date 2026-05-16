@@ -2475,6 +2475,13 @@ async def init_data_middleware(request: web.Request, handler):
     tg_user = parsed.get('user') or {}
     request['user_id'] = str(tg_user.get('id', ''))
     request['tg_user'] = tg_user
+    # Auto-register the user so /admin_stats reflects real activity, even if
+    # they only ever launched the Mini App and never sent /start.
+    if tg_user.get('id'):
+        try:
+            await db.upsert_user(_UserObj(tg_user))
+        except Exception as e:
+            logger.warning(f'upsert_user via middleware failed: {e}')
     return await handler(request)
 
 
