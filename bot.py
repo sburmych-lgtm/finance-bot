@@ -458,7 +458,11 @@ def save_settings(settings):
 
 # Load settings and create dynamic categories
 SETTINGS = load_settings()
-EMPLOYEES = SETTINGS['employees']
+# EMPLOYEES is a *copy* of SETTINGS['employees'] — they MUST be separate
+# list objects, otherwise EMPLOYEES.clear() also wipes SETTINGS['employees']
+# (Python list aliasing), and POST /api/employees ends up persisting an
+# empty list to disk while ostensibly "adding" a new employee.
+EMPLOYEES = list(SETTINGS['employees'])
 TAX_CONFIG = SETTINGS['tax_config']
 CATEGORIES = SETTINGS['categories']
 TIME_CATEGORIES = SETTINGS.get('time_categories', DEFAULT_SETTINGS['time_categories'])
@@ -3003,8 +3007,9 @@ async def api_employees_create(request: web.Request):
         return _json_response({'detail': 'employee already exists'}, status=409)
 
     employees_list.append(name)
-    EMPLOYEES.clear()
-    EMPLOYEES.extend(employees_list)
+    # EMPLOYEES is a separate list — mirror via slice-assign so existing
+    # references to EMPLOYEES (e.g. show_employee_report) see the new state.
+    EMPLOYEES[:] = list(employees_list)
     rebuild_employee_categories()
     save_settings(SETTINGS)
     return _json_response({'name': name}, status=201)
@@ -3017,8 +3022,7 @@ async def api_employees_delete(request: web.Request):
         return _json_response({'detail': 'employee not found'}, status=404)
 
     employees_list.remove(name)
-    EMPLOYEES.clear()
-    EMPLOYEES.extend(employees_list)
+    EMPLOYEES[:] = list(employees_list)
     rebuild_employee_categories()
     save_settings(SETTINGS)
     return web.Response(status=204)
