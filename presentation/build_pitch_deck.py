@@ -402,9 +402,111 @@ def slide_reports(c, n, total):
         ])
 
 
+def _mini_phone(c, x, y, w, image_path, label=None):
+    """Draw a single mini phone-shell with screenshot. Label optional."""
+    img_h = w * 844 / 390
+    # ambient
+    c.saveState()
+    for r in range(20, 0, -2):
+        alpha = (22 - r) / 600.0
+        col = Color(CRIMSON.red, CRIMSON.green, CRIMSON.blue, alpha=alpha)
+        c.setFillColor(col)
+        c.circle(x + w / 2, y + img_h / 2, r * mm, fill=1, stroke=0)
+    c.restoreState()
+    # shell
+    c.setFillColor(GRAPHITE)
+    c.setStrokeColor(rgba('#D8B56D', 0.4))
+    c.setLineWidth(0.8)
+    c.roundRect(x - 1.4 * mm, y - 1.4 * mm, w + 2.8 * mm, img_h + 2.8 * mm, 3 * mm, fill=1, stroke=1)
+    c.drawImage(str(image_path), x, y, width=w, height=img_h, preserveAspectRatio=True, mask='auto')
+    if label:
+        c.setFillColor(GOLD)
+        c.setFont(F_BOLD, 8)
+        c.drawCentredString(x + w / 2, y - 4 * mm, label.upper())
+
+
+def slide_add_time(c, n, total):
+    screen_slide(c, n, total, SHOTS / 'add_time.png',
+        '06 · Mini App',
+        'Час як третій вимір',
+        'У тому ж екрані «Додати» — третя вкладка «⏱ Час». Швидкі пресети 30 / 60 / 90 / 120 хвилин або цифровий ввід, далі — категорія активності з власного списку. Один тап «Зберегти» — і запис у БД.',
+        [
+            ('Пресети + numpad', 'Чотири quick-кнопки покривають 90% випадків. Цифрова панель — для точних значень типу 47 чи 213 хв.'),
+            ('Власні активності', 'Сон, Робота, Зал, Терапія, Уроки англійської, Скрол стрічки — налаштовується у Меню → Категорії часу.'),
+            ('Прямий вплив на звіти', 'Кожен запис йде у «Звіти → Час» і пораховується у продуктивний/непродуктивний/відпочинок.')
+        ])
+
+
+def slide_reports_pack(c, n, total):
+    chrome(c, n, total)
+    title(c, '08 · Mini App · Звіти', 'Чотири bizz-звіти — один свайп', y=PAGE_H - 36 * mm, size=30)
+
+    # 4 mini phones in a row
+    phones = [
+        (SHOTS / 'reports_employees.png',  'Працівники · ROI'),
+        (SHOTS / 'reports_tax.png',        'Податки · ФОП 3'),
+        (SHOTS / 'reports_accounting.png', 'Бухгалтерія · Дт-Кт'),
+        (SHOTS / 'reports_time.png',       'Час · продуктивність'),
+    ]
+    n_phones = len(phones)
+    avail_w = PAGE_W - 2 * MARGIN - (n_phones - 1) * 8 * mm
+    phone_w = avail_w / n_phones
+    phone_w = min(phone_w, 42 * mm)
+    total_phones_w = n_phones * phone_w + (n_phones - 1) * 8 * mm
+    start_x = (PAGE_W - total_phones_w) / 2
+    img_h = phone_w * 844 / 390
+    y = (PAGE_H - img_h) / 2 - 6 * mm
+    for i, (path, label) in enumerate(phones):
+        _mini_phone(c, start_x + i * (phone_w + 8 * mm), y, phone_w, path, label)
+
+    # Bottom strip — feature highlights
+    sy = 22 * mm
+    c.setFillColor(GOLD)
+    c.setFont(F_BOLD, 9)
+    c.drawString(MARGIN, sy + 14, 'ПОВНИЙ ПАКЕТ B2B-ЗВІТНОСТІ')
+    c.setFillColor(MUTED)
+    c.setFont(F_BODY, 10)
+    c.drawString(MARGIN, sy,
+        'ROI кожного працівника · готовий розрахунок єдиного податку та ЄСВ · опeraційні проводки Дт-Кт · аналіз часу з виявленням сліпих зон.')
+    c.drawString(MARGIN, sy - 13,
+        'Кожен звіт — окремий API-endpoint з HMAC-захистом. Місячний пікер вгорі переключає період без перезавантаження.')
+
+
+def slide_settings_pack(c, n, total):
+    chrome(c, n, total)
+    title(c, '12 · Mini App · Меню', 'Все під контролем — без коду', y=PAGE_H - 36 * mm, size=30)
+
+    phones = [
+        (SHOTS / 'settings_categories.png', 'Категорії'),
+        (SHOTS / 'settings_employees.png',  'Працівники'),
+        (SHOTS / 'settings_tax.png',        'Податки'),
+    ]
+    n_phones = len(phones)
+    avail_w = PAGE_W - 2 * MARGIN - (n_phones - 1) * 14 * mm
+    phone_w = avail_w / n_phones
+    phone_w = min(phone_w, 55 * mm)
+    total_phones_w = n_phones * phone_w + (n_phones - 1) * 14 * mm
+    start_x = (PAGE_W - total_phones_w) / 2
+    img_h = phone_w * 844 / 390
+    y = (PAGE_H - img_h) / 2 - 6 * mm
+    for i, (path, label) in enumerate(phones):
+        _mini_phone(c, start_x + i * (phone_w + 14 * mm), y, phone_w, path, label)
+
+    sy = 22 * mm
+    c.setFillColor(GOLD)
+    c.setFont(F_BOLD, 9)
+    c.drawString(MARGIN, sy + 14, 'POWER USER FRIENDLY')
+    c.setFillColor(MUTED)
+    c.setFont(F_BODY, 10)
+    c.drawString(MARGIN, sy,
+        'Додавайте, перейменовуйте, видаляйте: категорії витрат і доходів, активності для часу, працівників.')
+    c.drawString(MARGIN, sy - 13,
+        'При додаванні працівника автоматично створюються «Від <ім\'я>» (дохід) і «ЗП <ім\'я>» (витрата) — звіт ROI працює одразу.')
+
+
 def slide_ai_report(c, n, total):
     screen_slide(c, n, total, SHOTS / 'reports_ai.png',
-        '06 · MINI APP · AI',
+        '09 · MINI APP · AI',
         'AI-аналіз у два дотики',
         'На вкладці «Звіти» — окрема кнопка «Згенерувати AI-аналіз». Вона будує структурований промпт із вашими доходами, витратами, відсотками й контекстом ФОП 3 групи. Скопіюйте текст — і вставте у будь-який AI-чат.',
         [
@@ -416,7 +518,7 @@ def slide_ai_report(c, n, total):
 
 def slide_history(c, n, total):
     screen_slide(c, n, total, SHOTS / 'history.png',
-        '07 · Mini App',
+        '10 · Mini App',
         'Історія — група за днями',
         'Всі операції згруповані за датою. Кожна група містить кількість операцій і список з категорією, описом, валютною сумою. Це бухгалтерська виписка, але читається як стрічка.',
         [
@@ -428,7 +530,7 @@ def slide_history(c, n, total):
 
 def slide_settings(c, n, total):
     screen_slide(c, n, total, SHOTS / 'settings.png',
-        '08 · Mini App',
+        '11 · Mini App',
         'Меню — профіль, курси, приватність',
         'Профіль Telegram-користувача, поточні курси USD/EUR за НБУ, список редагованих категорій, налаштування податків (ФОП 3 група), кнопка очищення власних даних.',
         [
@@ -440,7 +542,7 @@ def slide_settings(c, n, total):
 
 def slide_architecture(c, n, total):
     chrome(c, n, total)
-    title(c, '09 · Архітектура', 'Дві служби, одна БД, нуль зайвого', y=PAGE_H - 40 * mm)
+    title(c, '13 · Архітектура', 'Дві служби, одна БД, нуль зайвого', y=PAGE_H - 40 * mm)
 
     # Pipeline diagram
     y = PAGE_H - 110 * mm
@@ -493,7 +595,7 @@ def slide_architecture(c, n, total):
 
 def slide_monetization(c, n, total):
     chrome(c, n, total)
-    title(c, '10 · Монетизація', 'Три тарифи. Один Telegram-чекаут.', y=PAGE_H - 40 * mm)
+    title(c, '14 · Монетизація', 'Три тарифи. Один Telegram-чекаут.', y=PAGE_H - 40 * mm)
 
     y = PAGE_H - 80 * mm
     col_w = (PAGE_W - 2 * MARGIN - 2 * 10 * mm) / 3
@@ -585,7 +687,7 @@ def slide_monetization(c, n, total):
 
 def slide_roadmap(c, n, total):
     chrome(c, n, total)
-    title(c, '11 · Roadmap', 'Що буде далі', y=PAGE_H - 40 * mm)
+    title(c, '15 · Roadmap', 'Що буде далі', y=PAGE_H - 40 * mm)
 
     # Timeline
     y = PAGE_H - 110 * mm
@@ -647,7 +749,7 @@ def slide_contact(c, n, total):
     y_eyebrow = PAGE_H - 48 * mm
     c.setFillColor(GOLD)
     c.setFont(F_BOLD, 11)
-    c.drawCentredString(PAGE_W / 2, y_eyebrow, '12 · ВІДКРИЙ ЗАРАЗ')
+    c.drawCentredString(PAGE_W / 2, y_eyebrow, '16 · ВІДКРИЙ ЗАРАЗ')
 
     y_title = y_eyebrow - 38
     c.setFillColor(IVORY)
@@ -730,19 +832,22 @@ def build():
     c.setSubject('Telegram Mini App for Professionals')
 
     slides = [
-        slide_cover,
-        slide_problem,
-        slide_solution,
-        slide_home,
-        slide_add,
-        slide_reports,
-        slide_ai_report,
-        slide_history,
-        slide_settings,
-        slide_architecture,
-        slide_monetization,
-        slide_roadmap,
-        slide_contact,
+        slide_cover,           # 01
+        slide_problem,         # 02
+        slide_solution,        # 03
+        slide_home,            # 04
+        slide_add,             # 05
+        slide_add_time,        # 06  NEW
+        slide_reports,         # 07
+        slide_reports_pack,    # 08  NEW
+        slide_ai_report,       # 09
+        slide_history,         # 10
+        slide_settings,        # 11
+        slide_settings_pack,   # 12  NEW
+        slide_architecture,    # 13
+        slide_monetization,    # 14
+        slide_roadmap,         # 15
+        slide_contact,         # 16
     ]
     total = len(slides)
     for i, slide in enumerate(slides, 1):
