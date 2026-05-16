@@ -2474,6 +2474,32 @@ async def post_init_notify(application: Application):
 
 _SKIP_AUTH_PATHS = {'/api/health', '/api/exchange-rates'}
 
+
+@web.middleware
+async def json_errors_middleware(request: web.Request, handler):
+    """Convert framework 4xx/5xx (and uncaught exceptions) to JSON
+    `{"detail": "..."}` so the Mini App's error handler never sees plain text
+    or HTML. This catches things like 405 Method Not Allowed, 404 from the
+    router, and any unhandled exception inside a handler (e.g. NaN crash)."""
+    try:
+        resp = await handler(request)
+    except web.HTTPException as e:
+        # aiohttp uses HTTPException for 4xx/5xx routing/method errors
+        if request.path.startswith('/api'):
+            return _json_response({'detail': e.reason or 'Error'}, status=e.status)
+        raise
+    except Exception as e:  # pragma: no cover — catch-all safety net
+        if request.path.startswith('/api'):
+            logger.exception(f'unhandled in {request.method} {request.path}: {e}')
+            return _json_response({'detail': 'internal error'}, status=500)
+        raise
+    # Convert non-JSON 4xx/5xx responses (e.g. aiohttp's default 405 text) to JSON
+    if (request.path.startswith('/api')
+            and resp.status >= 400
+            and resp.content_type != 'application/json'):
+        return _json_response({'detail': resp.reason or 'Error'}, status=resp.status)
+    return resp
+
 # Origins that legitimately host our Mini App.
 # Telegram WebView (iOS/Android native) does not send Origin (or sends 'null'),
 # so we let those through too — the initData HMAC remains the real auth gate.
@@ -2604,13 +2630,9 @@ async def api_exchange_rates(request: web.Request):
 
 async def api_balance(request: web.Request):
     user_id = request['user_id']
-    now = datetime.now(KYIV_TZ)
-    try:
-        year = int(request.rel_url.query.get('year', now.year))
-        month = int(request.rel_url.query.get('month', now.month))
-    except ValueError:
-        return _json_response({'detail': 'Invalid year/month'}, status=400)
-
+    year, month, err = _parse_year_month(request)
+    if err is not None:
+        return err
     rows = await db.get_transactions(user_id, year=year, month=month)
     income = sum(r['amount_uah'] for r in rows if r['type'] == 'income')
     expense = sum(r['amount_uah'] for r in rows if r['type'] == 'expense')
@@ -2624,11 +2646,9 @@ async def api_balance(request: web.Request):
 
 async def api_get_transactions(request: web.Request):
     user_id = request['user_id']
-    try:
-        limit = min(int(request.rel_url.query.get('limit', 15)), 100)
-    except ValueError:
-        limit = 15
-
+    limit, err = _parse_limit(request, default=15, hard_cap=100)
+    if err is not None:
+        return err
     rows = await db.get_transactions(user_id, limit=limit)
     result = [
         {
@@ -2660,20 +2680,39 @@ async def api_post_transaction(request: web.Request):
     if t_type not in ('income', 'expense'):
         return _json_response({'detail': 'type must be income or expense'}, status=400)
 
-    try:
-        amount = float(body['amount'])
-    except (KeyError, TypeError, ValueError):
+    raw_amount = body.get('amount')
+    if raw_amount is None or isinstance(raw_amount, bool):
         return _json_response({'detail': 'amount required and must be a number'}, status=400)
+    try:
+        amount = float(raw_amount)
+    except (TypeError, ValueError):
+        return _json_response({'detail': 'amount must be a number'}, status=400)
+    # Reject NaN / Inf (Python's json parser accepts these, breaks downstream)
+    import math
+    if not math.isfinite(amount):
+        return _json_response({'detail': 'amount must be a finite number'}, status=400)
+    # Positive only — negative/zero amounts silently corrupt every report.
+    if amount <= 0:
+        return _json_response({'detail': 'amount must be > 0'}, status=400)
+    # Cap to a sane upper bound (1 billion of any currency)
+    if amount > 1_000_000_000:
+        return _json_response({'detail': 'amount too large'}, status=400)
 
     currency = str(body.get('currency', 'UAH')).upper()
     if currency not in ('UAH', 'USD', 'EUR'):
         return _json_response({'detail': 'currency must be UAH, USD, or EUR'}, status=400)
 
-    category = str(body.get('category', 'Інше'))
-    description = body.get('description', '')
+    category = _clean_text(body.get('category'), max_len=80, default='Інше')
+    description = _clean_text(body.get('description'), max_len=200, default='')
 
     rate = await get_exchange_rate(currency)
     amount_uah = round(convert_to_uah(amount, currency, rate), 2)
+    # Reject sub-kopiyka amounts: storing amount=0.001 UAH and amount_uah=0.0
+    # would silently delete the entry from reports (display says 0.001, math
+    # uses 0). Force the user to pick a meaningful figure.
+    if amount_uah < 0.01:
+        return _json_response(
+            {'detail': 'amount too small (UAH equivalent must be at least 0.01)'}, status=400)
 
     now = datetime.now(KYIV_TZ)
     date_str = now.strftime('%Y-%m-%d')
@@ -2718,13 +2757,9 @@ async def api_delete_transaction(request: web.Request):
 
 async def api_monthly_report(request: web.Request):
     user_id = request['user_id']
-    now = datetime.now(KYIV_TZ)
-    try:
-        year = int(request.rel_url.query.get('year', now.year))
-        month = int(request.rel_url.query.get('month', now.month))
-    except ValueError:
-        return _json_response({'detail': 'Invalid year/month'}, status=400)
-
+    year, month, err = _parse_year_month(request)
+    if err is not None:
+        return err
     rows = await db.get_transactions(user_id, year=year, month=month)
     income_by_cat: dict[str, float] = {}
     expense_by_cat: dict[str, float] = {}
@@ -2776,7 +2811,41 @@ def _parse_year_month(request: web.Request):
         return None, None, _json_response({'detail': 'Invalid year/month'}, status=400)
     if not (1 <= month <= 12):
         return None, None, _json_response({'detail': 'month must be 1-12'}, status=400)
+    # Reject silly years (year=0 produced '0000-01-01' periods)
+    if not (2000 <= year <= now.year + 1):
+        return None, None, _json_response(
+            {'detail': f'year must be between 2000 and {now.year + 1}'}, status=400)
     return year, month, None
+
+
+def _parse_limit(request: web.Request, default: int = 15, hard_cap: int = 500):
+    """Parse ?limit=N. Returns (limit, err_response_or_None).
+    Rejects non-int, <=0; clamps to hard_cap."""
+    raw = request.rel_url.query.get('limit')
+    if raw is None:
+        return default, None
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return None, _json_response({'detail': 'limit must be a positive integer'}, status=400)
+    if val < 1:
+        return None, _json_response({'detail': 'limit must be >= 1'}, status=400)
+    return min(val, hard_cap), None
+
+
+def _clean_text(value, max_len: int, default: str = '') -> str:
+    """Coerce arbitrary JSON value to a safe text:
+      • None / non-str → default
+      • strip NULL bytes (break Telegram rendering, log tooling)
+      • truncate to max_len
+    """
+    if value is None:
+        return default
+    s = value if isinstance(value, str) else str(value)
+    s = s.replace('\x00', '').strip()
+    if not s:
+        return default
+    return s[:max_len]
 
 
 # ---- reports parity ----
@@ -3013,15 +3082,21 @@ async def api_categories_update(request: web.Request):
 
     new_entry = {'emoji': new_emoji, 'keywords': new_keywords or []}
 
-    # Rebuild preserving order
+    # Build the rebuilt bucket fully off-bucket first (no partial state visible
+    # mid-operation), then swap atomically into CATEGORIES & SETTINGS. Avoids
+    # the "old key + new key both present" race observed in QA.
     new_bucket = {}
-    for k, v in bucket.items():
+    for k, v in list(bucket.items()):
         if k == name:
             new_bucket[new_name] = new_entry
         else:
             new_bucket[k] = v
+    # If we somehow already had new_name (shouldn't, guarded above), the dict
+    # construction above silently dropped one — make that explicit.
+    if len(new_bucket) != len(bucket):
+        return _json_response({'detail': 'rename collision'}, status=409)
+    # Single source of truth — CATEGORIES is an alias of SETTINGS['categories'].
     CATEGORIES[cat_type] = new_bucket
-    SETTINGS.setdefault('categories', {})[cat_type] = new_bucket
     save_settings(SETTINGS)
     return _json_response({'type': cat_type, 'name': new_name, **new_entry})
 
@@ -3132,17 +3207,18 @@ async def api_time_categories_delete(request: web.Request):
 
 async def api_time_tracks_list(request: web.Request):
     user_id = request['user_id']
-    now = datetime.now(KYIV_TZ)
-    year = request.rel_url.query.get('year')
-    month = request.rel_url.query.get('month')
-    limit_raw = request.rel_url.query.get('limit')
-
-    try:
-        year_val = int(year) if year else None
-        month_val = int(month) if month else None
-        limit_val = min(int(limit_raw), 500) if limit_raw else None
-    except ValueError:
-        return _json_response({'detail': 'Invalid year/month/limit'}, status=400)
+    year_raw = request.rel_url.query.get('year')
+    month_raw = request.rel_url.query.get('month')
+    year_val = month_val = None
+    if year_raw or month_raw:
+        # both required together if either is present
+        y, m, err = _parse_year_month(request)
+        if err is not None:
+            return err
+        year_val, month_val = y, m
+    limit_val, err = _parse_limit(request, default=None, hard_cap=500)
+    if err is not None:
+        return err
 
     rows = await db.get_time_tracks(user_id, year=year_val, month=month_val, limit=limit_val)
     return _json_response([dict(r) for r in rows])
@@ -3155,18 +3231,29 @@ async def api_time_tracks_create(request: web.Request):
     except Exception:
         return _json_response({'detail': 'Invalid JSON'}, status=400)
 
-    try:
-        minutes = int(body['minutes'])
-    except (KeyError, TypeError, ValueError):
+    raw_minutes = body.get('minutes')
+    if raw_minutes is None or isinstance(raw_minutes, bool):
         return _json_response({'detail': 'minutes required and must be an integer'}, status=400)
+    try:
+        minutes = int(raw_minutes)
+    except (TypeError, ValueError):
+        return _json_response({'detail': 'minutes must be an integer'}, status=400)
     if minutes <= 0:
         return _json_response({'detail': 'minutes must be positive'}, status=400)
+    if minutes > 24 * 60:
+        return _json_response({'detail': 'minutes cannot exceed 1440 (24 h)'}, status=400)
 
-    category = str(body.get('category', '')).strip()
+    category = _clean_text(body.get('category'), max_len=60)
     if not category:
         return _json_response({'detail': 'category required'}, status=400)
+    # Whitelist: must be a known time category, else productivity buckets
+    # silently lose this entry's minutes.
+    known_time_cats = set(SETTINGS.get('time_categories') or TIME_CATEGORIES or {}) or set()
+    if known_time_cats and category not in known_time_cats:
+        return _json_response(
+            {'detail': f'unknown time category "{category}"'}, status=400)
 
-    description = body.get('description', '')
+    description = _clean_text(body.get('description'), max_len=200)
 
     now = datetime.now(KYIV_TZ)
     date_str = now.strftime('%Y-%m-%d')
@@ -3236,7 +3323,9 @@ async def api_settings_tax_update(request: web.Request):
 
 def build_api_app() -> web.Application:
     """Build and return the aiohttp API application."""
-    app = web.Application(middlewares=[cors_middleware, init_data_middleware])
+    # Order matters: json_errors first (catches everything else), then CORS
+    # (so the error JSON also carries CORS headers), then init-data auth.
+    app = web.Application(middlewares=[json_errors_middleware, cors_middleware, init_data_middleware])
     app.router.add_route('GET', '/api/health', api_health)
     app.router.add_route('GET', '/api/me', api_me)
     app.router.add_route('GET', '/api/exchange-rates', api_exchange_rates)
