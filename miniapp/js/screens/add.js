@@ -11,10 +11,18 @@ const state = {
   currency: 'UAH',
   category: null,
   note: '',
+  empOpen: false,  // employees-submenu collapse state
 };
 
 function symbolFor(cur) {
   return cur === 'UAH' ? '₴' : cur === 'USD' ? '$' : cur === 'EUR' ? '€' : esc(cur);
+}
+
+// Employee categories follow the bot's naming convention:
+//   • income  → 'Від <name>'  (we received money from this person)
+//   • expense → 'ЗП <name>'   (we paid salary to this person)
+function _empPrefix(mode) {
+  return mode === 'income' ? 'Від ' : 'ЗП ';
 }
 
 function categoriesFor(mode) {
@@ -29,6 +37,15 @@ function categoriesFor(mode) {
   const cats = Store.categories?.[mode];
   if (cats && Array.isArray(cats)) return cats;
   return mode === 'income' ? fallbackIncome : fallbackExpense;
+}
+
+function splitCategoriesByEmployee(mode, allCats) {
+  const prefix = _empPrefix(mode);
+  const regular = allCats.filter((c) => !c.startsWith(prefix));
+  const employeeNames = allCats
+    .filter((c) => c.startsWith(prefix))
+    .map((c) => c.slice(prefix.length));
+  return { regular, employeeNames };
 }
 
 function emojiFor(mode, cat) {
@@ -78,13 +95,37 @@ function template() {
     <div class="section-head" style="margin-top: var(--sp-4);">
       <div class="section-title">${isTime ? 'Активність' : 'Категорія'}</div>
     </div>
-    <div class="chip-grid">
-      ${cats.map((c) => {
-        const em = emojiFor(state.mode, c);
-        const label = em ? `${em} ${c}` : c;
-        return `<button class="chip ${state.category === c ? 'active' : ''}" data-cat="${esc(c)}">${esc(label)}</button>`;
-      }).join('')}
-    </div>
+    ${(() => {
+      if (isTime) {
+        return `<div class="chip-grid">${cats.map((c) => {
+          const em = emojiFor('time', c);
+          const label = em ? `${em} ${c}` : c;
+          return `<button class="chip ${state.category === c ? 'active' : ''}" data-cat="${esc(c)}">${esc(label)}</button>`;
+        }).join('')}</div>`;
+      }
+      // Money mode: split into regular categories + employees submenu
+      const { regular, employeeNames } = splitCategoriesByEmployee(state.mode, cats);
+      const prefix = _empPrefix(state.mode);
+      const groupLabel = state.mode === 'income' ? '👥 Від працівників' : '💼 ЗП працівникам';
+      const empActive = state.category && state.category.startsWith(prefix);
+      const regularHtml = `<div class="chip-grid">${regular.map((c) => {
+        return `<button class="chip ${state.category === c ? 'active' : ''}" data-cat="${esc(c)}">${esc(c)}</button>`;
+      }).join('')}</div>`;
+      const empHtml = employeeNames.length ? `
+        <button class="emp-group-toggle ${(state.empOpen || empActive) ? 'open' : ''} ${empActive ? 'active' : ''}" id="empToggle">
+          <span>${esc(groupLabel)}</span>
+          <span class="emp-arrow">${(state.empOpen || empActive) ? '▾' : '▸'}</span>
+        </button>
+        ${(state.empOpen || empActive) ? `
+          <div class="chip-grid emp-grid">
+            ${employeeNames.map((n) => {
+              const cat = prefix + n;
+              return `<button class="chip emp-chip ${state.category === cat ? 'active' : ''}" data-cat="${esc(cat)}">${esc(n)}</button>`;
+            }).join('')}
+          </div>` : ''}
+      ` : '';
+      return regularHtml + empHtml;
+    })()}
 
     <div class="field" style="margin-top: var(--sp-4);">
       <label>${isTime ? 'Опис (необов\'язково)' : 'Коментар (необов\'язково)'}</label>
@@ -120,6 +161,11 @@ function bind(root) {
     Telegram.haptic('selection');
     renderAdd();
   }));
+  root.querySelector('#empToggle')?.addEventListener('click', () => {
+    state.empOpen = !state.empOpen;
+    Telegram.haptic('selection');
+    renderAdd();
+  });
   root.querySelectorAll('[data-key]').forEach((b) => b.addEventListener('click', () => {
     const k = b.dataset.key;
     Telegram.haptic('light');

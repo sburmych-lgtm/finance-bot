@@ -92,6 +92,47 @@
 .report-row .donut { flex: 0 0 auto; }
 .report-row .legend { flex: 1; }
 
+/* Employees submenu toggle on Add screen */
+.emp-group-toggle {
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%;
+  margin-top: var(--sp-3);
+  padding: 14px 16px;
+  border: 1px solid var(--ruby-line);
+  background: linear-gradient(145deg, rgba(216,181,109,.08), rgba(110,15,31,.18));
+  color: var(--ruby-ivory);
+  border-radius: var(--r-lg);
+  font-size: var(--fs-14);
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  transition: all var(--t-fast) var(--ease-out);
+}
+.emp-group-toggle.open {
+  border-color: var(--ruby-gold);
+  background: linear-gradient(145deg, rgba(216,181,109,.16), rgba(110,15,31,.28));
+}
+.emp-group-toggle.active {
+  border-color: var(--ruby-gold);
+  background: linear-gradient(135deg, var(--ruby-burgundy), var(--ruby-primary));
+}
+.emp-group-toggle .emp-arrow {
+  color: var(--ruby-gold);
+  font-size: var(--fs-17);
+  margin-left: var(--sp-2);
+}
+.emp-grid {
+  margin-top: var(--sp-2);
+  padding: var(--sp-3);
+  border-radius: var(--r-lg);
+  background: rgba(255,255,255,.025);
+  border: 1px dashed var(--ruby-line-soft);
+}
+.emp-chip {
+  background: rgba(216,181,109,.06);
+  border-color: var(--ruby-line);
+}
+
 /* Settings list */
 .setting-section { margin-top: var(--sp-6); }
 .setting-section .section-title { padding-left: var(--sp-1); }
