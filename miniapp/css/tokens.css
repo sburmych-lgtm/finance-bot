@@ -27,14 +27,17 @@
   --ruby-danger:     #D45A4F;
   --ruby-warning:    #E8B863;
 
-  /* ── Telegram theme bridge ─────────────────────────────────── */
-  --tg-bg:          var(--tg-theme-bg-color,            var(--ruby-ink));
-  --tg-bg-sec:      var(--tg-theme-secondary-bg-color,  var(--ruby-graphite));
-  --tg-text:        var(--tg-theme-text-color,          var(--ruby-ivory));
-  --tg-hint:        var(--tg-theme-hint-color,          var(--ruby-muted));
-  --tg-link:        var(--tg-theme-link-color,          var(--ruby-gold));
-  --tg-button:      var(--tg-theme-button-color,        var(--ruby-primary));
-  --tg-button-text: var(--tg-theme-button-text-color,   var(--ruby-ivory));
+  /* ── Brand-locked surface vars (ignore Telegram theme on purpose) ──
+     Ruby Finance ships its own identity. We do NOT inherit
+     --tg-theme-*-color, because that lets a user's bright iOS theme
+     wash out the luxury palette in daylight. */
+  --tg-bg:          var(--ruby-ink);
+  --tg-bg-sec:      var(--ruby-graphite);
+  --tg-text:        var(--ruby-ivory);
+  --tg-hint:        var(--ruby-muted);
+  --tg-link:        var(--ruby-gold);
+  --tg-button:      var(--ruby-primary);
+  --tg-button-text: var(--ruby-ivory);
 
   /* ── Typography ────────────────────────────────────────────── */
   --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Display",
@@ -97,23 +100,25 @@
   --safe-bottom: env(safe-area-inset-bottom, 0px);
 }
 
-[data-theme="light"] {
-  color-scheme: light;
-  --ruby-ink:       #FBF6EE;
-  --ruby-graphite:  #FFFDFC;
-  --ruby-fog:       #F7EFE4;
-  --ruby-line:      rgba(122, 16, 32, 0.18);
-  --ruby-line-soft: rgba(122, 16, 32, 0.08);
-  --ruby-oxblood:   #5B101D;
-  --ruby-burgundy:  #7A1020;
-  --ruby-primary:   #9E2434;
-  --ruby-primary-hot:#B22A3F;
-  --ruby-gold:      #A77E2D;
-  --ruby-gold-soft: #70531F;
-  --ruby-ivory:     #181112;
-  --ruby-muted:     #5F4E45;
-  --ruby-dim:       #8A776B;
-  --shadow-card:    0 18px 44px rgba(58, 11, 20, 0.12);
-  --shadow-gold:    0 14px 34px rgba(167, 126, 45, 0.16);
-  --shadow-crimson: 0 16px 34px rgba(155, 27, 48, 0.20);
+/* Light mode is intentionally NOT supported — Ruby Finance is dark-only.
+   Re-assert dark palette under any prefers-color-scheme so iOS daytime
+   schedules can't bleach the app. */
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: dark;
+    --ruby-ink:        #0A0608;
+    --ruby-graphite:   #14101A;
+    --ruby-fog:        #1E1820;
+    --ruby-line:       rgba(216, 181, 109, 0.18);
+    --ruby-line-soft:  rgba(247, 241, 231, 0.08);
+    --ruby-oxblood:    #3A0B14;
+    --ruby-burgundy:   #6E0F1F;
+    --ruby-primary:    #9B1B30;
+    --ruby-primary-hot:#C2243B;
+    --ruby-gold:       #D8B56D;
+    --ruby-gold-soft:  #F2E3BE;
+    --ruby-ivory:      #F7F1E7;
+    --ruby-muted:      #B8A99D;
+    --ruby-dim:        #7A6E66;
+  }
 }

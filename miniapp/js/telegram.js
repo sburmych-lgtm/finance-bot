@@ -16,12 +16,18 @@ export const Telegram = {
       if (typeof tg.disableVerticalSwipes === 'function') {
         try { tg.disableVerticalSwipes(); } catch (_) {}
       }
-      // Apply Telegram theme colors to header & bottom bar where supported.
+      // Ruby Finance is dark-only — paint the Telegram chrome ruby-ink so
+      // there is no light flash regardless of the user's Telegram theme.
       if (typeof tg.setHeaderColor === 'function') {
-        try { tg.setHeaderColor('secondary_bg_color'); } catch (_) {}
+        try { tg.setHeaderColor('#0A0608'); } catch (_) {
+          try { tg.setHeaderColor('bg_color'); } catch (_) {}
+        }
       }
       if (typeof tg.setBackgroundColor === 'function') {
         try { tg.setBackgroundColor('#0A0608'); } catch (_) {}
+      }
+      if (typeof tg.setBottomBarColor === 'function') {
+        try { tg.setBottomBarColor('#0A0608'); } catch (_) {}
       }
     } catch (e) {
       console.warn('Telegram.ready failed', e);

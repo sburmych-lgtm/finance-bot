@@ -23,7 +23,7 @@
           <div class="screen-title" id="screenTitle">Огляд</div>
         </div>
       </div>
-      <button class="ghost-btn" id="themeToggle" aria-label="Перемкнути тему">☾</button>
+      <button class="ghost-btn" id="aboutBtn" aria-label="Інфо">i</button>
     </header>
 
     <div class="content">
@@ -86,13 +86,12 @@
   <script>
     // API base — runtime-injected by server (or fall back to same origin)
     window.__RUBY_API_BASE__ = window.__RUBY_API_BASE__ || '';
-    // Theme toggle (Telegram drives colors via CSS vars; this is a local override)
-    document.getElementById('themeToggle').addEventListener('click', () => {
-      const root = document.documentElement;
-      const cur = root.dataset.theme === 'light' ? 'light' : 'dark';
-      const next = cur === 'dark' ? 'light' : 'dark';
-      root.dataset.theme = next;
-      document.getElementById('themeToggle').textContent = next === 'dark' ? '☾' : '☀';
+    // Ruby Finance is dark-only — force the attribute and ignore any system
+    // preference. Helps when iOS Safari overrides via prefers-color-scheme.
+    document.documentElement.setAttribute('data-theme', 'dark');
+    document.getElementById('aboutBtn').addEventListener('click', () => {
+      const navItem = document.querySelector('[data-nav="settings"]');
+      navItem?.click();
       if (window.Telegram?.WebApp?.HapticFeedback) {
         try { window.Telegram.WebApp.HapticFeedback.selectionChanged(); } catch (_) {}
       }
