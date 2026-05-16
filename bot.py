@@ -2728,6 +2728,8 @@ def main():
     application.add_handler(CommandHandler("info", show_info))
     application.add_handler(CommandHandler("settings", show_settings))
     application.add_handler(CommandHandler("admin_stats", admin_stats))
+    application.add_handler(CommandHandler("stats", admin_stats))  # short alias
+    application.add_handler(CommandHandler("admin", admin_stats))  # shorter alias
     application.add_handler(CommandHandler("broadcast", admin_broadcast))
 
     # Callbacks
