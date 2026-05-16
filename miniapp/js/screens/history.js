@@ -1,7 +1,9 @@
-/* History screen — full transaction list */
+/* History screen — full transaction list with per-row delete */
 
 import { Store } from '../app.js';
-import { fmtMoney, fmtDate, esc } from '../ui.js';
+import { Api } from '../api.js';
+import { Telegram } from '../telegram.js';
+import { fmtMoney, fmtDate, esc, toast } from '../ui.js';
 
 const CATEGORY_LETTER = {
   'Продукти':'П','Кафе':'К','Транспорт':'Т','Розваги':'Р','Здоров\'я':'Z',
@@ -36,7 +38,7 @@ export function renderHistory() {
     </div>
     <div class="row-list">
       ${items.map((t) => `
-        <div class="row">
+        <div class="row history-row" data-tx-id="${esc(String(t.id))}">
           <div class="avatar">${esc(CATEGORY_LETTER[t.category] || (t.category?.[0] || '•').toUpperCase())}</div>
           <div>
             <div class="row-title">${esc(t.category || 'Інше')}</div>
@@ -46,8 +48,34 @@ export function renderHistory() {
             t.type === 'expense' ? -(t.amount_uah || t.amount) : (t.amount_uah || t.amount),
             'UAH'
           ))}</div>
+          <button class="history-del" data-del="${esc(String(t.id))}" aria-label="Видалити">×</button>
         </div>
       `).join('')}
     </div>
   `).join('');
+
+  // Per-row delete handler — same UX as the bot's «↩️ Відмінити» but on any row
+  root.querySelectorAll('[data-del]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const txId = btn.dataset.del;
+      const tx = (Store.transactions || []).find((x) => String(x.id) === txId);
+      if (!tx) return;
+      const amountStr = fmtMoney(
+        tx.type === 'expense' ? -(tx.amount_uah || tx.amount) : (tx.amount_uah || tx.amount),
+        'UAH'
+      );
+      if (!window.confirm(`Видалити «${tx.category} · ${amountStr}»? Цю дію неможливо скасувати.`)) return;
+      try {
+        await Api.deleteTransaction(tx.id);
+        Telegram.haptic('success');
+        toast('Видалено');
+        await Store.hydrate();
+        renderHistory();
+      } catch (err) {
+        Telegram.haptic('error');
+        toast(err.message || 'Помилка');
+      }
+    });
+  });
 }

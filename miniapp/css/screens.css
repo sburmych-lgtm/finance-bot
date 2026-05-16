@@ -92,6 +92,68 @@
 .report-row .donut { flex: 0 0 auto; }
 .report-row .legend { flex: 1; }
 
+/* Undo card on Home */
+.undo-card {
+  margin-top: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  background: linear-gradient(145deg, rgba(216,181,109,.06), rgba(110,15,31,.10));
+  border: 1px solid rgba(216,181,109,.22);
+}
+.undo-row {
+  display: grid;
+  grid-template-columns: 40px 1fr auto;
+  align-items: center;
+  gap: var(--sp-3);
+}
+.undo-icon {
+  width: 40px; height: 40px;
+  display: grid; place-items: center;
+  border-radius: var(--r-md);
+  border: 1px solid var(--ruby-line);
+  color: var(--ruby-gold);
+  font-size: var(--fs-20);
+  font-family: var(--font-display);
+}
+.undo-title {
+  font-size: var(--fs-13);
+  font-weight: 800;
+  color: var(--ruby-ivory);
+}
+.undo-meta {
+  margin-top: 2px;
+  font-size: var(--fs-12);
+  color: var(--ruby-muted);
+}
+.undo-btn {
+  padding: 10px 14px;
+  border-radius: var(--r-md);
+  border: 1px solid rgba(212, 90, 79, 0.4);
+  background: rgba(212, 90, 79, 0.14);
+  color: var(--ruby-danger);
+  font-size: var(--fs-12);
+  font-weight: 800;
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease-out);
+}
+.undo-btn:active { background: rgba(212, 90, 79, 0.28); }
+
+/* History per-row delete button */
+.history-row {
+  grid-template-columns: 44px 1fr auto 32px;
+}
+.history-del {
+  width: 28px; height: 28px;
+  border: 1px solid var(--ruby-line-soft);
+  background: rgba(212, 90, 79, 0.06);
+  color: var(--ruby-danger);
+  border-radius: 50%;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease-out);
+}
+.history-del:active { background: rgba(212, 90, 79, 0.24); }
+
 /* Employees submenu toggle on Add screen */
 .emp-group-toggle {
   display: flex; align-items: center; justify-content: space-between;
