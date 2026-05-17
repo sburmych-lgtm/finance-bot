@@ -267,8 +267,50 @@ class Database:
             )
         ''')
 
+        # Per-user settings: each user owns their own employees, categories,
+        # time categories, tax config. Stored as a JSON blob for schema-less
+        # forward compatibility — every Mini App settings change writes here,
+        # never the global SETTINGS file (which is now boot-time defaults only).
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id TEXT PRIMARY KEY,
+                settings_json TEXT NOT NULL,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         self.conn.commit()
         logger.info("Database initialized successfully")
+
+    async def get_user_settings(self, user_id):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT settings_json FROM user_settings WHERE user_id = ?",
+                (str(user_id),),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            try:
+                return json.loads(row['settings_json'])
+            except (json.JSONDecodeError, TypeError):
+                return None
+
+    async def save_user_settings(self, user_id, settings):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                '''
+                INSERT INTO user_settings (user_id, settings_json, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    settings_json = excluded.settings_json,
+                    updated_at = CURRENT_TIMESTAMP
+                ''',
+                (str(user_id), json.dumps(settings, ensure_ascii=False)),
+            )
+            self.conn.commit()
 
     async def upsert_user(self, user):
         if not user:
@@ -525,6 +567,70 @@ rebuild_employee_categories()
 
 # Initialize database
 db = Database()
+
+
+# ============================================================
+# Per-user settings layer.
+# The globals above (SETTINGS, CATEGORIES, EMPLOYEES, TAX_CONFIG,
+# TIME_CATEGORIES) are now *defaults* used to seed each new user and
+# kept as a fallback for the bot's Telegram-flow until that's migrated.
+# Every Mini App request runs through user_settings_for(user_id) so
+# one user's edits never leak to another's view.
+# ============================================================
+
+import copy as _copy
+
+
+def _employee_categories_dict(employees):
+    income_emp = {}
+    expense_emp = {}
+    for emp in employees:
+        income_emp[f'Від {emp}'] = {
+            'emoji': '👤',
+            'keywords': [emp.lower(), f'від {emp.lower()}'],
+        }
+        expense_emp[f'ЗП {emp}'] = {
+            'emoji': '💼',
+            'keywords': [f'зп {emp.lower()}', f'зарплата {emp.lower()}'],
+        }
+    return income_emp, expense_emp
+
+
+def rebuild_user_categories(settings):
+    """In a per-user settings dict, rebuild auto-generated employee
+    categories ('Від <name>' / 'ЗП <name>') from settings['employees'].
+    Mutates the dict in place."""
+    cats = settings.setdefault('categories',
+                               _copy.deepcopy(DEFAULT_SETTINGS['categories']))
+    cats.setdefault('income', {})
+    cats.setdefault('expense', {})
+    cats['income'] = {k: v for k, v in cats['income'].items() if not k.startswith('Від ')}
+    cats['expense'] = {k: v for k, v in cats['expense'].items() if not k.startswith('ЗП ')}
+    income_emp, expense_emp = _employee_categories_dict(settings.get('employees', []))
+    cats['income'].update(income_emp)
+    cats['expense'].update(expense_emp)
+
+
+async def user_settings_for(user_id):
+    """Return this user's settings dict, creating a deep-copy of defaults on
+    first access. Always returns a complete shape (all DEFAULT_SETTINGS keys
+    present, employee-derived categories rebuilt)."""
+    existing = await db.get_user_settings(user_id)
+    if existing is None:
+        existing = _copy.deepcopy(DEFAULT_SETTINGS)
+    else:
+        for key, default_value in DEFAULT_SETTINGS.items():
+            if key not in existing:
+                existing[key] = _copy.deepcopy(default_value)
+    rebuild_user_categories(existing)
+    return existing
+
+
+async def save_user_settings(user_id, settings):
+    """Persist the user's settings dict. Also rebuilds employee categories
+    so the on-disk copy stays consistent."""
+    rebuild_user_categories(settings)
+    await db.save_user_settings(user_id, settings)
 
 
 # ========== EXCHANGE RATES ==========
@@ -2572,6 +2678,18 @@ async def init_data_middleware(request: web.Request, handler):
         await db.upsert_user(_UserObj(tg_user))
     except Exception as e:
         logger.warning(f'upsert_user via middleware failed: {e}')
+    # First-time admins inherit the global SETTINGS as their starting point
+    # (so the existing employees/tax/categories don't disappear on first
+    # Mini App open after this migration). Everyone else starts from
+    # DEFAULT_SETTINGS via user_settings_for().
+    try:
+        if is_admin(user_id_val):
+            existing = await db.get_user_settings(user_id_val)
+            if existing is None:
+                snapshot = _copy.deepcopy(SETTINGS) if SETTINGS else _copy.deepcopy(DEFAULT_SETTINGS)
+                await db.save_user_settings(user_id_val, snapshot)
+    except Exception as e:
+        logger.warning(f'admin settings bootstrap failed: {e}')
     return await handler(request)
 
 
@@ -2680,6 +2798,11 @@ async def api_post_transaction(request: web.Request):
     if t_type not in ('income', 'expense'):
         return _json_response({'detail': 'type must be income or expense'}, status=400)
 
+    # Ensure this user has a settings row (so /api/employees etc. don't 404 on
+    # first interaction). Side-effects only; we don't read from it here since
+    # the Mini App sends an explicit category string.
+    await user_settings_for(user_id)
+
     raw_amount = body.get('amount')
     if raw_amount is None or isinstance(raw_amount, bool):
         return _json_response({'detail': 'amount required and must be a number'}, status=400)
@@ -2786,13 +2909,15 @@ async def api_monthly_report(request: web.Request):
 
 
 async def api_categories(request: web.Request):
-    expense_names = [k for k in CATEGORIES.get('expense', {}).keys()]
-    income_names = [k for k in CATEGORIES.get('income', {}).keys()]
+    user_settings = await user_settings_for(request['user_id'])
+    cats = user_settings.get('categories', {})
+    expense_names = list(cats.get('expense', {}).keys())
+    income_names = list(cats.get('income', {}).keys())
     return _json_response({'expense': expense_names, 'income': income_names})
 
 
 async def api_settings(request: web.Request):
-    s = SETTINGS if SETTINGS else DEFAULT_SETTINGS
+    s = await user_settings_for(request['user_id'])
     return _json_response({
         'employees': s.get('employees', []),
         'tax_config': s.get('tax_config', {}),
@@ -2858,9 +2983,11 @@ async def api_report_employees(request: web.Request):
         return err
 
     transactions = await db.get_transactions(user_id, year=year, month=month)
+    user_settings = await user_settings_for(user_id)
+    user_employees = user_settings.get('employees', [])
 
     employees = []
-    for emp in EMPLOYEES:
+    for emp in user_employees:
         income_cat = f'Від {emp}'
         salary_cat = f'ЗП {emp}'
         income = sum(t['amount_uah'] for t in transactions
@@ -2893,8 +3020,10 @@ async def api_report_tax(request: web.Request):
     total_expense = sum(t['amount_uah'] for t in transactions if t['type'] == 'expense')
     profit = total_income - total_expense
 
-    single_tax_rate = TAX_CONFIG['single_tax_rate']
-    esv_fixed = TAX_CONFIG['esv_fixed']
+    user_settings = await user_settings_for(user_id)
+    user_tax = user_settings.get('tax_config', DEFAULT_SETTINGS['tax_config'])
+    single_tax_rate = user_tax.get('single_tax_rate', 0.05)
+    esv_fixed = user_tax.get('esv_fixed', 1760)
     single_tax = total_income * single_tax_rate
     total_tax = single_tax + esv_fixed
 
@@ -2995,9 +3124,12 @@ async def api_report_time(request: web.Request):
     rest_minutes = sum(time_by_cat.get(c, 0) for c in rest_cats)
     untracked_minutes = days_in_month * 24 * 60 - total_minutes
 
+    user_settings = await user_settings_for(user_id)
+    user_time_cats = user_settings.get('time_categories', {}) or {}
+
     by_category = []
     for cat, minutes in sorted(time_by_cat.items(), key=lambda x: x[1], reverse=True):
-        emoji = TIME_CATEGORIES.get(cat, {}).get('emoji', '⏱️')
+        emoji = (user_time_cats.get(cat) or {}).get('emoji', '⏱️')
         pct = (minutes / total_minutes * 100) if total_minutes > 0 else 0
         by_category.append({
             'name': cat,
@@ -3020,14 +3152,16 @@ async def api_report_time(request: web.Request):
     })
 
 
-# ---- categories CRUD ----
+# ---- categories CRUD (per-user) ----
 
 async def api_categories_full(request: web.Request):
-    """Return the entire CATEGORIES dict (expense + income, with metadata)."""
-    return _json_response(CATEGORIES)
+    """Return THIS user's CATEGORIES dict."""
+    user_settings = await user_settings_for(request['user_id'])
+    return _json_response(user_settings.get('categories', {}))
 
 
 async def api_categories_create(request: web.Request):
+    user_id = request['user_id']
     try:
         body = await request.json()
     except Exception:
@@ -3041,7 +3175,8 @@ async def api_categories_create(request: web.Request):
     if not name:
         return _json_response({'detail': 'name required'}, status=400)
 
-    bucket = CATEGORIES.setdefault(cat_type, {})
+    settings = await user_settings_for(user_id)
+    bucket = settings.setdefault('categories', {}).setdefault(cat_type, {})
     if name in bucket:
         return _json_response({'detail': 'category already exists'}, status=409)
 
@@ -3050,18 +3185,19 @@ async def api_categories_create(request: web.Request):
         'keywords': body.get('keywords', []) or [],
     }
     bucket[name] = entry
-    SETTINGS.setdefault('categories', {}).setdefault(cat_type, {})[name] = entry
-    save_settings(SETTINGS)
+    await save_user_settings(user_id, settings)
     return _json_response({'type': cat_type, 'name': name, **entry}, status=201)
 
 
 async def api_categories_update(request: web.Request):
+    user_id = request['user_id']
     cat_type = request.match_info.get('type')
     name = unquote(request.match_info.get('name', ''))
     if cat_type not in ('income', 'expense'):
         return _json_response({'detail': 'type must be income or expense'}, status=400)
 
-    bucket = CATEGORIES.get(cat_type, {})
+    settings = await user_settings_for(user_id)
+    bucket = settings.get('categories', {}).get(cat_type, {})
     if name not in bucket:
         return _json_response({'detail': 'category not found'}, status=404)
 
@@ -3081,27 +3217,18 @@ async def api_categories_update(request: web.Request):
         return _json_response({'detail': 'cannot rename "Інше"'}, status=400)
 
     new_entry = {'emoji': new_emoji, 'keywords': new_keywords or []}
-
-    # Build the rebuilt bucket fully off-bucket first (no partial state visible
-    # mid-operation), then swap atomically into CATEGORIES & SETTINGS. Avoids
-    # the "old key + new key both present" race observed in QA.
     new_bucket = {}
     for k, v in list(bucket.items()):
-        if k == name:
-            new_bucket[new_name] = new_entry
-        else:
-            new_bucket[k] = v
-    # If we somehow already had new_name (shouldn't, guarded above), the dict
-    # construction above silently dropped one — make that explicit.
+        new_bucket[new_name if k == name else k] = new_entry if k == name else v
     if len(new_bucket) != len(bucket):
         return _json_response({'detail': 'rename collision'}, status=409)
-    # Single source of truth — CATEGORIES is an alias of SETTINGS['categories'].
-    CATEGORIES[cat_type] = new_bucket
-    save_settings(SETTINGS)
+    settings['categories'][cat_type] = new_bucket
+    await save_user_settings(user_id, settings)
     return _json_response({'type': cat_type, 'name': new_name, **new_entry})
 
 
 async def api_categories_delete(request: web.Request):
+    user_id = request['user_id']
     cat_type = request.match_info.get('type')
     name = unquote(request.match_info.get('name', ''))
     if cat_type not in ('income', 'expense'):
@@ -3109,97 +3236,100 @@ async def api_categories_delete(request: web.Request):
     if name == 'Інше':
         return _json_response({'detail': 'cannot delete "Інше"'}, status=400)
 
-    bucket = CATEGORIES.get(cat_type, {})
+    settings = await user_settings_for(user_id)
+    bucket = settings.get('categories', {}).get(cat_type, {})
     if name not in bucket:
         return _json_response({'detail': 'category not found'}, status=404)
 
     del bucket[name]
-    SETTINGS.setdefault('categories', {}).setdefault(cat_type, {}).pop(name, None)
-    save_settings(SETTINGS)
+    await save_user_settings(user_id, settings)
     return web.Response(status=204)
 
 
-# ---- employees CRUD ----
+# ---- employees CRUD (per-user) ----
 
 async def api_employees_list(request: web.Request):
-    return _json_response(SETTINGS.get('employees', []))
+    settings = await user_settings_for(request['user_id'])
+    return _json_response(settings.get('employees', []))
 
 
 async def api_employees_create(request: web.Request):
+    user_id = request['user_id']
     try:
         body = await request.json()
     except Exception:
         return _json_response({'detail': 'Invalid JSON'}, status=400)
 
-    name = (body.get('name') or '').strip()
+    name = _clean_text(body.get('name'), max_len=60)
     if not name:
         return _json_response({'detail': 'name required'}, status=400)
 
-    employees_list = SETTINGS.setdefault('employees', [])
+    settings = await user_settings_for(user_id)
+    employees_list = settings.setdefault('employees', [])
     if name in employees_list:
         return _json_response({'detail': 'employee already exists'}, status=409)
 
     employees_list.append(name)
-    # EMPLOYEES is a separate list — mirror via slice-assign so existing
-    # references to EMPLOYEES (e.g. show_employee_report) see the new state.
-    EMPLOYEES[:] = list(employees_list)
-    rebuild_employee_categories()
-    save_settings(SETTINGS)
+    await save_user_settings(user_id, settings)  # rebuilds employee categories
     return _json_response({'name': name}, status=201)
 
 
 async def api_employees_delete(request: web.Request):
+    user_id = request['user_id']
     name = unquote(request.match_info.get('name', ''))
-    employees_list = SETTINGS.setdefault('employees', [])
+
+    settings = await user_settings_for(user_id)
+    employees_list = settings.setdefault('employees', [])
     if name not in employees_list:
         return _json_response({'detail': 'employee not found'}, status=404)
 
     employees_list.remove(name)
-    EMPLOYEES[:] = list(employees_list)
-    rebuild_employee_categories()
-    save_settings(SETTINGS)
+    await save_user_settings(user_id, settings)
     return web.Response(status=204)
 
 
-# ---- time categories CRUD ----
+# ---- time categories CRUD (per-user) ----
 
 async def api_time_categories_list(request: web.Request):
-    return _json_response(SETTINGS.get('time_categories', TIME_CATEGORIES))
+    settings = await user_settings_for(request['user_id'])
+    return _json_response(settings.get('time_categories', {}))
 
 
 async def api_time_categories_create(request: web.Request):
+    user_id = request['user_id']
     try:
         body = await request.json()
     except Exception:
         return _json_response({'detail': 'Invalid JSON'}, status=400)
 
-    name = (body.get('name') or '').strip()
+    name = _clean_text(body.get('name'), max_len=60)
     if not name:
         return _json_response({'detail': 'name required'}, status=400)
 
-    bucket = SETTINGS.setdefault('time_categories', {})
+    settings = await user_settings_for(user_id)
+    bucket = settings.setdefault('time_categories', {})
     if name in bucket:
         return _json_response({'detail': 'time category already exists'}, status=409)
 
     entry = {'emoji': body.get('emoji', '⏱️')}
     bucket[name] = entry
-    TIME_CATEGORIES[name] = entry
-    save_settings(SETTINGS)
+    await save_user_settings(user_id, settings)
     return _json_response({'name': name, **entry}, status=201)
 
 
 async def api_time_categories_delete(request: web.Request):
+    user_id = request['user_id']
     name = unquote(request.match_info.get('name', ''))
     if name == 'Інше':
         return _json_response({'detail': 'cannot delete "Інше"'}, status=400)
 
-    bucket = SETTINGS.setdefault('time_categories', {})
+    settings = await user_settings_for(user_id)
+    bucket = settings.setdefault('time_categories', {})
     if name not in bucket:
         return _json_response({'detail': 'time category not found'}, status=404)
 
     del bucket[name]
-    TIME_CATEGORIES.pop(name, None)
-    save_settings(SETTINGS)
+    await save_user_settings(user_id, settings)
     return web.Response(status=204)
 
 
@@ -3246,9 +3376,9 @@ async def api_time_tracks_create(request: web.Request):
     category = _clean_text(body.get('category'), max_len=60)
     if not category:
         return _json_response({'detail': 'category required'}, status=400)
-    # Whitelist: must be a known time category, else productivity buckets
-    # silently lose this entry's minutes.
-    known_time_cats = set(SETTINGS.get('time_categories') or TIME_CATEGORIES or {}) or set()
+    # Whitelist against THIS user's own time categories.
+    user_settings = await user_settings_for(user_id)
+    known_time_cats = set(user_settings.get('time_categories') or {})
     if known_time_cats and category not in known_time_cats:
         return _json_response(
             {'detail': f'unknown time category "{category}"'}, status=400)
@@ -3289,22 +3419,24 @@ async def api_time_tracks_delete(request: web.Request):
 # ---- tax settings ----
 
 async def api_settings_tax_update(request: web.Request):
+    user_id = request['user_id']
     try:
         body = await request.json()
     except Exception:
         return _json_response({'detail': 'Invalid JSON'}, status=400)
+
+    settings = await user_settings_for(user_id)
+    tax_cfg = settings.setdefault('tax_config', _copy.deepcopy(DEFAULT_SETTINGS['tax_config']))
 
     if 'single_tax_rate' in body:
         try:
             rate = float(body['single_tax_rate'])
         except (TypeError, ValueError):
             return _json_response({'detail': 'single_tax_rate must be a number'}, status=400)
-        # Sane Ukrainian-FOP range — silently allowing 0% or >25% creates
-        # nonsense reports and we'd rather force the user to think.
         if rate < 0.01 or rate > 0.25:
             return _json_response(
                 {'detail': 'single_tax_rate must be between 0.01 (1%) and 0.25 (25%)'}, status=400)
-        TAX_CONFIG['single_tax_rate'] = rate
+        tax_cfg['single_tax_rate'] = rate
 
     if 'esv_fixed' in body:
         try:
@@ -3314,11 +3446,10 @@ async def api_settings_tax_update(request: web.Request):
         if esv < 0 or esv > 50000:
             return _json_response(
                 {'detail': 'esv_fixed must be between 0 and 50000 UAH'}, status=400)
-        TAX_CONFIG['esv_fixed'] = esv
+        tax_cfg['esv_fixed'] = esv
 
-    SETTINGS['tax_config'] = TAX_CONFIG
-    save_settings(SETTINGS)
-    return _json_response(TAX_CONFIG)
+    await save_user_settings(user_id, settings)
+    return _json_response(tax_cfg)
 
 
 def build_api_app() -> web.Application:
