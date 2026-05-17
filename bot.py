@@ -188,6 +188,14 @@ class Database:
         except Exception as e:
             logger.warning(f'could not enable WAL: {e}')
         cursor = self.conn.cursor()
+        # Migration tracker — lets us bake one-time data fixes into deploys
+        # without ever asking users to run reset commands.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS _migrations (
+                name TEXT PRIMARY KEY,
+                applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
 
         # Transactions table
         cursor.execute('''
@@ -270,7 +278,47 @@ class Database:
         ''')
 
         self.conn.commit()
+
+        # ── One-time migrations ────────────────────────────────────────
+        # Migrations baked into deploys so users never need to run any
+        # reset command themselves. Each migration writes its name into
+        # the _migrations table; subsequent boots see the marker and skip.
+        self._run_migrations()
+
         logger.info("Database initialized successfully")
+
+    def _run_migrations(self):
+        """Apply any pending one-time data fixes."""
+        cursor = self.conn.cursor()
+
+        def applied(name: str) -> bool:
+            cursor.execute("SELECT 1 FROM _migrations WHERE name = ?", (name,))
+            return cursor.fetchone() is not None
+
+        def mark(name: str):
+            cursor.execute(
+                "INSERT OR IGNORE INTO _migrations (name) VALUES (?)",
+                (name,),
+            )
+
+        # 20260518_wipe_legacy_user_settings
+        #   The Mini App originally shared a global settings.json across all
+        #   users, which seeded everyone's per-user row with the same
+        #   employees (Катя, Ілона, ...) and category set. After the
+        #   per-user-settings refactor (5695c63), those rows persisted —
+        #   meaning new app installs that inherited legacy data still see
+        #   strangers' employees. This migration wipes user_settings ONCE
+        #   so every user reseeds from the neutral DEFAULT_SETTINGS on
+        #   their next API request. Transactions and time-tracks are NOT
+        #   touched — only settings preferences.
+        mig = '20260518_wipe_legacy_user_settings'
+        if not applied(mig):
+            cursor.execute("DELETE FROM user_settings")
+            wiped = cursor.rowcount
+            mark(mig)
+            logger.info(f"Migration {mig}: wiped {wiped} legacy user_settings rows")
+
+        self.conn.commit()
 
     async def get_user_settings(self, user_id):
         async with db_lock:
