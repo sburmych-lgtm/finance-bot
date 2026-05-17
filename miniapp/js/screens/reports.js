@@ -244,14 +244,33 @@ async function renderTax(container) {
   try {
     const d = await Api.taxReport(state.year, state.month);
     state.data.tax = d;
+    const groupLabel = d.group_label || 'ФОП 3 група';
+    const isNotFop = d.group === 'none';
+
+    let metricRow = '';
+    if (isNotFop) {
+      metricRow = `<div class="metric" style="grid-column: 1 / -1;"><span>Без нарахувань</span><strong>Фізособа — податки не нараховуємо</strong></div>`;
+    } else {
+      const singleLabel = d.group === 'fop3'
+        ? `Єдиний податок (${(d.single_tax_rate * 100).toFixed(0)}%)`
+        : 'Єдиний податок (фіксований)';
+      metricRow = `
+        <div class="metric"><span>${esc(singleLabel)}</span><strong>${esc(fmtMoney(d.single_tax, 'UAH'))}</strong></div>
+        <div class="metric"><span>ЄСВ (фіксований)</span><strong>${esc(fmtMoney(d.esv_fixed, 'UAH'))}</strong></div>
+      `;
+    }
+
+    const hintText = isNotFop
+      ? 'Як фізособа ви не сплачуєте єдиний податок та ЄСВ. Якщо ви ФОП — змініть групу у Меню → Налаштування → Податки.'
+      : d.group === 'fop3'
+        ? `${(d.single_tax_rate * 100).toFixed(0)}% єдиного податку від доходу + фіксований ЄСВ ${fmtMoney(d.esv_fixed, 'UAH')}. Змініть у Меню → Налаштування → Податки.`
+        : `Фіксований єдиний податок ${fmtMoney(d.single_tax, 'UAH')} + ЄСВ ${fmtMoney(d.esv_fixed, 'UAH')}. Змініть у Меню → Налаштування → Податки.`;
+
     container.innerHTML = `
       <div class="balance-card" style="min-height:auto;">
-        <div class="balance-label">До сплати · ${esc(d.month_name)} ${d.year}</div>
+        <div class="balance-label">${esc(groupLabel)} · ${esc(d.month_name)} ${d.year}</div>
         <div class="balance-value" style="font-size: var(--fs-32);">${esc(fmtMoney(d.total_tax, 'UAH'))}</div>
-        <div class="metric-row">
-          <div class="metric"><span>Єдиний податок (${(d.single_tax_rate * 100).toFixed(0)}%)</span><strong>${esc(fmtMoney(d.single_tax, 'UAH'))}</strong></div>
-          <div class="metric"><span>ЄСВ (фіксований)</span><strong>${esc(fmtMoney(d.esv_fixed, 'UAH'))}</strong></div>
-        </div>
+        <div class="metric-row">${metricRow}</div>
       </div>
 
       <div class="section-head"><div class="section-title">Звіт у податкову</div></div>
@@ -269,8 +288,8 @@ async function renderTax(container) {
         <div class="ai-card-row">
           <div class="ai-card-icon">📋</div>
           <div class="ai-card-text">
-            <div class="ai-card-title">ФОП 3 група · спрощена система</div>
-            <div class="ai-card-sub">5% єдиного податку від доходу + фіксований ЄСВ ${esc(fmtMoney(d.esv_fixed, 'UAH'))}. Параметри змінюються у Меню → Налаштування → Податки.</div>
+            <div class="ai-card-title">${esc(groupLabel)}</div>
+            <div class="ai-card-sub">${esc(hintText)}</div>
           </div>
         </div>
       </div>`;

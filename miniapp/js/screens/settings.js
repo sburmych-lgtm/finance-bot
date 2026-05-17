@@ -298,6 +298,13 @@ async function renderEmployees(root) {
 }
 
 // ── Tax settings ───────────────────────────────────────────────
+const TAX_GROUPS = [
+  { id: 'fop1', label: 'ФОП 1 група',     hint: 'Фіксований податок ~10% прожиткового мінімуму + ЄСВ' },
+  { id: 'fop2', label: 'ФОП 2 група',     hint: 'Фіксований податок ~20% мінімалки + ЄСВ' },
+  { id: 'fop3', label: 'ФОП 3 група',     hint: '% від доходу + ЄСВ. Найпоширеніше для самозайнятих' },
+  { id: 'none', label: 'Я не ФОП',        hint: 'Фізособа — нічого не нараховуємо' },
+];
+
 async function renderTaxSettings(root) {
   root.innerHTML = backHeader('Податкові налаштування');
   wireBack(root);
@@ -307,36 +314,81 @@ async function renderTaxSettings(root) {
 
   try {
     const s = await Api.settings();
-    const tax = s?.tax_config || { single_tax_rate: 0.05, esv_fixed: 1760 };
+    const tax = s?.tax_config || {};
+    const group = tax.group || 'fop3';
+    const rate = (tax.single_tax_rate ?? 0.05) * 100;
+    const fop1 = tax.fop1_fixed ?? 303;
+    const fop2 = tax.fop2_fixed ?? 1600;
+    const esv = tax.esv_fixed ?? 1760;
+
+    const groupCards = TAX_GROUPS.map((g) => `
+      <button class="tax-group-card ${group === g.id ? 'active' : ''}" data-group="${esc(g.id)}">
+        <div class="tax-group-label">${esc(g.label)}</div>
+        <div class="tax-group-hint">${esc(g.hint)}</div>
+      </button>
+    `).join('');
+
     body.innerHTML = `
       <div class="panel" style="padding: var(--sp-4);">
-        <div class="field">
-          <label>Ставка єдиного податку (%)</label>
-          <input class="input" id="taxRate" type="number" step="0.1" min="0" max="100" value="${(tax.single_tax_rate * 100).toFixed(1)}">
-        </div>
-        <div class="field">
-          <label>Фіксований ЄСВ (₴/міс)</label>
-          <input class="input" id="taxEsv" type="number" step="1" min="0" value="${tax.esv_fixed}">
-        </div>
-        <button class="btn btn-primary" id="saveTaxBtn" style="margin-top: var(--sp-3);">Зберегти</button>
+        <label style="font-size:10px; letter-spacing:.14em; text-transform:uppercase; font-weight:800; color: var(--ruby-gold); display:block; margin-bottom: var(--sp-2);">Оберіть групу</label>
+        <div class="tax-group-grid">${groupCards}</div>
       </div>
+
+      <div class="panel" style="padding: var(--sp-4); margin-top: var(--sp-3);" id="taxFieldsPanel">
+        ${renderTaxFields(group, { rate, fop1, fop2, esv })}
+      </div>
+
+      <button class="btn btn-primary" id="saveTaxBtn" style="margin-top: var(--sp-3);">Зберегти</button>
+
       <div class="panel ai-card" style="margin-top: var(--sp-3);">
         <div class="ai-card-row">
           <div class="ai-card-icon">📋</div>
           <div class="ai-card-text">
-            <div class="ai-card-title">За замовчуванням — ФОП 3 група</div>
-            <div class="ai-card-sub">Єдиний податок 5% від доходу + ЄСВ 1 760 ₴/міс. Якщо у вас 1 чи 2 група — змініть тут.</div>
+            <div class="ai-card-title">Як це впливає на звіти</div>
+            <div class="ai-card-sub">Обрана група визначає формулу в «Звіти → Податки». Цифри 2026 — приблизні, перевірте на сайті ДПС перед поданням декларації.</div>
           </div>
         </div>
       </div>
     `;
+
+    // Reactive group selector — re-renders fields panel when group changes
+    body.querySelectorAll('[data-group]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        body.querySelectorAll('[data-group]').forEach((b) => b.classList.toggle('active', b === btn));
+        const newGroup = btn.dataset.group;
+        body.querySelector('#taxFieldsPanel').innerHTML =
+          renderTaxFields(newGroup, { rate: getCurrentRate(body), fop1: getCurrentFop1(body), fop2: getCurrentFop2(body), esv: getCurrentEsv(body) });
+        Telegram.haptic('selection');
+      });
+    });
+
     body.querySelector('#saveTaxBtn').addEventListener('click', async () => {
-      const rate = parseFloat(body.querySelector('#taxRate').value) / 100;
-      const esv = parseFloat(body.querySelector('#taxEsv').value);
-      if (!isFinite(rate) || rate < 0 || rate > 1) { toast('Невірна ставка'); return; }
-      if (!isFinite(esv) || esv < 0) { toast('Невірний ЄСВ'); return; }
+      const activeGroup = body.querySelector('[data-group].active')?.dataset.group || 'fop3';
+      const payload = { group: activeGroup };
+
+      if (activeGroup === 'fop3') {
+        const r = parseFloat(body.querySelector('#taxRate')?.value);
+        if (!isFinite(r) || r < 1 || r > 25) { toast('Ставка має бути 1–25%'); return; }
+        payload.single_tax_rate = r / 100;
+      }
+      if (activeGroup === 'fop1') {
+        const v = parseFloat(body.querySelector('#taxFop1')?.value);
+        if (!isFinite(v) || v < 0 || v > 10000) { toast('Невірна сума'); return; }
+        payload.fop1_fixed = v;
+      }
+      if (activeGroup === 'fop2') {
+        const v = parseFloat(body.querySelector('#taxFop2')?.value);
+        if (!isFinite(v) || v < 0 || v > 20000) { toast('Невірна сума'); return; }
+        payload.fop2_fixed = v;
+      }
+      if (activeGroup !== 'none') {
+        const e = parseFloat(body.querySelector('#taxEsv')?.value);
+        if (!isFinite(e) || e < 0 || e > 50000) { toast('Невірний ЄСВ'); return; }
+        payload.esv_fixed = e;
+      }
+
       try {
-        await Api.patchTax({ single_tax_rate: rate, esv_fixed: esv });
+        await Api.patchTax(payload);
         Telegram.haptic('success');
         toast('Збережено');
       } catch (e) { Telegram.haptic('error'); toast(e.message); }
@@ -344,6 +396,53 @@ async function renderTaxSettings(root) {
   } catch (e) {
     body.innerHTML = `<div class="empty-state"><p>${esc(e.message)}</p></div>`;
   }
+}
+
+function getCurrentRate(root) { return parseFloat(root.querySelector('#taxRate')?.value) || 5; }
+function getCurrentFop1(root) { return parseFloat(root.querySelector('#taxFop1')?.value) || 303; }
+function getCurrentFop2(root) { return parseFloat(root.querySelector('#taxFop2')?.value) || 1600; }
+function getCurrentEsv(root)  { return parseFloat(root.querySelector('#taxEsv')?.value)  || 1760; }
+
+function renderTaxFields(group, { rate, fop1, fop2, esv }) {
+  if (group === 'none') {
+    return `
+      <div class="empty-state" style="padding: var(--sp-4);">
+        <div class="icon">∅</div>
+        <h3>Без нарахувань</h3>
+        <p>Як фізособа ви не сплачуєте єдиний податок та ЄСВ. Звіти «Податки» показуватимуть 0.</p>
+      </div>
+    `;
+  }
+  let html = '';
+  if (group === 'fop1') {
+    html += `
+      <div class="field">
+        <label>Єдиний податок (₴/міс)</label>
+        <input class="input" id="taxFop1" type="number" step="1" min="0" max="10000" value="${esc(String(fop1))}">
+        <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">10% прожиткового мінімуму. На 2026 ≈ 303 ₴.</p>
+      </div>`;
+  } else if (group === 'fop2') {
+    html += `
+      <div class="field">
+        <label>Єдиний податок (₴/міс)</label>
+        <input class="input" id="taxFop2" type="number" step="1" min="0" max="20000" value="${esc(String(fop2))}">
+        <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">20% мінімалки. На 2026 = 1 600 ₴.</p>
+      </div>`;
+  } else {  // fop3
+    html += `
+      <div class="field">
+        <label>Ставка єдиного податку (%)</label>
+        <input class="input" id="taxRate" type="number" step="0.1" min="1" max="25" value="${esc(rate.toFixed(1))}">
+        <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">5% — неплатники ПДВ. 3% — платники ПДВ.</p>
+      </div>`;
+  }
+  html += `
+    <div class="field">
+      <label>Фіксований ЄСВ (₴/міс)</label>
+      <input class="input" id="taxEsv" type="number" step="1" min="0" max="50000" value="${esc(String(esv))}">
+      <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">22% × мінімалка. На 2026 = 1 760 ₴.</p>
+    </div>`;
+  return html;
 }
 
 // ── Privacy ────────────────────────────────────────────────────

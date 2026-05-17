@@ -195,6 +195,44 @@
   border-color: var(--ruby-line);
 }
 
+/* Tax-group cards (Settings → Податки) */
+.tax-group-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-2);
+}
+.tax-group-card {
+  display: block;
+  text-align: left;
+  padding: var(--sp-3) var(--sp-3);
+  border: 1px solid var(--ruby-line-soft);
+  background: rgba(255,255,255,.04);
+  color: var(--ruby-ivory);
+  border-radius: var(--r-lg);
+  cursor: pointer;
+  transition: all var(--t-fast) var(--ease-out);
+}
+.tax-group-card.active {
+  border-color: var(--ruby-gold);
+  background: linear-gradient(145deg, rgba(216,181,109,.14), rgba(110,15,31,.32));
+  box-shadow: var(--shadow-gold);
+}
+.tax-group-label {
+  font-size: var(--fs-13);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: var(--ruby-ivory);
+}
+.tax-group-card.active .tax-group-label {
+  color: var(--ruby-gold);
+}
+.tax-group-hint {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--ruby-muted);
+  line-height: 1.4;
+}
+
 /* Settings list */
 .setting-section { margin-top: var(--sp-6); }
 .setting-section .section-title { padding-left: var(--sp-1); }

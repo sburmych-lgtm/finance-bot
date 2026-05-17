@@ -122,9 +122,17 @@ DEFAULT_SETTINGS = {
     # and any niche expense/income categories via Settings → Категорії.
     'employees': [],
     'tax_config': {
-        'single_tax_rate': 0.05,  # ФОП 3 група — найпоширеніший випадок
+        # Податкова група. Один з: 'fop1', 'fop2', 'fop3', 'none'.
+        'group': 'fop3',
+        # ФОП 3 група: відсоток єдиного податку від доходу (для неплатників ПДВ — 5%)
+        'single_tax_rate': 0.05,
+        # ФОП 1 група: фіксований єдиний податок (≈10% прожиткового мінімуму) на 2026 ≈ 303 ₴
+        'fop1_fixed': 303,
+        # ФОП 2 група: фіксований єдиний податок (≈20% мінімалки) на 2026 = 1 600 ₴
+        'fop2_fixed': 1600,
+        # ЄСВ — фіксований внесок на 2026 = 1 760 ₴ (22% × мінімалка). Сплачують усі групи ФОП.
         'esv_fixed': 1760,
-        'note': 'Для ФОП 3 група: 5% + фіксований ЄСВ. Змініть у Налаштування → Податки.'
+        'note': 'Оберіть свою групу у Налаштування → Податки. Не ФОП — 0.'
     },
     'categories': {
         'expense': {
@@ -3011,10 +3019,29 @@ async def api_report_tax(request: web.Request):
 
     user_settings = await user_settings_for(user_id)
     user_tax = user_settings.get('tax_config', DEFAULT_SETTINGS['tax_config'])
-    single_tax_rate = user_tax.get('single_tax_rate', 0.05)
+    group = user_tax.get('group', 'fop3')
     esv_fixed = user_tax.get('esv_fixed', 1760)
-    single_tax = total_income * single_tax_rate
-    total_tax = single_tax + esv_fixed
+    single_tax_rate = user_tax.get('single_tax_rate', 0.05)
+
+    # Tax math depends on the group. ЄСВ is the same for any ФОП group; «не ФОП»
+    # pays nothing through this app's accounting (фізособи rules differ).
+    if group == 'none':
+        single_tax = 0.0
+        esv = 0.0
+        group_label = 'Не ФОП (фізособа)'
+    elif group == 'fop1':
+        single_tax = float(user_tax.get('fop1_fixed', 303))
+        esv = esv_fixed
+        group_label = 'ФОП 1 група'
+    elif group == 'fop2':
+        single_tax = float(user_tax.get('fop2_fixed', 1600))
+        esv = esv_fixed
+        group_label = 'ФОП 2 група'
+    else:  # 'fop3' (default)
+        single_tax = total_income * single_tax_rate
+        esv = esv_fixed
+        group_label = 'ФОП 3 група'
+    total_tax = single_tax + esv
 
     import calendar
     last_day = calendar.monthrange(year, month)[1]
@@ -3025,11 +3052,13 @@ async def api_report_tax(request: web.Request):
         'year': year,
         'month': month,
         'month_name': MONTH_NAMES[month],
+        'group': group,
+        'group_label': group_label,
         'total_income': round(total_income, 2),
         'total_expense': round(total_expense, 2),
         'profit': round(profit, 2),
         'single_tax_rate': single_tax_rate,
-        'esv_fixed': esv_fixed,
+        'esv_fixed': round(esv, 2),
         'single_tax': round(single_tax, 2),
         'total_tax': round(total_tax, 2),
         'after_tax': round(profit - total_tax, 2),
@@ -3417,6 +3446,13 @@ async def api_settings_tax_update(request: web.Request):
     settings = await user_settings_for(user_id)
     tax_cfg = settings.setdefault('tax_config', _copy.deepcopy(DEFAULT_SETTINGS['tax_config']))
 
+    if 'group' in body:
+        group = str(body['group']).strip().lower()
+        if group not in ('fop1', 'fop2', 'fop3', 'none'):
+            return _json_response(
+                {'detail': 'group must be one of: fop1, fop2, fop3, none'}, status=400)
+        tax_cfg['group'] = group
+
     if 'single_tax_rate' in body:
         try:
             rate = float(body['single_tax_rate'])
@@ -3426,6 +3462,24 @@ async def api_settings_tax_update(request: web.Request):
             return _json_response(
                 {'detail': 'single_tax_rate must be between 0.01 (1%) and 0.25 (25%)'}, status=400)
         tax_cfg['single_tax_rate'] = rate
+
+    if 'fop1_fixed' in body:
+        try:
+            v = float(body['fop1_fixed'])
+        except (TypeError, ValueError):
+            return _json_response({'detail': 'fop1_fixed must be a number'}, status=400)
+        if v < 0 or v > 10000:
+            return _json_response({'detail': 'fop1_fixed must be between 0 and 10000'}, status=400)
+        tax_cfg['fop1_fixed'] = v
+
+    if 'fop2_fixed' in body:
+        try:
+            v = float(body['fop2_fixed'])
+        except (TypeError, ValueError):
+            return _json_response({'detail': 'fop2_fixed must be a number'}, status=400)
+        if v < 0 or v > 20000:
+            return _json_response({'detail': 'fop2_fixed must be between 0 and 20000'}, status=400)
+        tax_cfg['fop2_fixed'] = v
 
     if 'esv_fixed' in body:
         try:
