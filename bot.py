@@ -2567,6 +2567,60 @@ async def admin_cleanup_users(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(text, parse_mode='Markdown')
 
 
+async def admin_reset_user_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """`/reset_user_settings <user_id>` — wipe one user's user_settings row so
+    they're reseeded from neutral DEFAULT_SETTINGS on next request.
+
+    Special args:
+      • `me` — reset the admin's own settings
+      • `all` — reset every non-admin user (preserves admins)
+    """
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Команда доступна лише адміністратору.")
+        return
+    parts = (update.message.text or '').split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ''
+    if not arg:
+        await update.message.reply_text(
+            "Використання:\n"
+            "  `/reset_user_settings me` — скинути свої налаштування\n"
+            "  `/reset_user_settings <user_id>` — скинути конкретного юзера\n"
+            "  `/reset_user_settings all` — скинути всіх (крім адмінів)",
+            parse_mode='Markdown',
+        )
+        return
+
+    targets: list[str] = []
+    if arg == 'me':
+        targets = [str(update.effective_user.id)]
+    elif arg == 'all':
+        async with db_lock:
+            cursor = db.conn.cursor()
+            cursor.execute("SELECT user_id FROM user_settings")
+            rows = cursor.fetchall()
+        targets = [r['user_id'] for r in rows if r['user_id'] not in ADMIN_IDS]
+        # ALSO reset admins if they explicitly say 'all-including-me' — but here we preserve them
+    else:
+        targets = [arg]
+
+    if not targets:
+        await update.message.reply_text("📭 Нікого скидати.")
+        return
+
+    async with db_lock:
+        cursor = db.conn.cursor()
+        for uid in targets:
+            cursor.execute("DELETE FROM user_settings WHERE user_id = ?", (uid,))
+        db.conn.commit()
+
+    await update.message.reply_text(
+        f"🧹 Скинуто налаштувань: {len(targets)}.\n"
+        f"Наступне відкриття Mini App перезапише їх з нейтрального шаблону "
+        f"(працівники = пусто, категорії = базові, ФОП 3 група).\n"
+        f"Транзакції та час НЕ зачеплено."
+    )
+
+
 async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Broadcast message to all users — admin only"""
     if not is_admin(update.effective_user.id):
@@ -3633,6 +3687,8 @@ def main():
     application.add_handler(CommandHandler("users", admin_list_users))
     application.add_handler(CommandHandler("cleanup_users", admin_cleanup_users))
     application.add_handler(CommandHandler("cleanup", admin_cleanup_users))
+    application.add_handler(CommandHandler("reset_user_settings", admin_reset_user_settings))
+    application.add_handler(CommandHandler("reset", admin_reset_user_settings))
     application.add_handler(CommandHandler("broadcast", admin_broadcast))
 
     # Callbacks
