@@ -2498,6 +2498,75 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def admin_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List every registered user — admin only."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Команда доступна лише адміністратору.")
+        return
+    async with db_lock:
+        cursor = db.conn.cursor()
+        cursor.execute(
+            "SELECT user_id, username, first_name, last_name, first_seen, last_seen "
+            "FROM users ORDER BY first_seen"
+        )
+        rows = cursor.fetchall()
+    if not rows:
+        await update.message.reply_text("📭 У БД немає користувачів.")
+        return
+    lines = ["👥 *Users in DB*", ""]
+    for r in rows:
+        uid = r['user_id']
+        name = (r['first_name'] or '') + (' ' + r['last_name'] if r['last_name'] else '')
+        uname = f"@{r['username']}" if r['username'] else '—'
+        seen = r['first_seen'][:10] if r['first_seen'] else '?'
+        lines.append(f"`{uid}` · {name.strip() or '?'} · {uname} · {seen}")
+    lines.append("")
+    lines.append("Видалити фейкових: /cleanup\\_users")
+    await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
+
+
+async def admin_cleanup_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove test users (those who have NO transactions AND NO time tracks AND
+    aren't in ADMIN_IDS). Returns the list of deleted user_ids."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Команда доступна лише адміністратору.")
+        return
+    async with db_lock:
+        cursor = db.conn.cursor()
+        # Find users with zero activity who aren't admins
+        admin_clause = ''
+        params: list = []
+        if ADMIN_IDS:
+            placeholders = ','.join('?' for _ in ADMIN_IDS)
+            admin_clause = f' AND user_id NOT IN ({placeholders})'
+            params = list(ADMIN_IDS)
+        cursor.execute(
+            f'''
+            SELECT user_id, first_name, username FROM users u
+            WHERE NOT EXISTS (SELECT 1 FROM transactions t WHERE t.user_id = u.user_id)
+              AND NOT EXISTS (SELECT 1 FROM time_tracks tt WHERE tt.user_id = u.user_id)
+              {admin_clause}
+            ''',
+            params,
+        )
+        candidates = cursor.fetchall()
+        if not candidates:
+            await update.message.reply_text("✨ Нічого видаляти — всі юзери або з активністю, або адміни.")
+            return
+        removed = []
+        for row in candidates:
+            uid = row['user_id']
+            cursor.execute("DELETE FROM users WHERE user_id = ?", (uid,))
+            cursor.execute("DELETE FROM user_settings WHERE user_id = ?", (uid,))
+            cursor.execute("DELETE FROM subscriptions WHERE user_id = ?", (uid,))
+            removed.append((uid, row['first_name'] or '?', row['username']))
+        db.conn.commit()
+    text = f"🧹 *Cleanup done* · removed {len(removed)} users\n\n"
+    for uid, name, uname in removed[:20]:
+        text += f"`{uid}` · {name} · {('@' + uname) if uname else '—'}\n"
+    await update.message.reply_text(text, parse_mode='Markdown')
+
+
 async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Broadcast message to all users — admin only"""
     if not is_admin(update.effective_user.id):
@@ -3560,6 +3629,10 @@ def main():
     application.add_handler(CommandHandler("admin_stats", admin_stats))
     application.add_handler(CommandHandler("stats", admin_stats))  # short alias
     application.add_handler(CommandHandler("admin", admin_stats))  # shorter alias
+    application.add_handler(CommandHandler("list_users", admin_list_users))
+    application.add_handler(CommandHandler("users", admin_list_users))
+    application.add_handler(CommandHandler("cleanup_users", admin_cleanup_users))
+    application.add_handler(CommandHandler("cleanup", admin_cleanup_users))
     application.add_handler(CommandHandler("broadcast", admin_broadcast))
 
     # Callbacks
