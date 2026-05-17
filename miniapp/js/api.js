@@ -66,5 +66,6 @@ export const Api = {
   // Settings
   settings:        ()                    => request('/api/settings'),
   patchTax:        (payload)             => request('/api/settings/tax',                     { method: 'PATCH',  body: payload }),
+  resetSettings:   ()                    => request('/api/settings',                         { method: 'DELETE' }),
   exchangeRates:   ()                    => request('/api/exchange-rates'),
 };

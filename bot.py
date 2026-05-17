@@ -117,37 +117,30 @@ exchange_rates_cache = {
 
 # Default settings
 DEFAULT_SETTINGS = {
-    'employees': ['Катя', 'Ілона', 'Мирослав', 'Христина', 'Інші'],
+    # Universal neutral defaults — no personal/professional bias.
+    # Each user is expected to add their own employees, time-categories,
+    # and any niche expense/income categories via Settings → Категорії.
+    'employees': [],
     'tax_config': {
-        'single_tax_rate': 0.05,
+        'single_tax_rate': 0.05,  # ФОП 3 група — найпоширеніший випадок
         'esv_fixed': 1760,
-        'note': 'Для ФОП 3 група: 5% + фіксований ЄСВ'
+        'note': 'Для ФОП 3 група: 5% + фіксований ЄСВ. Змініть у Налаштування → Податки.'
     },
     'categories': {
         'expense': {
             'Продукти': {'emoji': '🛒', 'keywords': ['продукти', 'магазин', 'супермаркет', 'silpo', 'атб', 'groceries', 'їжа']},
-            'Кафе': {'emoji': '☕', 'keywords': ['кава', 'кафе', 'coffee', 'ресторан', 'обід', 'lunch', 'латте', 'капучино', 'еспресо']},
-            'Транспорт': {'emoji': '🚕', 'keywords': ['таксі', 'taxi', 'uber', 'bolt', 'метро', 'автобус', 'бензин', 'укрзалізниця', 'поїздка', 'проїзд']},
+            'Кафе': {'emoji': '☕', 'keywords': ['кава', 'кафе', 'coffee', 'ресторан', 'обід', 'lunch']},
+            'Транспорт': {'emoji': '🚕', 'keywords': ['таксі', 'taxi', 'uber', 'bolt', 'метро', 'автобус', 'бензин']},
             'Розваги': {'emoji': '🎭', 'keywords': ['кіно', 'бар', 'клуб', 'пиво', 'cinema']},
-            'Здоров\'я': {'emoji': '💊', 'keywords': ['аптека', 'лікар', 'pharmacy', 'hospital']},
-            'Ліки': {'emoji': '💊', 'keywords': ['ліки', 'medicine', 'таблетки', 'препарат', 'анальгін']},
-            'Подарунки': {'emoji': '🎁', 'keywords': ['подарунки', 'подарок', 'gift', 'present']},
-            'Податки': {'emoji': '📋', 'keywords': ['податки', 'tax', 'taxes', 'пдв', 'єдиний податок']},
-            'Косметолог': {'emoji': '💄', 'keywords': ['косметолог', 'cosmetologist', 'beautician']},
-            'Салон краси': {'emoji': '💅', 'keywords': ['салон', 'перукар', 'beauty salon', 'manicure', 'манікюр']},
-            'Догляд/Косметика': {'emoji': '🧴', 'keywords': ['косметика', 'skincare', 'догляд', 'крем']},
-            'Вітаміни': {'emoji': '💊', 'keywords': ['вітаміни', 'vitamins', 'supplements', 'добавки']},
-            'Одяг': {'emoji': '👗', 'keywords': ['одяг', 'clothes', 'clothing', 'взуття']},
-            'Комунальні': {'emoji': '🏠', 'keywords': ['комунальні', 'комуналка', 'світло', 'вода', 'газ', 'опалення', 'utilities']},
+            "Здоров'я": {'emoji': '💊', 'keywords': ['аптека', 'лікар', 'pharmacy', 'ліки']},
+            'Одяг': {'emoji': '👗', 'keywords': ['одяг', 'clothes', 'взуття']},
+            'Комунальні': {'emoji': '🏠', 'keywords': ['комунальні', 'комуналка', 'світло', 'газ', 'опалення']},
+            'Податки': {'emoji': '📋', 'keywords': ['податки', 'tax', 'пдв', 'єдиний податок']},
             'Інше': {'emoji': '📦', 'keywords': []}
         },
         'income': {
             'Зарплата': {'emoji': '💰', 'keywords': ['зарплата', 'salary', 'зп']},
             'Фріланс': {'emoji': '💼', 'keywords': ['freelance', 'фріланс', 'проект']},
-            'Консультації': {'emoji': '⚖️', 'keywords': ['консультація', 'consultation']},
-            'ВЛК': {'emoji': '🏥', 'keywords': ['влк', 'військово-лікарська комісія']},
-            'ТЦК': {'emoji': '🪖', 'keywords': ['тцк', 'territorial recruitment']},
-            'Суди': {'emoji': '🏛️', 'keywords': ['суд', 'судові', 'court']},
             'Інше': {'emoji': '📦', 'keywords': []}
         }
     },
@@ -156,19 +149,8 @@ DEFAULT_SETTINGS = {
         'Робота': {'emoji': '💼'},
         'Зал': {'emoji': '🏋️'},
         'Їжа': {'emoji': '🍽️'},
-        'Терапія': {'emoji': '🧘'},
-        'Відпустка': {'emoji': '🏖️'},
-        'Уроки історії': {'emoji': '📚'},
-        'Уроки англійської': {'emoji': '🇬🇧'},
-        'Підвищення кваліфікації': {'emoji': '📈'},
         'Навчання': {'emoji': '🎓'},
-        'Батьки': {'emoji': '👨‍👩‍👧'},
-        'Стосунки': {'emoji': '💕'},
-        'Друзі': {'emoji': '👯'},
-        'Безкоштовна робота': {'emoji': '🎁'},
-        'Шопінг': {'emoji': '🛍️'},
         'Розваги': {'emoji': '🎉'},
-        'Скрол стрічки': {'emoji': '📱'},
         'Інше': {'emoji': '📦'}
     }
 }
@@ -311,6 +293,13 @@ class Database:
                 (str(user_id), json.dumps(settings, ensure_ascii=False)),
             )
             self.conn.commit()
+
+    async def delete_user_settings(self, user_id):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM user_settings WHERE user_id = ?", (str(user_id),))
+            self.conn.commit()
+            return cursor.rowcount > 0
 
     async def upsert_user(self, user):
         if not user:
@@ -2678,18 +2667,6 @@ async def init_data_middleware(request: web.Request, handler):
         await db.upsert_user(_UserObj(tg_user))
     except Exception as e:
         logger.warning(f'upsert_user via middleware failed: {e}')
-    # First-time admins inherit the global SETTINGS as their starting point
-    # (so the existing employees/tax/categories don't disappear on first
-    # Mini App open after this migration). Everyone else starts from
-    # DEFAULT_SETTINGS via user_settings_for().
-    try:
-        if is_admin(user_id_val):
-            existing = await db.get_user_settings(user_id_val)
-            if existing is None:
-                snapshot = _copy.deepcopy(SETTINGS) if SETTINGS else _copy.deepcopy(DEFAULT_SETTINGS)
-                await db.save_user_settings(user_id_val, snapshot)
-    except Exception as e:
-        logger.warning(f'admin settings bootstrap failed: {e}')
     return await handler(request)
 
 
@@ -2922,6 +2899,18 @@ async def api_settings(request: web.Request):
         'employees': s.get('employees', []),
         'tax_config': s.get('tax_config', {}),
     })
+
+
+async def api_settings_reset(request: web.Request):
+    """Wipe this user's settings row → next request rebuilds it from
+    DEFAULT_SETTINGS. Used by the «Reset to defaults» button in the
+    Mini App, and as the recovery path for users who imported legacy
+    employees/categories they didn't actually have."""
+    user_id = request['user_id']
+    await db.delete_user_settings(user_id)
+    logger.info(f"API DELETE /api/settings user={user_id} (reset to defaults)")
+    fresh = await user_settings_for(user_id)
+    return _json_response(fresh)
 
 
 # ---- helpers for parity endpoints ----
@@ -3493,6 +3482,7 @@ def build_api_app() -> web.Application:
     app.router.add_route('DELETE', '/api/time-tracks/{id}', api_time_tracks_delete)
     # tax settings
     app.router.add_route('PATCH', '/api/settings/tax', api_settings_tax_update)
+    app.router.add_route('DELETE', '/api/settings', api_settings_reset)
 
     # Catch-all OPTIONS for CORS preflight on any path
     app.router.add_route('OPTIONS', '/{path_info:.*}', lambda r: web.Response(status=204))

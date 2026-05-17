@@ -368,6 +368,15 @@ function renderPrivacy(root) {
         Нижче — кнопка «Очистити всі мої дані». Це фінально, без відновлення.
       </p>
     </div>
+    <div class="panel" style="padding: var(--sp-4); margin-top: var(--sp-3);">
+      <button class="btn btn-secondary" id="resetBtn">
+        ↺ Скинути налаштування до дефолтів
+      </button>
+      <p style="color: var(--ruby-muted); font-size: var(--fs-12); margin: var(--sp-3) 0 0; line-height: 1.5;">
+        Скидає тільки <b>налаштування</b> (працівники, категорії, податки) до базового стану.
+        Транзакції та час залишаються незмінними.
+      </p>
+    </div>
     <div class="panel" style="padding: var(--sp-4); margin-top: var(--sp-3); border-color: rgba(212, 90, 79, 0.4);">
       <button class="btn btn-secondary" id="clearAllBtn" style="background: rgba(212, 90, 79, 0.18); color: var(--ruby-danger); border-color: rgba(212, 90, 79, 0.4);">
         🗑 Очистити всі мої дані
@@ -375,9 +384,23 @@ function renderPrivacy(root) {
     </div>
   `;
   root.appendChild(body);
+  body.querySelector('#resetBtn').addEventListener('click', async () => {
+    if (!window.confirm('Скинути всі ваші налаштування (працівники, категорії, податки) до дефолтів? Транзакції залишаться.')) return;
+    try {
+      await Api.resetSettings();
+      Telegram.haptic('success');
+      toast('Налаштування скинуто');
+      await Store.hydrate();
+      state.section = 'main';
+      renderSettings();
+    } catch (e) {
+      Telegram.haptic('error');
+      toast(e.message || 'Помилка');
+    }
+  });
   body.querySelector('#clearAllBtn').addEventListener('click', () => {
     Telegram.haptic('warning');
-    toast('Очищення — поки тільки через бот: /очистити');
+    toast('Очищення всіх даних — поки тільки через бот: /очистити');
   });
 }
 
