@@ -280,20 +280,28 @@ class Database:
         self.conn.commit()
 
         # ── One-time migrations ────────────────────────────────────────
-        # Migrations baked into deploys so users never need to run any
-        # reset command themselves. Each migration writes its name into
-        # the _migrations table; subsequent boots see the marker and skip.
-        self._run_migrations()
+        # Wrapped in a global try/except: any migration failure must NOT
+        # take the whole worker down (that would brick the API for every
+        # user). On error we log and continue with the existing schema.
+        try:
+            self._run_migrations()
+        except Exception as e:
+            logger.exception(f"Migrations failed but continuing: {e}")
 
         logger.info("Database initialized successfully")
 
     def _run_migrations(self):
-        """Apply any pending one-time data fixes."""
+        """Apply any pending one-time data fixes. Each migration is
+        individually try/excepted so one bad migration cannot block the
+        others, nor crash the boot."""
         cursor = self.conn.cursor()
 
         def applied(name: str) -> bool:
-            cursor.execute("SELECT 1 FROM _migrations WHERE name = ?", (name,))
-            return cursor.fetchone() is not None
+            try:
+                cursor.execute("SELECT 1 FROM _migrations WHERE name = ?", (name,))
+                return cursor.fetchone() is not None
+            except Exception:
+                return False
 
         def mark(name: str):
             cursor.execute(
@@ -302,21 +310,22 @@ class Database:
             )
 
         # 20260518_wipe_legacy_user_settings
-        #   The Mini App originally shared a global settings.json across all
-        #   users, which seeded everyone's per-user row with the same
-        #   employees (Катя, Ілона, ...) and category set. After the
-        #   per-user-settings refactor (5695c63), those rows persisted —
-        #   meaning new app installs that inherited legacy data still see
-        #   strangers' employees. This migration wipes user_settings ONCE
-        #   so every user reseeds from the neutral DEFAULT_SETTINGS on
-        #   their next API request. Transactions and time-tracks are NOT
-        #   touched — only settings preferences.
         mig = '20260518_wipe_legacy_user_settings'
         if not applied(mig):
-            cursor.execute("DELETE FROM user_settings")
-            wiped = cursor.rowcount
-            mark(mig)
-            logger.info(f"Migration {mig}: wiped {wiped} legacy user_settings rows")
+            try:
+                # `user_settings` may not yet exist on a brand-new DB; guard.
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='user_settings'"
+                )
+                if cursor.fetchone():
+                    cursor.execute("DELETE FROM user_settings")
+                    wiped = cursor.rowcount
+                else:
+                    wiped = 0
+                mark(mig)
+                logger.info(f"Migration {mig}: wiped {wiped} legacy user_settings rows")
+            except Exception as e:
+                logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
 
         self.conn.commit()
 
