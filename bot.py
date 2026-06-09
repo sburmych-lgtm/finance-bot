@@ -434,16 +434,38 @@ class Database:
             self.conn.commit()
             return cursor.lastrowid
 
-    async def get_transactions(self, user_id, year=None, month=None, limit=None):
-        """Get transactions for user"""
+    async def get_transactions(self, user_id, year=None, month=None, limit=None,
+                                t_type=None, from_date=None, to_date=None):
+        """Get transactions for user.
+
+        Filters (all optional):
+          • year+month  — restrict to a specific calendar month
+          • t_type      — 'income' or 'expense'
+          • from_date   — ISO 'YYYY-MM-DD' (inclusive lower bound)
+          • to_date     — ISO 'YYYY-MM-DD' (inclusive upper bound)
+          • limit       — at most N rows (use _parse_limit at the API layer)
+
+        from_date/to_date take precedence over year/month if both are given.
+        """
         async with db_lock:
             cursor = self.conn.cursor()
             query = "SELECT * FROM transactions WHERE user_id = ?"
             params = [user_id]
 
-            if year and month:
+            if from_date or to_date:
+                if from_date:
+                    query += " AND date >= ?"
+                    params.append(str(from_date))
+                if to_date:
+                    query += " AND date <= ?"
+                    params.append(str(to_date))
+            elif year and month:
                 query += " AND strftime('%Y', date) = ? AND strftime('%m', date) = ?"
                 params.extend([str(year), f"{month:02d}"])
+
+            if t_type in ('income', 'expense'):
+                query += " AND type = ?"
+                params.append(t_type)
 
             query += " ORDER BY timestamp DESC"
 
@@ -2928,11 +2950,82 @@ async def api_balance(request: web.Request):
 
 
 async def api_get_transactions(request: web.Request):
+    """List user's transactions with optional filters:
+
+      ?limit=N                     (default 15, max 100; if 'all' →
+                                    hard_cap 100 ignored, cap raised to 5 000)
+      ?type=income|expense
+      ?period=current_month|10d|30d|month   (convenience presets)
+      ?year=YYYY&month=MM          (when period=month, OR direct override)
+      ?from=YYYY-MM-DD&to=YYYY-MM-DD  (explicit date range — takes precedence)
+
+    Backwards-compatible: no filters → latest 15 across all types.
+    """
     user_id = request['user_id']
-    limit, err = _parse_limit(request, default=15, hard_cap=100)
-    if err is not None:
-        return err
-    rows = await db.get_transactions(user_id, limit=limit)
+    q = request.rel_url.query
+
+    # Optional type filter
+    t_type = q.get('type')
+    if t_type and t_type not in ('income', 'expense'):
+        return _json_response({'detail': 'type must be income or expense'}, status=400)
+
+    # Period → date range translation
+    from_date = q.get('from')
+    to_date = q.get('to')
+    period = q.get('period')
+    now = datetime.now(KYIV_TZ)
+
+    if not from_date and not to_date and period:
+        if period == 'current_month':
+            year_v, month_v = now.year, now.month
+            import calendar
+            last_day = calendar.monthrange(year_v, month_v)[1]
+            from_date = f'{year_v:04d}-{month_v:02d}-01'
+            to_date   = f'{year_v:04d}-{month_v:02d}-{last_day:02d}'
+        elif period == '10d':
+            from datetime import timedelta
+            from_date = (now - timedelta(days=10)).strftime('%Y-%m-%d')
+            to_date   = now.strftime('%Y-%m-%d')
+        elif period == '30d':
+            from datetime import timedelta
+            from_date = (now - timedelta(days=30)).strftime('%Y-%m-%d')
+            to_date   = now.strftime('%Y-%m-%d')
+        elif period == 'month':
+            # specific month — use ?year & ?month
+            year_v, month_v, err = _parse_year_month(request)
+            if err is not None:
+                return err
+            import calendar
+            last_day = calendar.monthrange(year_v, month_v)[1]
+            from_date = f'{year_v:04d}-{month_v:02d}-01'
+            to_date   = f'{year_v:04d}-{month_v:02d}-{last_day:02d}'
+        else:
+            return _json_response(
+                {'detail': 'period must be one of: current_month, 10d, 30d, month'},
+                status=400,
+            )
+
+    # Validate explicit from/to (loose — SQLite text comparison works for ISO dates)
+    for k, v in (('from', from_date), ('to', to_date)):
+        if v and not _looks_like_iso_date(v):
+            return _json_response({'detail': f'{k} must be YYYY-MM-DD'}, status=400)
+
+    # Limit. 'all' raises the cap so history filters can return everything in range.
+    limit_raw = q.get('limit')
+    if limit_raw == 'all':
+        limit = None
+    else:
+        limit, err = _parse_limit(request, default=15, hard_cap=5000)
+        if err is not None:
+            return err
+
+    rows = await db.get_transactions(
+        user_id,
+        limit=limit,
+        t_type=t_type,
+        from_date=from_date,
+        to_date=to_date,
+    )
     result = [
         {
             'id': r['id'],
@@ -2948,6 +3041,11 @@ async def api_get_transactions(request: web.Request):
         for r in rows
     ]
     return _json_response(result)
+
+
+def _looks_like_iso_date(s: str) -> bool:
+    import re as _re
+    return bool(_re.fullmatch(r'\d{4}-\d{2}-\d{2}', s))
 
 
 async def api_post_transaction(request: web.Request):

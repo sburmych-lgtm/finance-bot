@@ -28,6 +28,10 @@ export const Api = {
   // Profile
   me:              ()                    => request('/api/me'),
 
+  // Low-level escape hatch so screens can hand-craft query strings.
+  // Returns parsed JSON (or null on 204) and throws Error(detail) on !ok.
+  _request:        (path, opts)          => request(path, opts),
+
   // Balance + transactions
   getBalance:      (year, month)         => request(`/api/balance?year=${year}&month=${month}`),
   listTransactions:(limit = 15)          => request(`/api/transactions?limit=${limit}`),

@@ -162,12 +162,15 @@ function renderOverview() {
   }
   const slices = Object.entries(expenseByCat).map(([k, v]) => ({ name: k, value: v }))
     .sort((a, b) => b.value - a.value).slice(0, 6);
-  const legend = slices.map((s, i) => `
-    <div class="legend-item">
-      <span class="swatch" style="background:${SLICE_COLORS[i % SLICE_COLORS.length]}"></span>
-      <span>${esc(s.name)}</span>
-      <strong>${((s.value / (totalExpense || 1)) * 100).toFixed(0)}%</strong>
-    </div>`).join('');
+  const legend = slices.map((s, i) => {
+    const pct = ((s.value / (totalExpense || 1)) * 100).toFixed(0);
+    return `
+      <div class="legend-item">
+        <span class="swatch" style="background:${SLICE_COLORS[i % SLICE_COLORS.length]}"></span>
+        <span>${esc(s.name)}</span>
+        <strong>${esc(fmtMoney(s.value, 'UAH'))} <span class="legend-pct">(${pct}%)</span></strong>
+      </div>`;
+  }).join('');
   const incomeBars = Object.entries(incomeByCat).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `
     <div>
       <div class="bar-meta"><span>${esc(k)}</span><strong>${esc(fmtMoney(v, 'UAH'))}</strong></div>

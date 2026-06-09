@@ -195,6 +195,54 @@
   border-color: var(--ruby-line);
 }
 
+/* History filter bar */
+.history-filter {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+}
+.history-filter .segmented {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: var(--r-lg);
+  background: rgba(255,255,255,.04);
+  border: 1px solid var(--ruby-line-soft);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.history-filter .segmented::-webkit-scrollbar { display: none; }
+.history-filter .seg-btn {
+  flex: 1 0 auto;
+  min-width: max-content;
+  border: 0;
+  background: transparent;
+  border-radius: var(--r-md);
+  padding: 10px 14px;
+  color: var(--ruby-muted);
+  font-size: var(--fs-13);
+  font-weight: 800;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all var(--t-fast) var(--ease-out);
+}
+.history-filter .seg-btn.active {
+  color: var(--ruby-gold);
+  background: linear-gradient(145deg, rgba(216,181,109,.14), rgba(110,15,31,.30));
+  box-shadow: inset 0 0 0 1px rgba(216,181,109,.22);
+}
+.month-year-picker {
+  display: grid;
+  grid-template-columns: 1fr 1.5fr;
+  gap: var(--sp-2);
+}
+.month-year-picker select {
+  min-height: 44px;
+  padding: 10px 12px;
+}
+
 /* Tax-group cards (Settings → Податки) */
 .tax-group-grid {
   display: grid;
