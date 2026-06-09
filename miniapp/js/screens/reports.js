@@ -3,7 +3,7 @@
 import { Store } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
-import { fmtMoney, esc, toast } from '../ui.js';
+import { fmtMoney, fmtAmount, esc, toast } from '../ui.js';
 
 const SLICE_COLORS = ['#6E0F1F', '#D8B56D', '#9B1B30', '#6FB67E', '#D45A4F', '#7A6E66'];
 
@@ -168,7 +168,7 @@ function renderOverview() {
       <div class="legend-item">
         <span class="swatch" style="background:${SLICE_COLORS[i % SLICE_COLORS.length]}"></span>
         <span>${esc(s.name)}</span>
-        <strong>${esc(fmtMoney(s.value, 'UAH'))} <span class="legend-pct">(${pct}%)</span></strong>
+        <strong>${esc(fmtAmount(s.value, 'UAH'))} <span class="legend-pct">(${pct}%)</span></strong>
       </div>`;
   }).join('');
   const incomeBars = Object.entries(incomeByCat).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `
@@ -181,8 +181,8 @@ function renderOverview() {
       <div class="balance-label">${esc(monthLabel())}</div>
       <div class="balance-value" style="font-size: var(--fs-32);">${esc(fmtMoney(totalIncome - totalExpense, 'UAH'))}</div>
       <div class="metric-row">
-        <div class="metric"><span>Доходи</span><strong>${esc(fmtMoney(totalIncome, 'UAH'))}</strong></div>
-        <div class="metric"><span>Витрати</span><strong>${esc(fmtMoney(totalExpense, 'UAH'))}</strong></div>
+        <div class="metric"><span>Доходи</span><strong>${esc(fmtAmount(totalIncome, 'UAH'))}</strong></div>
+        <div class="metric"><span>Витрати</span><strong>${esc(fmtAmount(totalExpense, 'UAH'))}</strong></div>
       </div>
     </div>
     <div class="section-head"><div class="section-title">Витрати по категоріях</div></div>
@@ -258,21 +258,21 @@ async function renderTax(container) {
         ? `Єдиний податок (${(d.single_tax_rate * 100).toFixed(0)}%)`
         : 'Єдиний податок (фіксований)';
       metricRow = `
-        <div class="metric"><span>${esc(singleLabel)}</span><strong>${esc(fmtMoney(d.single_tax, 'UAH'))}</strong></div>
-        <div class="metric"><span>ЄСВ (фіксований)</span><strong>${esc(fmtMoney(d.esv_fixed, 'UAH'))}</strong></div>
+        <div class="metric"><span>${esc(singleLabel)}</span><strong>${esc(fmtAmount(d.single_tax, 'UAH'))}</strong></div>
+        <div class="metric"><span>ЄСВ (фіксований)</span><strong>${esc(fmtAmount(d.esv_fixed, 'UAH'))}</strong></div>
       `;
     }
 
     const hintText = isNotFop
       ? 'Як фізособа ви не сплачуєте єдиний податок та ЄСВ. Якщо ви ФОП — змініть групу у Меню → Налаштування → Податки.'
       : d.group === 'fop3'
-        ? `${(d.single_tax_rate * 100).toFixed(0)}% єдиного податку від доходу + фіксований ЄСВ ${fmtMoney(d.esv_fixed, 'UAH')}. Змініть у Меню → Налаштування → Податки.`
-        : `Фіксований єдиний податок ${fmtMoney(d.single_tax, 'UAH')} + ЄСВ ${fmtMoney(d.esv_fixed, 'UAH')}. Змініть у Меню → Налаштування → Податки.`;
+        ? `${(d.single_tax_rate * 100).toFixed(0)}% єдиного податку від доходу + фіксований ЄСВ ${fmtAmount(d.esv_fixed, 'UAH')}. Змініть у Меню → Налаштування → Податки.`
+        : `Фіксований єдиний податок ${fmtAmount(d.single_tax, 'UAH')} + ЄСВ ${fmtAmount(d.esv_fixed, 'UAH')}. Змініть у Меню → Налаштування → Податки.`;
 
     container.innerHTML = `
       <div class="balance-card" style="min-height:auto;">
         <div class="balance-label">${esc(groupLabel)} · ${esc(d.month_name)} ${d.year}</div>
-        <div class="balance-value" style="font-size: var(--fs-32);">${esc(fmtMoney(d.total_tax, 'UAH'))}</div>
+        <div class="balance-value" style="font-size: var(--fs-32);">${esc(fmtAmount(d.total_tax, 'UAH'))}</div>
         <div class="metric-row">${metricRow}</div>
       </div>
 
@@ -280,8 +280,8 @@ async function renderTax(container) {
       <div class="panel" style="padding: var(--sp-4);">
         <div class="row-list">
           <div class="kv"><span>Період</span><strong>${esc(d.period_from)} — ${esc(d.period_to)}</strong></div>
-          <div class="kv"><span>Загальний дохід</span><strong>${esc(fmtMoney(d.total_income, 'UAH'))}</strong></div>
-          <div class="kv"><span>Загальні витрати</span><strong>${esc(fmtMoney(d.total_expense, 'UAH'))}</strong></div>
+          <div class="kv"><span>Загальний дохід</span><strong>${esc(fmtAmount(d.total_income, 'UAH'))}</strong></div>
+          <div class="kv"><span>Загальні витрати</span><strong>${esc(fmtAmount(d.total_expense, 'UAH'))}</strong></div>
           <div class="kv"><span>Чистий прибуток</span><strong class="amount ${d.profit >= 0 ? 'income' : 'expense'}">${esc(fmtMoney(d.profit, 'UAH'))}</strong></div>
           <div class="kv"><span>Після податків</span><strong class="amount ${d.after_tax >= 0 ? 'income' : 'expense'}">${esc(fmtMoney(d.after_tax, 'UAH'))}</strong></div>
         </div>

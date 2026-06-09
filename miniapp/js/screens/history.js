@@ -3,7 +3,7 @@
 import { Store } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
-import { fmtMoney, fmtDate, esc, toast } from '../ui.js';
+import { fmtMoney, fmtAmount, fmtDate, esc, toast } from '../ui.js';
 
 const CATEGORY_LETTER = {
   'Продукти':'П','Кафе':'К','Транспорт':'Т','Розваги':'Р','Здоров\'я':'Z',
@@ -69,7 +69,7 @@ function filterBar() {
     { id: 'current_month', label: 'Цей місяць' },
     { id: '10d',           label: '10 днів' },
     { id: '30d',           label: '30 днів' },
-    { id: 'month',         label: 'Конкретний' },
+    { id: 'month',         label: 'За місяць' },
   ];
   const periodSeg = periodOpts.map((p) =>
     `<button class="seg-btn ${state.period === p.id ? 'active' : ''}" data-period="${p.id}">${esc(p.label)}</button>`
@@ -115,8 +115,8 @@ function summary() {
       <div class="balance-label">${esc(periodLabel())}</div>
       <div class="balance-value" style="font-size: var(--fs-32);">${esc(fmtMoney(net, 'UAH'))}</div>
       <div class="metric-row">
-        <div class="metric"><span>Доходи</span><strong>${esc(fmtMoney(income, 'UAH'))}</strong></div>
-        <div class="metric"><span>Витрати</span><strong>${esc(fmtMoney(expense, 'UAH'))}</strong></div>
+        <div class="metric"><span>Доходи</span><strong>${esc(fmtAmount(income, 'UAH'))}</strong></div>
+        <div class="metric"><span>Витрати</span><strong>${esc(fmtAmount(expense, 'UAH'))}</strong></div>
       </div>
     </div>`;
 }

@@ -8,6 +8,16 @@ export function fmtMoney(value, currency = 'UAH') {
   return `${sign}${formatted} ${symbol}`;
 }
 
+// Like fmtMoney but with no leading sign — for unambiguously-positive labels
+// like «Доходи: X ₴» / «Витрати: X ₴» where the column header already conveys
+// direction and a stray «+» would read as income.
+export function fmtAmount(value, currency = 'UAH') {
+  const abs = Math.abs(Number(value) || 0);
+  const formatted = abs.toLocaleString('uk-UA', { maximumFractionDigits: 2 });
+  const symbol = currency === 'UAH' ? '₴' : currency === 'USD' ? '$' : currency === 'EUR' ? '€' : currency;
+  return `${formatted} ${symbol}`;
+}
+
 export function fmtDate(dateStr) {
   if (!dateStr) return '';
   const d = new Date(dateStr);

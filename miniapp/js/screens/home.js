@@ -3,7 +3,7 @@
 import { Store } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
-import { fmtMoney, fmtDate, esc, toast } from '../ui.js';
+import { fmtMoney, fmtAmount, fmtDate, esc, toast } from '../ui.js';
 
 const CATEGORY_LETTER = {
   'Продукти':'П','Кафе':'К','Транспорт':'Т','Розваги':'Р','Здоров\'я':'Z',
@@ -26,8 +26,8 @@ export function renderHome() {
     card.querySelector('.balance-sub').textContent = `${month} · чистий результат`;
     card.querySelector('.balance-sub').classList.remove('sk');
     const metrics = card.querySelectorAll('.metric strong');
-    metrics[0].textContent = fmtMoney(b.income || 0, 'UAH');
-    metrics[1].textContent = fmtMoney(b.expense || 0, 'UAH');
+    metrics[0].textContent = fmtAmount(b.income || 0, 'UAH');
+    metrics[1].textContent = fmtAmount(b.expense || 0, 'UAH');
     metrics.forEach((m) => m.classList.remove('sk'));
   }
 
