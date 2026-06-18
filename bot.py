@@ -3473,9 +3473,17 @@ async def api_report_time(request: web.Request):
 # ---- categories CRUD (per-user) ----
 
 async def api_categories_full(request: web.Request):
-    """Return THIS user's CATEGORIES dict."""
+    """Return THIS user's CATEGORIES dict, normalised so every category
+    entry always carries a `subcategories` list (default categories that
+    were never edited omit the key in storage — consumers shouldn't have to
+    guard for its absence)."""
     user_settings = await user_settings_for(request['user_id'])
-    return _json_response(user_settings.get('categories', {}))
+    cats = user_settings.get('categories', {}) or {}
+    for cat_type in ('expense', 'income'):
+        for name, entry in (cats.get(cat_type, {}) or {}).items():
+            if isinstance(entry, dict) and not isinstance(entry.get('subcategories'), list):
+                entry['subcategories'] = []
+    return _json_response(cats)
 
 
 async def api_categories_create(request: web.Request):
