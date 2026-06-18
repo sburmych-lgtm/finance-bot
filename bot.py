@@ -3937,6 +3937,54 @@ async def api_settings_tax_update(request: web.Request):
     return _json_response(tax_cfg)
 
 
+async def api_admin_broadcast(request: web.Request):
+    """POST /api/admin/broadcast  body {text}
+    Admin-only mass message to every registered user. Same effect as the
+    in-chat /broadcast command, but reachable over HTTP so an operator
+    tool can trigger it. Sends via the Telegram HTTP API directly (no need
+    for the Application instance). Skips obvious test ids and tolerates
+    'chat not found' for stale entries."""
+    if not is_admin(request['user_id']):
+        return _json_response({'detail': 'admin only'}, status=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+
+    text = (body.get('text') or '').strip()
+    if not text:
+        return _json_response({'detail': 'text required'}, status=400)
+
+    user_ids = await db.get_all_user_ids()
+    token = os.getenv('TELEGRAM_BOT_TOKEN', '')
+    if not token:
+        return _json_response({'detail': 'bot token unavailable'}, status=500)
+
+    sent, failed, skipped = 0, 0, 0
+    url = f'https://api.telegram.org/bot{token}/sendMessage'
+    async with aiohttp.ClientSession() as session:
+        for uid in user_ids:
+            # Skip the synthetic QA test accounts (999000***) that never
+            # correspond to a real Telegram chat.
+            if str(uid).startswith('999000'):
+                skipped += 1
+                continue
+            try:
+                async with session.post(url, json={'chat_id': int(uid), 'text': text}) as resp:
+                    if resp.status == 200:
+                        sent += 1
+                    else:
+                        failed += 1
+            except Exception as e:
+                failed += 1
+                logger.warning(f'admin broadcast to {uid} failed: {e}')
+            await asyncio.sleep(0.05)  # stay well under Telegram rate limits
+
+    logger.info(f"API admin broadcast: sent={sent} failed={failed} skipped={skipped}")
+    return _json_response({'sent': sent, 'failed': failed, 'skipped': skipped,
+                           'total_users': len(user_ids)})
+
+
 def build_api_app() -> web.Application:
     """Build and return the aiohttp API application."""
     # Order matters: json_errors first (catches everything else), then CORS
@@ -3984,6 +4032,8 @@ def build_api_app() -> web.Application:
     # tax settings
     app.router.add_route('PATCH', '/api/settings/tax', api_settings_tax_update)
     app.router.add_route('DELETE', '/api/settings', api_settings_reset)
+    # admin
+    app.router.add_route('POST', '/api/admin/broadcast', api_admin_broadcast)
 
     # Catch-all OPTIONS for CORS preflight on any path
     app.router.add_route('OPTIONS', '/{path_info:.*}', lambda r: web.Response(status=204))
