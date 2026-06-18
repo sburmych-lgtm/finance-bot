@@ -10,6 +10,7 @@ const state = {
   amount: '0',
   currency: 'UAH',
   category: null,
+  subcategory: null,  // optional, only when the chosen category has subcategories
   note: '',
   empOpen: false,  // employees-submenu collapse state
 };
@@ -127,6 +128,22 @@ function template() {
       return regularHtml + empHtml;
     })()}
 
+    ${(() => {
+      // Subcategory chips — only when a category is chosen AND it has subcategories
+      if (isTime || !state.category) return '';
+      const subs = Store.subcategoriesFor(state.mode, state.category);
+      if (!subs.length) return '';
+      return `
+        <div class="section-head" style="margin-top: var(--sp-3);">
+          <div class="section-title">Підрозділ <span class="sub-optional">(необов'язково)</span></div>
+        </div>
+        <div class="chip-grid">
+          ${subs.map((s) =>
+            `<button class="chip sub-chip ${state.subcategory === s ? 'active' : ''}" data-sub="${esc(s)}">${esc(s)}</button>`
+          ).join('')}
+        </div>`;
+    })()}
+
     <div class="field" style="margin-top: var(--sp-4);">
       <label>${isTime ? 'Опис (необов\'язково)' : 'Коментар (необов\'язково)'}</label>
       <input class="input" id="noteInput" placeholder="${isTime ? 'напр. підготовка позову' : 'напр. кава з клієнтом'}" value="${esc(state.note)}">
@@ -142,6 +159,7 @@ function bind(root) {
   root.querySelectorAll('[data-mode]').forEach((b) => b.addEventListener('click', () => {
     state.mode = b.dataset.mode;
     state.category = null;
+    state.subcategory = null;
     state.amount = '0';
     Telegram.haptic('selection');
     renderAdd();
@@ -158,6 +176,13 @@ function bind(root) {
   }));
   root.querySelectorAll('[data-cat]').forEach((b) => b.addEventListener('click', () => {
     state.category = b.dataset.cat;
+    state.subcategory = null;  // reset — different category has different subcategories
+    Telegram.haptic('selection');
+    renderAdd();
+  }));
+  root.querySelectorAll('[data-sub]').forEach((b) => b.addEventListener('click', () => {
+    // Toggle: tapping the active subcategory clears it (it's optional)
+    state.subcategory = state.subcategory === b.dataset.sub ? null : b.dataset.sub;
     Telegram.haptic('selection');
     renderAdd();
   }));
@@ -213,11 +238,12 @@ function bind(root) {
         amount,
         currency: state.currency,
         category: state.category,
+        subcategory: state.subcategory || undefined,
         description: state.note || state.category,
       });
       Telegram.haptic('success');
       toast('Операцію збережено');
-      state.amount = '0'; state.category = null; state.note = '';
+      state.amount = '0'; state.category = null; state.subcategory = null; state.note = '';
       await Store.hydrate();
       navigate('home');
     } catch (e) { Telegram.haptic('error'); toast(e.message || 'Помилка'); }

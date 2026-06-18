@@ -22,6 +22,7 @@ export const Store = {
   balance: null,
   transactions: [],
   categories: null,
+  categoriesFull: null,   // full dict {expense:{name:{emoji,keywords,subcategories}}, income:{...}}
   rates: { USD: 41.5, EUR: 45.2 },
   timeCategories: null,
   employees: [],
@@ -30,11 +31,12 @@ export const Store = {
   async hydrate() {
     const now = new Date();
     try {
-      const [me, balance, txs, cats, rates, tCats, emps] = await Promise.all([
+      const [me, balance, txs, cats, catsFull, rates, tCats, emps] = await Promise.all([
         Api.me().catch(() => null),
         Api.getBalance(now.getFullYear(), now.getMonth() + 1).catch(() => null),
         Api.listTransactions(15).catch(() => []),
         Api.categories().catch(() => null),
+        Api.categoriesFull().catch(() => null),
         Api.exchangeRates().catch(() => null),
         Api.timeCategories().catch(() => null),
         Api.employees().catch(() => []),
@@ -43,12 +45,20 @@ export const Store = {
       this.balance = balance;
       this.transactions = txs || [];
       this.categories = cats;
+      this.categoriesFull = catsFull;
       if (rates) Object.assign(this.rates, rates);
       this.timeCategories = tCats;
       this.employees = emps || [];
     } catch (e) {
       console.warn('hydrate failed', e);
     }
+  },
+
+  // Subcategory names for a given category, or [] if none.
+  subcategoriesFor(mode, category) {
+    const def = this.categoriesFull?.[mode]?.[category];
+    const subs = def && Array.isArray(def.subcategories) ? def.subcategories : [];
+    return subs;
   },
 };
 

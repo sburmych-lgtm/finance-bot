@@ -207,6 +207,7 @@ class Database:
                 amount_uah REAL NOT NULL,
                 type TEXT NOT NULL,
                 category TEXT NOT NULL,
+                subcategory TEXT,
                 description TEXT,
                 date DATE NOT NULL,
                 timestamp DATETIME NOT NULL,
@@ -327,6 +328,22 @@ class Database:
             except Exception as e:
                 logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
 
+        # 20260610_add_subcategory_column
+        #   Hierarchical categories: a transaction may belong to an optional
+        #   subcategory inside its category (e.g. Житло → Комунальні). Add a
+        #   nullable column; existing rows keep subcategory = NULL.
+        mig = '20260610_add_subcategory_column'
+        if not applied(mig):
+            try:
+                cursor.execute("PRAGMA table_info(transactions)")
+                cols = {r[1] for r in cursor.fetchall()}
+                if 'subcategory' not in cols:
+                    cursor.execute("ALTER TABLE transactions ADD COLUMN subcategory TEXT")
+                    logger.info(f"Migration {mig}: added transactions.subcategory")
+                mark(mig)
+            except Exception as e:
+                logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
+
         self.conn.commit()
 
     async def get_user_settings(self, user_id):
@@ -410,15 +427,15 @@ class Database:
             self.conn.commit()
 
     async def add_transaction(self, user_id, amount, currency, amount_uah, t_type,
-                             category, description, date, timestamp):
+                             category, description, date, timestamp, subcategory=None):
         """Add transaction to database"""
         async with db_lock:
             cursor = self.conn.cursor()
             cursor.execute('''
                 INSERT INTO transactions
-                (user_id, amount, currency, amount_uah, type, category, description, date, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (user_id, amount, currency, amount_uah, t_type, category, description, date, timestamp))
+                (user_id, amount, currency, amount_uah, type, category, subcategory, description, date, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (user_id, amount, currency, amount_uah, t_type, category, subcategory, description, date, timestamp))
             self.conn.commit()
             return cursor.lastrowid
 
@@ -3034,6 +3051,7 @@ async def api_get_transactions(request: web.Request):
             'amount_uah': r['amount_uah'],
             'type': r['type'],
             'category': r['category'],
+            'subcategory': (r['subcategory'] if 'subcategory' in r.keys() else None),
             'description': r['description'],
             'date': r['date'],
             'timestamp': r['timestamp'],
@@ -3090,6 +3108,8 @@ async def api_post_transaction(request: web.Request):
 
     category = _clean_text(body.get('category'), max_len=80, default='Інше')
     description = _clean_text(body.get('description'), max_len=200, default='')
+    # Optional subcategory (hierarchical categories). None when absent/empty.
+    subcategory = _clean_text(body.get('subcategory'), max_len=80, default='') or None
 
     rate = await get_exchange_rate(currency)
     amount_uah = round(convert_to_uah(amount, currency, rate), 2)
@@ -3106,7 +3126,8 @@ async def api_post_transaction(request: web.Request):
 
     row_id = await db.add_transaction(
         user_id, amount, currency, amount_uah,
-        t_type, category, description, date_str, ts_str
+        t_type, category, description, date_str, ts_str,
+        subcategory=subcategory,
     )
 
     await db.upsert_user(_UserObj(tg_user))
@@ -3119,6 +3140,7 @@ async def api_post_transaction(request: web.Request):
         'amount_uah': amount_uah,
         'type': t_type,
         'category': category,
+        'subcategory': subcategory,
         'description': description,
         'date': date_str,
         'timestamp': ts_str,
@@ -3479,6 +3501,7 @@ async def api_categories_create(request: web.Request):
     entry = {
         'emoji': body.get('emoji', '📦'),
         'keywords': body.get('keywords', []) or [],
+        'subcategories': [s for s in (body.get('subcategories') or []) if isinstance(s, str)],
     }
     bucket[name] = entry
     await save_user_settings(user_id, settings)
@@ -3505,6 +3528,8 @@ async def api_categories_update(request: web.Request):
     current = bucket[name]
     new_emoji = body.get('emoji', current.get('emoji', '📦'))
     new_keywords = body.get('keywords', current.get('keywords', []))
+    # Preserve subcategories across rename/update unless explicitly provided.
+    new_subs = body.get('subcategories', current.get('subcategories', []))
     new_name = (body.get('new_name') or name).strip() or name
 
     if new_name != name and new_name in bucket:
@@ -3512,7 +3537,11 @@ async def api_categories_update(request: web.Request):
     if name == 'Інше' and new_name != 'Інше':
         return _json_response({'detail': 'cannot rename "Інше"'}, status=400)
 
-    new_entry = {'emoji': new_emoji, 'keywords': new_keywords or []}
+    new_entry = {
+        'emoji': new_emoji,
+        'keywords': new_keywords or [],
+        'subcategories': [s for s in (new_subs or []) if isinstance(s, str)],
+    }
     new_bucket = {}
     for k, v in list(bucket.items()):
         new_bucket[new_name if k == name else k] = new_entry if k == name else v
@@ -3540,6 +3569,133 @@ async def api_categories_delete(request: web.Request):
     del bucket[name]
     await save_user_settings(user_id, settings)
     return web.Response(status=204)
+
+
+# ---- subcategories CRUD (per-user, nested under a category) ----
+
+async def api_subcategories_create(request: web.Request):
+    """POST /api/categories/{type}/{name}/subcategories  body {name}"""
+    user_id = request['user_id']
+    cat_type = request.match_info.get('type')
+    cat_name = unquote(request.match_info.get('name', ''))
+    if cat_type not in ('income', 'expense'):
+        return _json_response({'detail': 'type must be income or expense'}, status=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+
+    sub_name = _clean_text(body.get('name'), max_len=80)
+    if not sub_name:
+        return _json_response({'detail': 'subcategory name required'}, status=400)
+
+    settings = await user_settings_for(user_id)
+    bucket = settings.get('categories', {}).get(cat_type, {})
+    if cat_name not in bucket:
+        return _json_response({'detail': 'category not found'}, status=404)
+
+    entry = bucket[cat_name]
+    subs = entry.setdefault('subcategories', [])
+    if sub_name in subs:
+        return _json_response({'detail': 'subcategory already exists'}, status=409)
+    if len(subs) >= 30:
+        return _json_response({'detail': 'too many subcategories (max 30)'}, status=400)
+
+    subs.append(sub_name)
+    await save_user_settings(user_id, settings)
+    return _json_response({'category': cat_name, 'subcategory': sub_name}, status=201)
+
+
+async def api_subcategories_delete(request: web.Request):
+    """DELETE /api/categories/{type}/{name}/subcategories/{sub}"""
+    user_id = request['user_id']
+    cat_type = request.match_info.get('type')
+    cat_name = unquote(request.match_info.get('name', ''))
+    sub_name = unquote(request.match_info.get('sub', ''))
+    if cat_type not in ('income', 'expense'):
+        return _json_response({'detail': 'type must be income or expense'}, status=400)
+
+    settings = await user_settings_for(user_id)
+    bucket = settings.get('categories', {}).get(cat_type, {})
+    if cat_name not in bucket:
+        return _json_response({'detail': 'category not found'}, status=404)
+
+    subs = bucket[cat_name].get('subcategories', [])
+    if sub_name not in subs:
+        return _json_response({'detail': 'subcategory not found'}, status=404)
+
+    subs.remove(sub_name)
+    await save_user_settings(user_id, settings)
+    return web.Response(status=204)
+
+
+async def api_report_category_breakdown(request: web.Request):
+    """GET /api/reports/category-breakdown?type=&category=&period=...
+    Aggregate ONE category's transactions by subcategory for the window.
+    Rows with no subcategory bucket into «Без підрозділу»."""
+    user_id = request['user_id']
+    q = request.rel_url.query
+
+    cat_type = q.get('type')
+    if cat_type not in ('income', 'expense'):
+        return _json_response({'detail': 'type must be income or expense'}, status=400)
+    category = _clean_text(q.get('category'), max_len=80)
+    if not category:
+        return _json_response({'detail': 'category required'}, status=400)
+
+    # Reuse the same period/date logic as the transaction list
+    from_date = q.get('from')
+    to_date = q.get('to')
+    period = q.get('period')
+    now = datetime.now(KYIV_TZ)
+    import calendar
+    if not from_date and not to_date:
+        if period == '10d':
+            from datetime import timedelta
+            from_date = (now - timedelta(days=10)).strftime('%Y-%m-%d')
+            to_date = now.strftime('%Y-%m-%d')
+        elif period == '30d':
+            from datetime import timedelta
+            from_date = (now - timedelta(days=30)).strftime('%Y-%m-%d')
+            to_date = now.strftime('%Y-%m-%d')
+        elif period == 'month':
+            year_v, month_v, err = _parse_year_month(request)
+            if err is not None:
+                return err
+            last_day = calendar.monthrange(year_v, month_v)[1]
+            from_date = f'{year_v:04d}-{month_v:02d}-01'
+            to_date = f'{year_v:04d}-{month_v:02d}-{last_day:02d}'
+        else:  # default current month
+            last_day = calendar.monthrange(now.year, now.month)[1]
+            from_date = f'{now.year:04d}-{now.month:02d}-01'
+            to_date = f'{now.year:04d}-{now.month:02d}-{last_day:02d}'
+
+    rows = await db.get_transactions(
+        user_id, t_type=cat_type, from_date=from_date, to_date=to_date,
+    )
+    rows = [r for r in rows if r['category'] == category]
+
+    by_sub: dict[str, float] = {}
+    total = 0.0
+    for r in rows:
+        v = r['amount_uah'] or 0
+        sub = (r['subcategory'] if 'subcategory' in r.keys() else None) or 'Без підрозділу'
+        by_sub[sub] = round(by_sub.get(sub, 0.0) + v, 2)
+        total += v
+
+    breakdown = [
+        {'name': k, 'value': v, 'percentage': round((v / total * 100) if total else 0, 1)}
+        for k, v in sorted(by_sub.items(), key=lambda x: x[1], reverse=True)
+    ]
+    return _json_response({
+        'category': category,
+        'type': cat_type,
+        'total': round(total, 2),
+        'breakdown': breakdown,
+        'from': from_date,
+        'to': to_date,
+    })
 
 
 # ---- employees CRUD (per-user) ----
@@ -3795,9 +3951,14 @@ def build_api_app() -> web.Application:
     app.router.add_route('GET', '/api/reports/tax', api_report_tax)
     app.router.add_route('GET', '/api/reports/accounting', api_report_accounting)
     app.router.add_route('GET', '/api/reports/time', api_report_time)
+    app.router.add_route('GET', '/api/reports/category-breakdown', api_report_category_breakdown)
     # categories CRUD
     app.router.add_route('GET', '/api/categories/full', api_categories_full)
     app.router.add_route('POST', '/api/categories', api_categories_create)
+    # subcategories (registered BEFORE the {type}/{name} routes so the longer
+    # path matches first)
+    app.router.add_route('POST', '/api/categories/{type}/{name}/subcategories', api_subcategories_create)
+    app.router.add_route('DELETE', '/api/categories/{type}/{name}/subcategories/{sub}', api_subcategories_delete)
     app.router.add_route('PATCH', '/api/categories/{type}/{name}', api_categories_update)
     app.router.add_route('DELETE', '/api/categories/{type}/{name}', api_categories_delete)
     # employees CRUD

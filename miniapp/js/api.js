@@ -52,6 +52,19 @@ export const Api = {
   patchCategory:   (type, name, payload) => request(`/api/categories/${type}/${encodeURIComponent(name)}`, { method: 'PATCH', body: payload }),
   deleteCategory:  (type, name)          => request(`/api/categories/${type}/${encodeURIComponent(name)}`, { method: 'DELETE' }),
 
+  // Subcategories (nested under a category)
+  addSubcategory:    (type, cat, name)   => request(`/api/categories/${type}/${encodeURIComponent(cat)}/subcategories`, { method: 'POST', body: { name } }),
+  deleteSubcategory: (type, cat, sub)    => request(`/api/categories/${type}/${encodeURIComponent(cat)}/subcategories/${encodeURIComponent(sub)}`, { method: 'DELETE' }),
+
+  // Drill-down: one category's transactions aggregated by subcategory
+  categoryBreakdown: (type, category, period, year, month) => {
+    const p = new URLSearchParams({ type, category });
+    if (period) p.set('period', period);
+    if (year)   p.set('year', String(year));
+    if (month)  p.set('month', String(month));
+    return request(`/api/reports/category-breakdown?${p.toString()}`);
+  },
+
   // Employees
   employees:       ()                    => request('/api/employees'),
   addEmployee:     (name)                => request('/api/employees',                        { method: 'POST',   body: { name } }),

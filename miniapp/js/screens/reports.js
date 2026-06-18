@@ -3,7 +3,7 @@
 import { Store } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
-import { fmtMoney, fmtAmount, esc, toast } from '../ui.js';
+import { fmtMoney, fmtAmount, esc, toast, setHTML } from '../ui.js';
 
 const SLICE_COLORS = ['#6E0F1F', '#D8B56D', '#9B1B30', '#6FB67E', '#D45A4F', '#7A6E66'];
 
@@ -24,6 +24,7 @@ const state = {
   year: new Date().getFullYear(),
   month: new Date().getMonth() + 1,
   data: {},  // cached per-tab
+  drill: null,  // {type, category} when drilled into one category's subcategories
 };
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -164,18 +165,24 @@ function renderOverview() {
     .sort((a, b) => b.value - a.value).slice(0, 6);
   const legend = slices.map((s, i) => {
     const pct = ((s.value / (totalExpense || 1)) * 100).toFixed(0);
+    const hasSub = Store.subcategoriesFor('expense', s.name).length > 0;
+    const drillAttr = hasSub ? ` data-drill="expense" data-drill-cat="${esc(s.name)}"` : '';
     return `
-      <div class="legend-item">
+      <div class="legend-item ${hasSub ? 'drillable' : ''}"${drillAttr}>
         <span class="swatch" style="background:${SLICE_COLORS[i % SLICE_COLORS.length]}"></span>
-        <span>${esc(s.name)}</span>
+        <span>${esc(s.name)}${hasSub ? ' <span class="drill-arrow">›</span>' : ''}</span>
         <strong>${esc(fmtAmount(s.value, 'UAH'))} <span class="legend-pct">(${pct}%)</span></strong>
       </div>`;
   }).join('');
-  const incomeBars = Object.entries(incomeByCat).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `
-    <div>
-      <div class="bar-meta"><span>${esc(k)}</span><strong>${esc(fmtMoney(v, 'UAH'))}</strong></div>
+  const incomeBars = Object.entries(incomeByCat).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => {
+    const hasSub = Store.subcategoriesFor('income', k).length > 0;
+    const drillAttr = hasSub ? ` data-drill="income" data-drill-cat="${esc(k)}"` : '';
+    return `
+    <div class="${hasSub ? 'drillable-bar' : ''}"${drillAttr}>
+      <div class="bar-meta"><span>${esc(k)}${hasSub ? ' <span class="drill-arrow">›</span>' : ''}</span><strong>${esc(fmtAmount(v, 'UAH'))}</strong></div>
       <div class="bar-track"><div class="bar-fill" style="width:${Math.min(100, (v / (totalIncome || 1)) * 100).toFixed(0)}%"></div></div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
   return `
     <div class="balance-card" style="min-height:auto;">
       <div class="balance-label">${esc(monthLabel())}</div>
@@ -440,6 +447,54 @@ function renderAI(container) {
   });
 }
 
+// Drill into one category → donut by subcategory
+async function renderCategoryDrill(container, drill) {
+  setHTML(container, loadingSkeleton());
+  try {
+    const d = await Api.categoryBreakdown(drill.type, drill.category, 'month', state.year, state.month);
+    const slices = (d.breakdown || []).map((b) => ({ name: b.name, value: b.value }));
+    const legend = slices.map((s, i) => {
+      const pct = ((s.value / (d.total || 1)) * 100).toFixed(0);
+      return `
+        <div class="legend-item">
+          <span class="swatch" style="background:${SLICE_COLORS[i % SLICE_COLORS.length]}"></span>
+          <span>${esc(s.name)}</span>
+          <strong>${esc(fmtAmount(s.value, 'UAH'))} <span class="legend-pct">(${pct}%)</span></strong>
+        </div>`;
+    }).join('');
+
+    setHTML(container, `
+      <button class="btn btn-secondary drill-back" id="drillBack" style="margin-bottom: var(--sp-3);">‹ Назад до категорій</button>
+      <div class="balance-card" style="min-height:auto;">
+        <div class="balance-label">${esc(drill.category)} · ${esc(monthLabel())}</div>
+        <div class="balance-value" style="font-size: var(--fs-32);">${esc(fmtAmount(d.total, 'UAH'))}</div>
+        <div class="balance-sub">${drill.type === 'expense' ? 'витрати' : 'доходи'} по підрозділах</div>
+      </div>
+      <div class="section-head"><div class="section-title">Розбивка по підрозділах</div></div>
+      <div class="panel" style="padding: var(--sp-4);">
+        ${slices.length ? `
+          <div class="report-row">
+            <div class="donut" style="background:${donutGradient(slices)}"></div>
+            <div class="legend">${legend}</div>
+          </div>` : emptyState('Немає операцій у цій категорії за період')}
+      </div>`);
+
+    container.querySelector('#drillBack')?.addEventListener('click', () => {
+      state.drill = null;
+      Telegram.haptic('selection');
+      renderReports();
+    });
+  } catch (e) {
+    setHTML(container, `
+      <button class="btn btn-secondary drill-back" id="drillBack" style="margin-bottom: var(--sp-3);">‹ Назад</button>
+      ${emptyState('Помилка: ' + (e.message || 'не вдалось завантажити'))}`);
+    container.querySelector('#drillBack')?.addEventListener('click', () => {
+      state.drill = null;
+      renderReports();
+    });
+  }
+}
+
 // ── Main entry ─────────────────────────────────────────────────
 export function renderReports() {
   const root = document.getElementById('screen-reports');
@@ -464,12 +519,14 @@ export function renderReports() {
   root.querySelector('#prevMonth').addEventListener('click', () => {
     state.month -= 1;
     if (state.month < 1) { state.month = 12; state.year -= 1; }
+    state.drill = null;
     Telegram.haptic('selection');
     renderReports();
   });
   root.querySelector('#nextMonth').addEventListener('click', () => {
     state.month += 1;
     if (state.month > 12) { state.month = 1; state.year += 1; }
+    state.drill = null;
     Telegram.haptic('selection');
     renderReports();
   });
@@ -478,6 +535,7 @@ export function renderReports() {
   root.querySelectorAll('[data-tab]').forEach((b) => {
     b.addEventListener('click', () => {
       state.tab = b.dataset.tab;
+      state.drill = null;
       Telegram.haptic('selection');
       renderReports();
     });
@@ -486,11 +544,29 @@ export function renderReports() {
   // Render the active tab
   const content = root.querySelector('#tab-content');
   switch (state.tab) {
-    case 'overview':   content.innerHTML = renderOverview(); break;
+    case 'overview':
+      if (state.drill) {
+        renderCategoryDrill(content, state.drill);
+      } else {
+        setHTML(content, renderOverview());
+        wireDrill(content);
+      }
+      break;
     case 'employees':  renderEmployees(content); break;
     case 'tax':        renderTax(content); break;
     case 'accounting': renderAccounting(content); break;
     case 'time':       renderTime(content); break;
     case 'ai':         renderAI(content); break;
   }
+}
+
+// Wire tap-to-drill on overview legend items / income bars that have subcategories
+function wireDrill(content) {
+  content.querySelectorAll('[data-drill-cat]').forEach((el) => {
+    el.addEventListener('click', () => {
+      state.drill = { type: el.dataset.drill, category: el.dataset.drillCat };
+      Telegram.haptic('selection');
+      renderReports();
+    });
+  });
 }

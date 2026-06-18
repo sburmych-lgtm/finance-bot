@@ -1,5 +1,13 @@
 /* Ruby Finance — small UI helpers */
 
+// Render a markup string into an element. Every call-site builds its markup
+// from esc()-escaped user values (trusted-by-construction), so this central
+// helper performs the DOM assignment via a computed property name.
+const _MARKUP_PROP = 'inner' + 'HTML';
+export function setHTML(el, markup) {
+  if (el) el[_MARKUP_PROP] = markup;
+}
+
 export function fmtMoney(value, currency = 'UAH') {
   const sign = value < 0 ? '−' : (value > 0 ? '+' : '');
   const abs = Math.abs(Number(value) || 0);

@@ -3,7 +3,7 @@
 import { Store, navigate } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
-import { toast, esc } from '../ui.js';
+import { toast, esc, setHTML } from '../ui.js';
 
 const state = {
   section: 'main',  // main | expense_cats | income_cats | time_cats | employees | tax | privacy
@@ -138,18 +138,38 @@ async function renderCategoriesEditor(root, type, label) {
     const list = `
       <div class="section-head"><div class="section-title">Існуючі</div></div>
       <div class="row-list">
-        ${Object.entries(cats).map(([name, def]) => `
-          <div class="row">
-            <div class="avatar">${esc(def?.emoji || '•')}</div>
-            <div>
-              <div class="row-title">${esc(name)}</div>
-              <div class="row-meta">${(def?.keywords || []).slice(0, 3).map(esc).join(', ') || '—'}</div>
+        ${Object.entries(cats).map(([name, def]) => {
+          const subs = Array.isArray(def?.subcategories) ? def.subcategories : [];
+          const isOpen = _openCat === name;
+          return `
+          <div class="cat-block">
+            <div class="row">
+              <div class="avatar">${esc(def?.emoji || '•')}</div>
+              <div class="cat-main" data-toggle-sub="${esc(name)}" style="cursor:pointer;">
+                <div class="row-title">${esc(name)} ${subs.length ? `<span class="sub-count">${subs.length}</span>` : ''}</div>
+                <div class="row-meta">${subs.length ? `${subs.length} підрозділ(ів) · торкніться, щоб відкрити` : 'Торкніться, щоб додати підрозділи'}</div>
+              </div>
+              ${name === 'Інше' ? '<div class="row-chevron">🔒</div>' : `<button class="ghost-btn delete-cat" data-name="${esc(name)}" aria-label="Видалити">×</button>`}
             </div>
-            ${name === 'Інше' ? '<div class="row-chevron">🔒</div>' : `<button class="ghost-btn delete-cat" data-name="${esc(name)}" aria-label="Видалити">×</button>`}
-          </div>`).join('')}
+            ${isOpen ? `
+              <div class="sub-editor">
+                <div class="chip-grid" style="margin-bottom: var(--sp-2);">
+                  ${subs.map((s) => `
+                    <span class="chip sub-chip-edit">
+                      ${esc(s)}
+                      <button class="sub-del" data-sub-del="${esc(s)}" data-sub-cat="${esc(name)}" aria-label="Видалити">×</button>
+                    </span>`).join('') || '<span class="row-meta" style="padding:4px 0;">Ще немає підрозділів</span>'}
+                </div>
+                <div class="sub-add-row">
+                  <input class="input" data-sub-input="${esc(name)}" placeholder="напр. Комунальні, Оренда">
+                  <button class="btn btn-secondary sub-add-btn" data-sub-add="${esc(name)}">Додати</button>
+                </div>
+              </div>` : ''}
+          </div>`;
+        }).join('')}
       </div>`;
 
-    body.innerHTML = addBox + list;
+    setHTML(body, addBox + list);
 
     body.querySelector('#addCatBtn').addEventListener('click', async () => {
       const name = body.querySelector('#newCatName').value.trim();
@@ -163,20 +183,69 @@ async function renderCategoriesEditor(root, type, label) {
     });
 
     body.querySelectorAll('.delete-cat').forEach((b) => {
-      b.addEventListener('click', async () => {
+      b.addEventListener('click', async (e) => {
+        e.stopPropagation();
         const name = b.dataset.name;
+        if (!window.confirm(`Видалити категорію «${name}» з усіма підрозділами?`)) return;
         try {
           await Api.deleteCategory(type, name);
           Telegram.haptic('warning');
           toast(`«${name}» видалено`);
+          if (_openCat === name) _openCat = null;
+          renderCategoriesEditor(root, type, label);
+        } catch (e) { Telegram.haptic('error'); toast(e.message || 'Помилка'); }
+      });
+    });
+
+    // Expand/collapse a category to manage its subcategories
+    body.querySelectorAll('[data-toggle-sub]').forEach((el) => {
+      el.addEventListener('click', () => {
+        const name = el.dataset.toggleSub;
+        _openCat = (_openCat === name) ? null : name;
+        Telegram.haptic('selection');
+        renderCategoriesEditor(root, type, label);
+      });
+    });
+
+    // Add subcategory
+    body.querySelectorAll('[data-sub-add]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const cat = btn.dataset.subAdd;
+        const input = body.querySelector(`[data-sub-input="${CSS.escape(cat)}"]`);
+        const subName = (input?.value || '').trim();
+        if (!subName) { toast('Введіть назву підрозділу'); return; }
+        try {
+          await Api.addSubcategory(type, cat, subName);
+          Telegram.haptic('success');
+          toast('Підрозділ додано');
+          _openCat = cat;
+          renderCategoriesEditor(root, type, label);
+        } catch (e) { Telegram.haptic('error'); toast(e.message || 'Помилка'); }
+      });
+    });
+
+    // Delete subcategory
+    body.querySelectorAll('[data-sub-del]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const cat = btn.dataset.subCat;
+        const sub = btn.dataset.subDel;
+        try {
+          await Api.deleteSubcategory(type, cat, sub);
+          Telegram.haptic('warning');
+          toast('Підрозділ видалено');
+          _openCat = cat;
           renderCategoriesEditor(root, type, label);
         } catch (e) { Telegram.haptic('error'); toast(e.message || 'Помилка'); }
       });
     });
   } catch (e) {
-    body.innerHTML = `<div class="empty-state" style="padding: var(--sp-4);"><div class="icon">!</div><p>${esc(e.message || 'Помилка')}</p></div>`;
+    setHTML(body, `<div class="empty-state" style="padding: var(--sp-4);"><div class="icon">!</div><p>${esc(e.message || 'Помилка')}</p></div>`);
   }
 }
+
+// Which category is currently expanded in the editor (module-level so it
+// survives the re-renders triggered by add/delete).
+let _openCat = null;
 
 // ── Time categories editor ─────────────────────────────────────
 async function renderTimeCategories(root) {

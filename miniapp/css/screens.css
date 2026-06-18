@@ -195,6 +195,89 @@
   border-color: var(--ruby-line);
 }
 
+/* Drill-down affordance on Reports legend / bars */
+.legend-item.drillable,
+.drillable-bar {
+  cursor: pointer;
+  border-radius: var(--r-sm);
+  transition: background var(--t-fast) var(--ease-out);
+}
+.legend-item.drillable { padding: 4px 6px; margin: 0 -6px; }
+.legend-item.drillable:active,
+.drillable-bar:active { background: rgba(216,181,109,.10); }
+.drill-arrow {
+  color: var(--ruby-gold);
+  font-weight: 800;
+  margin-left: 2px;
+}
+.drill-back { width: auto; padding: 0 16px; min-height: 40px; }
+
+/* Subcategory chips (Add screen) */
+.sub-chip {
+  background: rgba(255,255,255,.03);
+  border-style: dashed;
+}
+.sub-chip.active {
+  border-style: solid;
+}
+.sub-optional {
+  font-weight: 600;
+  color: var(--ruby-muted);
+  font-size: 11px;
+}
+
+/* Category block with nested subcategory editor (Settings) */
+.cat-block {
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+.cat-main { flex: 1; min-width: 0; }
+.sub-count {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 5px;
+  margin-left: 4px;
+  border-radius: 9px;
+  background: rgba(216,181,109,.18);
+  color: var(--ruby-gold);
+  font-size: 11px;
+  font-weight: 800;
+  text-align: center;
+}
+.sub-editor {
+  padding: var(--sp-3);
+  margin: 0 0 var(--sp-2);
+  border: 1px dashed var(--ruby-line);
+  border-top: 0;
+  border-radius: 0 0 var(--r-lg) var(--r-lg);
+  background: rgba(255,255,255,.02);
+}
+.sub-chip-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ruby-ivory);
+}
+.sub-del {
+  border: 0;
+  background: rgba(212,90,79,.18);
+  color: var(--ruby-danger);
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+.sub-add-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--sp-2);
+}
+.sub-add-row .input { min-height: 44px; }
+.sub-add-btn { min-height: 44px; white-space: nowrap; padding: 0 16px; }
+
 /* History filter bar */
 .history-filter {
   display: flex;
