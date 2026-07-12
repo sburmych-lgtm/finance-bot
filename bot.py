@@ -413,6 +413,30 @@ MONTH_NAMES = ['', 'Січень', 'Лютий', 'Березень', 'Квіте
                'Липень', 'Серпень', 'Вересень', 'Жовтень', 'Листопад', 'Грудень']
 
 
+PAYMENT_SOURCES = ('cash', 'card', 'transfer', 'other')
+PAYMENT_SOURCE_UNCLASSIFIED = 'unclassified'
+
+# Category labels are currently the relationship key. Keep all dependent-table
+# writes in these registries so a future recurring-operations table can join
+# the same atomic rename/delete transaction with one explicit hook.
+CATEGORY_RENAME_DEPENDENCY_HOOKS = (
+    ('transactions', '''
+        UPDATE transactions SET category = ?
+        WHERE user_id = ? AND type = ? AND category = ?
+    '''),
+    ('budgets', '''
+        UPDATE budgets SET category = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ? AND type = ? AND category = ?
+    '''),
+)
+CATEGORY_DELETE_DEPENDENCY_HOOKS = (
+    ('budgets', '''
+        DELETE FROM budgets
+        WHERE user_id = ? AND type = ? AND category = ?
+    '''),
+)
+
+
 # ========== DATABASE CLASS ==========
 class Database:
     """Thread-safe SQLite database wrapper"""
@@ -458,6 +482,7 @@ class Database:
                 date DATE NOT NULL,
                 timestamp DATETIME NOT NULL,
                 client_request_id TEXT,
+                payment_source TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -524,6 +549,23 @@ class Database:
                 settings_json TEXT NOT NULL,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS budgets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                category TEXT NOT NULL,
+                monthly_limit_uah REAL NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, type, category)
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_budgets_user
+            ON budgets(user_id)
         ''')
 
         # Broadcast audit trail: one row per broadcast batch, plus one receipt
@@ -677,6 +719,24 @@ class Database:
             except Exception as e:
                 logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
 
+        # Legacy transactions intentionally remain NULL: source must be
+        # supplied or corrected by the user, never guessed from category/text.
+        mig = '20260712_add_payment_source'
+        if not applied(mig):
+            try:
+                cursor.execute("PRAGMA table_info(transactions)")
+                cols = {row[1] for row in cursor.fetchall()}
+                if 'payment_source' not in cols:
+                    cursor.execute(
+                        "ALTER TABLE transactions ADD COLUMN payment_source TEXT"
+                    )
+                    logger.info(
+                        f"Migration {mig}: added nullable transactions.payment_source"
+                    )
+                mark(mig)
+            except Exception as e:
+                logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
+
         self.conn.commit()
 
     async def get_user_settings(self, user_id):
@@ -728,6 +788,7 @@ class Database:
             'broadcast_receipts',
             'transactions',
             'time_tracks',
+            'budgets',
             'subscriptions',
             'user_settings',
             'users',
@@ -890,7 +951,7 @@ class Database:
 
     async def add_transaction(self, user_id, amount, currency, amount_uah, t_type,
                              category, description, date, timestamp, subcategory=None,
-                             client_request_id=None):
+                             client_request_id=None, payment_source=None):
         """Add transaction to database"""
         async with db_lock:
             cursor = self.conn.cursor()
@@ -898,11 +959,13 @@ class Database:
                 cursor.execute('''
                     INSERT INTO transactions
                     (user_id, amount, currency, amount_uah, type, category,
-                     subcategory, description, date, timestamp, client_request_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     subcategory, description, date, timestamp, client_request_id,
+                     payment_source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     user_id, amount, currency, amount_uah, t_type, category,
                     subcategory, description, date, timestamp, client_request_id,
+                    payment_source,
                 ))
                 self.conn.commit()
                 return cursor.lastrowid
@@ -936,6 +999,7 @@ class Database:
                     category,
                     NULLIF(subcategory, '') AS subcategory,
                     COALESCE(description, '') AS description,
+                    payment_source,
                     COUNT(*) AS usage_count,
                     MAX(timestamp) AS last_used_at
                 FROM transactions
@@ -946,7 +1010,8 @@ class Database:
                     type,
                     category,
                     NULLIF(subcategory, ''),
-                    COALESCE(description, '')
+                    COALESCE(description, ''),
+                    payment_source
                 ORDER BY usage_count DESC, last_used_at DESC
                 LIMIT ?
             ''', (str(user_id), int(limit)))
@@ -1074,6 +1139,140 @@ class Database:
     async def get_all_time_tracks(self, user_id):
         """Get all time tracks for user"""
         return await self.get_time_tracks(user_id)
+
+    async def update_transaction_payment_source(
+        self, transaction_id, user_id, payment_source
+    ):
+        """Correct a source without allowing cross-tenant row discovery."""
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                UPDATE transactions
+                SET payment_source = ?
+                WHERE id = ? AND user_id = ?
+            ''', (payment_source, int(transaction_id), str(user_id)))
+            if cursor.rowcount == 0:
+                self.conn.commit()
+                return None
+            cursor.execute(
+                "SELECT * FROM transactions WHERE id = ? AND user_id = ?",
+                (int(transaction_id), str(user_id)),
+            )
+            row = cursor.fetchone()
+            self.conn.commit()
+            return dict(row) if row else None
+
+    async def upsert_budget(
+        self, user_id, budget_type, category, monthly_limit_uah
+    ):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT INTO budgets
+                    (user_id, type, category, monthly_limit_uah)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, type, category) DO UPDATE SET
+                    monthly_limit_uah = excluded.monthly_limit_uah,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (
+                str(user_id), budget_type, category, monthly_limit_uah,
+            ))
+            cursor.execute('''
+                SELECT type, category, monthly_limit_uah
+                FROM budgets
+                WHERE user_id = ? AND type = ? AND category = ?
+            ''', (str(user_id), budget_type, category))
+            row = cursor.fetchone()
+            self.conn.commit()
+            return dict(row)
+
+    async def get_budget_progress(self, user_id, from_date, to_date):
+        """Return budgets with tenant-scoped spend over [from_date, to_date)."""
+        async with db_lock:
+            rows = self.conn.execute('''
+                SELECT
+                    b.type,
+                    b.category,
+                    b.monthly_limit_uah,
+                    COALESCE(SUM(t.amount_uah), 0) AS spent_uah
+                FROM budgets AS b
+                LEFT JOIN transactions AS t
+                    ON t.user_id = b.user_id
+                   AND t.type = b.type
+                   AND t.category = b.category
+                   AND t.date >= ?
+                   AND t.date < ?
+                WHERE b.user_id = ?
+                GROUP BY b.id, b.type, b.category, b.monthly_limit_uah
+                ORDER BY b.type, b.category
+            ''', (from_date, to_date, str(user_id))).fetchall()
+            return [dict(row) for row in rows]
+
+    async def delete_budget(self, user_id, budget_type, category):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                DELETE FROM budgets
+                WHERE user_id = ? AND type = ? AND category = ?
+            ''', (str(user_id), budget_type, category))
+            self.conn.commit()
+            return cursor.rowcount > 0
+
+    async def save_category_rename(
+        self, user_id, category_type, old_name, new_name, settings
+    ):
+        """Atomically relabel every registered dependency and settings."""
+        owner = str(user_id)
+        async with db_lock:
+            cursor = self.conn.cursor()
+            changed = {}
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                for dependency, statement in CATEGORY_RENAME_DEPENDENCY_HOOKS:
+                    cursor.execute(
+                        statement, (new_name, owner, category_type, old_name)
+                    )
+                    changed[dependency] = cursor.rowcount
+                cursor.execute('''
+                    INSERT INTO user_settings
+                        (user_id, settings_json, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        settings_json = excluded.settings_json,
+                        updated_at = CURRENT_TIMESTAMP
+                ''', (owner, json.dumps(settings, ensure_ascii=False)))
+                self.conn.commit()
+                return changed
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    async def save_category_delete(
+        self, user_id, category_type, category, settings
+    ):
+        """Atomically remove config dependencies but retain financial rows."""
+        owner = str(user_id)
+        async with db_lock:
+            cursor = self.conn.cursor()
+            changed = {}
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                for dependency, statement in CATEGORY_DELETE_DEPENDENCY_HOOKS:
+                    cursor.execute(statement, (owner, category_type, category))
+                    changed[dependency] = cursor.rowcount
+                cursor.execute('''
+                    INSERT INTO user_settings
+                        (user_id, settings_json, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        settings_json = excluded.settings_json,
+                        updated_at = CURRENT_TIMESTAMP
+                ''', (owner, json.dumps(settings, ensure_ascii=False)))
+                self.conn.commit()
+                return changed
+            except Exception:
+                self.conn.rollback()
+                raise
 
     async def delete_transaction(self, transaction_id, user_id=None):
         """Delete a transaction. If user_id is given, scope the delete
@@ -3892,7 +4091,9 @@ async def cors_middleware(request: web.Request, handler):
         allow = 'null'  # blocks the browser from reading the body
     resp.headers['Access-Control-Allow-Origin'] = allow
     resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Telegram-Init-Data'
-    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PATCH, DELETE, OPTIONS'
+    resp.headers['Access-Control-Allow-Methods'] = (
+        'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+    )
     resp.headers['Vary'] = 'Origin'
     return resp
 
@@ -4192,6 +4393,9 @@ async def api_get_transactions(request: web.Request):
             'type': r['type'],
             'category': r['category'],
             'subcategory': (r['subcategory'] if 'subcategory' in r.keys() else None),
+            'payment_source': (
+                r['payment_source'] if 'payment_source' in r.keys() else None
+            ),
             'description': r['description'],
             'date': r['date'],
             'timestamp': r['timestamp'],
@@ -4209,6 +4413,7 @@ def _quick_operation_payload(row: dict):
         'type': row['type'],
         'category': row['category'],
         'subcategory': row.get('subcategory') or None,
+        'payment_source': row.get('payment_source'),
         'comment': row.get('description') or '',
     }
 
@@ -4295,6 +4500,23 @@ def _parse_client_request_id(body: dict):
     return value, None
 
 
+def _parse_payment_source(body: dict, *, required=False):
+    if 'payment_source' not in body:
+        if required:
+            return None, _json_response(
+                {'detail': 'payment_source is required'}, status=400
+            )
+        return None, None
+    value = body['payment_source']
+    if value is None:
+        return None, None
+    if not isinstance(value, str) or value not in PAYMENT_SOURCES:
+        return None, _json_response({
+            'detail': 'payment_source must be cash, card, transfer, other, or null'
+        }, status=400)
+    return value, None
+
+
 def _transaction_write_response(row: dict, *, duplicate: bool):
     """Stable POST response for both a new write and an idempotent replay."""
     client_request_id = row.get('client_request_id')
@@ -4306,6 +4528,7 @@ def _transaction_write_response(row: dict, *, duplicate: bool):
         'type': row['type'],
         'category': row['category'],
         'subcategory': row.get('subcategory'),
+        'payment_source': row.get('payment_source'),
         'description': row.get('description'),
         'date': row['date'],
         'timestamp': row['timestamp'],
@@ -4323,6 +4546,7 @@ def _idempotency_payload_matches(
     t_type: str,
     category: str,
     subcategory: str | None,
+    payment_source: str | None,
     description: str,
 ) -> bool:
     return (
@@ -4331,6 +4555,7 @@ def _idempotency_payload_matches(
         and row['type'] == t_type
         and row['category'] == category
         and (row.get('subcategory') or None) == subcategory
+        and row.get('payment_source') == payment_source
         and (row.get('description') or '') == description
     )
 
@@ -4354,6 +4579,9 @@ async def api_post_transaction(request: web.Request):
         return _json_response({'detail': 'JSON body must be an object'}, status=400)
 
     client_request_id, err = _parse_client_request_id(body)
+    if err is not None:
+        return err
+    payment_source, err = _parse_payment_source(body)
     if err is not None:
         return err
     t_type = body.get('type')
@@ -4399,6 +4627,7 @@ async def api_post_transaction(request: web.Request):
                 t_type=t_type,
                 category=category,
                 subcategory=subcategory,
+                payment_source=payment_source,
                 description=description,
             ):
                 return _idempotency_conflict_response()
@@ -4441,6 +4670,7 @@ async def api_post_transaction(request: web.Request):
             t_type, category, description, date_str, ts_str,
             subcategory=subcategory,
             client_request_id=client_request_id,
+            payment_source=payment_source,
         )
     except sqlite3.IntegrityError:
         # Two concurrent retries can both miss the preflight lookup. The
@@ -4459,6 +4689,7 @@ async def api_post_transaction(request: web.Request):
             t_type=t_type,
             category=category,
             subcategory=subcategory,
+            payment_source=payment_source,
             description=description,
         ):
             return _idempotency_conflict_response()
@@ -4482,6 +4713,7 @@ async def api_post_transaction(request: web.Request):
         'type': t_type,
         'category': category,
         'subcategory': subcategory,
+        'payment_source': payment_source,
         'description': description,
         'date': date_str,
         'timestamp': ts_str,
@@ -4490,6 +4722,42 @@ async def api_post_transaction(request: web.Request):
     return _json_response(
         _transaction_write_response(created, duplicate=False), status=201
     )
+
+
+async def api_patch_transaction(request: web.Request):
+    """Correct only the authenticated owner's payment source classification."""
+    try:
+        transaction_id = int(request.match_info['id'])
+    except (KeyError, TypeError, ValueError):
+        return _json_response({'detail': 'Invalid id'}, status=400)
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+    if not isinstance(body, dict):
+        return _json_response({'detail': 'JSON body must be an object'}, status=400)
+
+    payment_source, err = _parse_payment_source(body, required=True)
+    if err is not None:
+        return err
+    row = await db.update_transaction_payment_source(
+        transaction_id, request['user_id'], payment_source
+    )
+    if row is None:
+        return _json_response({'detail': 'Not found'}, status=404)
+    return _json_response({
+        'id': row['id'],
+        'amount': row['amount'],
+        'currency': row['currency'],
+        'amount_uah': row['amount_uah'],
+        'type': row['type'],
+        'category': row['category'],
+        'subcategory': row.get('subcategory'),
+        'payment_source': row.get('payment_source'),
+        'description': row.get('description'),
+        'date': row['date'],
+        'timestamp': row['timestamp'],
+    })
 
 
 async def api_delete_transaction(request: web.Request):
@@ -4506,6 +4774,35 @@ async def api_delete_transaction(request: web.Request):
         return _json_response({'detail': 'Not found'}, status=404)
     logger.info(f"API DELETE /api/transactions/{tx_id} user={user_id}")
     return web.Response(status=204)
+
+
+def _round_money(value) -> float:
+    return float(
+        Decimal(str(value)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    )
+
+
+def _payment_source_summary(rows):
+    keys = (*PAYMENT_SOURCES, PAYMENT_SOURCE_UNCLASSIFIED)
+    income = {key: Decimal('0') for key in keys}
+    expense = {key: Decimal('0') for key in keys}
+    for row in rows:
+        raw_source = row.get('payment_source')
+        source = (
+            raw_source
+            if raw_source in PAYMENT_SOURCES
+            else PAYMENT_SOURCE_UNCLASSIFIED
+        )
+        target = income if row['type'] == 'income' else expense
+        target[source] += Decimal(str(row['amount_uah']))
+    return {
+        'income_by_payment_source': {
+            key: _round_money(value) for key, value in income.items()
+        },
+        'expense_by_payment_source': {
+            key: _round_money(value) for key, value in expense.items()
+        },
+    }
 
 
 async def api_monthly_report(request: web.Request):
@@ -4529,11 +4826,36 @@ async def api_monthly_report(request: web.Request):
             expense_by_cat[cat] = round(expense_by_cat.get(cat, 0.0) + amt, 2)
             total_expense += amt
 
+    source_summary = _payment_source_summary(rows)
     return _json_response({
         'income_by_category': income_by_cat,
         'expense_by_category': expense_by_cat,
+        **source_summary,
         'total_income': round(total_income, 2),
         'total_expense': round(total_expense, 2),
+        'transaction_count': len(rows),
+    })
+
+
+async def api_report_payment_sources(request: web.Request):
+    user_id = request['user_id']
+    year, month, err = _parse_year_month(request)
+    if err is not None:
+        return err
+    rows = await db.get_transactions(user_id, year=year, month=month)
+    summary = _payment_source_summary(rows)
+    return _json_response({
+        'year': year,
+        'month': month,
+        **summary,
+        'total_income': _round_money(sum(
+            Decimal(str(row['amount_uah']))
+            for row in rows if row['type'] == 'income'
+        )),
+        'total_expense': _round_money(sum(
+            Decimal(str(row['amount_uah']))
+            for row in rows if row['type'] == 'expense'
+        )),
         'transaction_count': len(rows),
     })
 
@@ -4622,6 +4944,140 @@ def _clean_text(value, max_len: int, default: str = '') -> str:
     if not s:
         return default
     return s[:max_len]
+
+
+# ---- budgets (per-user, monthly UAH limits) ----
+
+def _parse_budget_identity(body):
+    if not isinstance(body, dict):
+        return None, None, _json_response(
+            {'detail': 'JSON body must be an object'}, status=400
+        )
+    budget_type = body.get('type')
+    if budget_type not in ('income', 'expense'):
+        return None, None, _json_response(
+            {'detail': 'type must be income or expense'}, status=400
+        )
+    raw_category = body.get('category')
+    if not isinstance(raw_category, str):
+        return None, None, _json_response(
+            {'detail': 'category must be a string'}, status=400
+        )
+    category = raw_category.strip()
+    if not category or len(category) > 80:
+        return None, None, _json_response(
+            {'detail': 'category must be 1-80 characters'}, status=400
+        )
+    return budget_type, category, None
+
+
+def _parse_budget_limit(body):
+    raw = body.get('monthly_limit_uah') if isinstance(body, dict) else None
+    if raw is None or isinstance(raw, bool):
+        return None, _json_response(
+            {'detail': 'monthly_limit_uah must be a positive number'}, status=400
+        )
+    try:
+        value = Decimal(str(raw))
+        if not value.is_finite() or value <= 0 or value > Decimal('1000000000000'):
+            raise ValueError
+        value = value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        if value < Decimal('0.01'):
+            raise ValueError
+    except (InvalidOperation, TypeError, ValueError):
+        return None, _json_response({
+            'detail': (
+                'monthly_limit_uah must be between 0.01 and 1000000000000'
+            )
+        }, status=400)
+    return value, None
+
+
+async def api_budgets_put(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+    budget_type, category, err = _parse_budget_identity(body)
+    if err is not None:
+        return err
+    monthly_limit, err = _parse_budget_limit(body)
+    if err is not None:
+        return err
+
+    settings = await user_settings_for(request['user_id'])
+    category_entry = (
+        settings.get('categories', {}).get(budget_type, {}).get(category)
+    )
+    if not isinstance(category_entry, dict):
+        return _json_response({'detail': 'unknown category'}, status=400)
+
+    row = await db.upsert_budget(
+        request['user_id'], budget_type, category, float(monthly_limit)
+    )
+    return _json_response({
+        'type': row['type'],
+        'category': row['category'],
+        'monthly_limit_uah': _round_money(row['monthly_limit_uah']),
+    })
+
+
+def _month_date_bounds(year, month):
+    start = f'{year:04d}-{month:02d}-01'
+    if month == 12:
+        end = f'{year + 1:04d}-01-01'
+    else:
+        end = f'{year:04d}-{month + 1:02d}-01'
+    return start, end
+
+
+async def api_budgets_get(request: web.Request):
+    year, month, err = _parse_year_month(request)
+    if err is not None:
+        return err
+    start, end = _month_date_bounds(year, month)
+    rows = await db.get_budget_progress(request['user_id'], start, end)
+    budgets = []
+    for row in rows:
+        limit_value = Decimal(str(row['monthly_limit_uah']))
+        spent = Decimal(str(row['spent_uah']))
+        remaining = limit_value - spent
+        progress = (spent * Decimal('100') / limit_value).quantize(
+            Decimal('0.01'), rounding=ROUND_HALF_UP
+        )
+        budgets.append({
+            'type': row['type'],
+            'category': row['category'],
+            'monthly_limit_uah': _round_money(limit_value),
+            'spent_uah': _round_money(spent),
+            'remaining_uah': _round_money(remaining),
+            'progress_percent': float(progress),
+            'is_exceeded': spent > limit_value,
+        })
+    return _json_response({
+        'year': year,
+        'month': month,
+        'currency': 'UAH',
+        'budgets': budgets,
+    })
+
+
+async def api_budgets_delete(request: web.Request):
+    budget_type = request.match_info.get('type')
+    category = unquote(request.match_info.get('category', ''))
+    if budget_type not in ('income', 'expense'):
+        return _json_response(
+            {'detail': 'type must be income or expense'}, status=400
+        )
+    settings = await user_settings_for(request['user_id'])
+    if category not in settings.get('categories', {}).get(budget_type, {}):
+        return _json_response({'detail': 'Not found'}, status=404)
+    deleted = await db.delete_budget(
+        request['user_id'], budget_type, category
+    )
+    if not deleted:
+        return _json_response({'detail': 'Not found'}, status=404)
+    return web.Response(status=204)
 
 
 # ---- reports parity ----
@@ -4879,7 +5335,7 @@ async def api_categories_update(request: web.Request):
     if cat_type not in ('income', 'expense'):
         return _json_response({'detail': 'type must be income or expense'}, status=400)
 
-    settings = await user_settings_for(user_id)
+    settings = _copy.deepcopy(await user_settings_for(user_id))
     bucket = settings.get('categories', {}).get(cat_type, {})
     if name not in bucket:
         return _json_response({'detail': 'category not found'}, status=404)
@@ -4927,7 +5383,16 @@ async def api_categories_update(request: web.Request):
     if len(new_bucket) != len(bucket):
         return _json_response({'detail': 'rename collision'}, status=409)
     settings['categories'][cat_type] = new_bucket
-    await save_user_settings(user_id, settings)
+    normalize_tax_config(settings)
+    rebuild_user_categories(settings)
+    try:
+        await db.save_category_rename(
+            user_id, cat_type, name, new_name, settings
+        )
+    except sqlite3.IntegrityError:
+        return _json_response(
+            {'detail': 'category dependency conflict'}, status=409
+        )
     return _json_response({'type': cat_type, 'name': new_name, **new_entry})
 
 
@@ -4940,13 +5405,20 @@ async def api_categories_delete(request: web.Request):
     if name == 'Інше':
         return _json_response({'detail': 'cannot delete "Інше"'}, status=400)
 
-    settings = await user_settings_for(user_id)
+    settings = _copy.deepcopy(await user_settings_for(user_id))
     bucket = settings.get('categories', {}).get(cat_type, {})
     if name not in bucket:
         return _json_response({'detail': 'category not found'}, status=404)
 
     del bucket[name]
-    await save_user_settings(user_id, settings)
+    normalize_tax_config(settings)
+    rebuild_user_categories(settings)
+    try:
+        await db.save_category_delete(user_id, cat_type, name, settings)
+    except sqlite3.IntegrityError:
+        return _json_response(
+            {'detail': 'category dependency conflict'}, status=409
+        )
     return web.Response(status=204)
 
 
@@ -5623,8 +6095,17 @@ def build_api_app() -> web.Application:
     app.router.add_route('GET', '/api/transactions', api_get_transactions)
     app.router.add_route('GET', '/api/quick-templates', api_quick_templates)
     app.router.add_route('POST', '/api/transactions', api_post_transaction)
+    app.router.add_route('PATCH', '/api/transactions/{id}', api_patch_transaction)
     app.router.add_route('DELETE', '/api/transactions/{id}', api_delete_transaction)
     app.router.add_route('GET', '/api/reports/monthly', api_monthly_report)
+    app.router.add_route(
+        'GET', '/api/reports/payment-sources', api_report_payment_sources
+    )
+    app.router.add_route('GET', '/api/budgets', api_budgets_get)
+    app.router.add_route('PUT', '/api/budgets', api_budgets_put)
+    app.router.add_route(
+        'DELETE', '/api/budgets/{type}/{category}', api_budgets_delete
+    )
     app.router.add_route('GET', '/api/categories', api_categories)
     app.router.add_route('GET', '/api/settings', api_settings)
 
