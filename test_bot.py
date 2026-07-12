@@ -1,8 +1,34 @@
 """Smoke-тести для parse_transaction нової версії."""
 import os
+import hashlib
+import hmac
+import json
+import time
+from urllib.parse import urlencode
+
 os.environ.setdefault('TELEGRAM_BOT_TOKEN', 'placeholder:test')
 
 import bot
+
+
+def _signed_init_data(auth_date):
+    token = os.environ['TELEGRAM_BOT_TOKEN']
+    params = {
+        'auth_date': str(auth_date),
+        'query_id': 'test-query',
+        'user': json.dumps({'id': 123}, separators=(',', ':')),
+    }
+    data_check_string = '\n'.join(f'{key}={value}' for key, value in sorted(params.items()))
+    secret = hmac.new(b'WebAppData', token.encode(), hashlib.sha256).digest()
+    params['hash'] = hmac.new(
+        secret, data_check_string.encode(), hashlib.sha256
+    ).hexdigest()
+    return urlencode(params)
+
+
+def test_validate_init_data_rejects_future_auth_date():
+    raw = _signed_init_data(int(time.time()) + 3600)
+    assert bot.validate_init_data(raw, os.environ['TELEGRAM_BOT_TOKEN']) is None
 
 
 def test_parse_simple_expense():

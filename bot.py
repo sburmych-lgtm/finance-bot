@@ -49,7 +49,10 @@ def validate_init_data(raw_init_data: str, bot_token: str) -> dict | None:
     auth_date_str = params.get('auth_date', '')
     try:
         auth_ts = int(auth_date_str)
-        if datetime.now(timezone.utc).timestamp() - auth_ts > 86400:
+        age_seconds = datetime.now(timezone.utc).timestamp() - auth_ts
+        # Permit minor clock drift, but reject replayed data and timestamps
+        # forged materially in the future.
+        if age_seconds > 86400 or age_seconds < -30:
             return None
     except (ValueError, TypeError):
         return None
@@ -4043,10 +4046,9 @@ def build_api_app() -> web.Application:
 def main():
     """Start the bot"""
     import datetime as _dt
-    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '8304522900:AAE9C8QXWjwo1BJ0Xwg2Vt5tXMcS3MSpOlk')
-
-    if TOKEN == '8304522900:AAE9C8QXWjwo1BJ0Xwg2Vt5tXMcS3MSpOlk':
-        logger.warning("⚠️ Using hardcoded token!")
+    TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
+    if not TOKEN:
+        raise RuntimeError('TELEGRAM_BOT_TOKEN is required')
 
     application = Application.builder().token(TOKEN).post_init(post_init_notify).build()
 
