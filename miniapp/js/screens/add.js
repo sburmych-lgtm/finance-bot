@@ -392,6 +392,7 @@ async function submitAdd(root) {
       showSubmitError(root, 'Оберіть активність');
       return;
     }
+    state.clientRequestId = ensureClientRequestId(state.clientRequestId);
     state.submitting = true;
     clearSubmitFeedback();
     syncSubmitDock(root);
@@ -400,6 +401,7 @@ async function submitAdd(root) {
         minutes,
         category: state.category,
         description: state.note || state.category,
+        client_request_id: state.clientRequestId,
       });
     } catch (error) {
       showSubmitError(root, error?.message || 'Не вдалося зберегти запис часу');

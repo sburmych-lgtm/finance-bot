@@ -482,6 +482,7 @@ class Database:
                 description TEXT,
                 date DATE NOT NULL,
                 timestamp DATETIME NOT NULL,
+                client_request_id TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -651,6 +652,25 @@ class Database:
                     CREATE UNIQUE INDEX IF NOT EXISTS
                     idx_transactions_user_client_request
                     ON transactions(user_id, client_request_id)
+                    WHERE client_request_id IS NOT NULL
+                ''')
+                mark(mig)
+            except Exception as e:
+                logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
+
+        mig = '20260712_add_time_client_request_id'
+        if not applied(mig):
+            try:
+                cursor.execute("PRAGMA table_info(time_tracks)")
+                cols = {row[1] for row in cursor.fetchall()}
+                if 'client_request_id' not in cols:
+                    cursor.execute(
+                        "ALTER TABLE time_tracks ADD COLUMN client_request_id TEXT"
+                    )
+                cursor.execute('''
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    idx_time_tracks_user_client_request
+                    ON time_tracks(user_id, client_request_id)
                     WHERE client_request_id IS NOT NULL
                 ''')
                 mark(mig)
@@ -941,17 +961,45 @@ class Database:
             last_row = cursor.fetchone()
             return templates, (dict(last_row) if last_row else None)
 
-    async def add_time_track(self, user_id, minutes, category, description, date, timestamp):
+    async def add_time_track(
+        self,
+        user_id,
+        minutes,
+        category,
+        description,
+        date,
+        timestamp,
+        client_request_id=None,
+    ):
         """Add time track to database"""
         async with db_lock:
             cursor = self.conn.cursor()
-            cursor.execute('''
-                INSERT INTO time_tracks
-                (user_id, minutes, category, description, date, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (user_id, minutes, category, description, date, timestamp))
-            self.conn.commit()
-            return cursor.lastrowid
+            try:
+                cursor.execute('''
+                    INSERT INTO time_tracks
+                    (user_id, minutes, category, description, date, timestamp,
+                     client_request_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_id, minutes, category, description, date, timestamp,
+                    client_request_id,
+                ))
+                self.conn.commit()
+                return cursor.lastrowid
+            except sqlite3.IntegrityError:
+                self.conn.rollback()
+                raise
+
+    async def get_time_track_by_client_request_id(
+        self, user_id, client_request_id
+    ):
+        async with db_lock:
+            row = self.conn.execute('''
+                SELECT * FROM time_tracks
+                WHERE user_id = ? AND client_request_id = ?
+                LIMIT 1
+            ''', (str(user_id), client_request_id)).fetchone()
+            return dict(row) if row else None
 
     async def get_transactions(self, user_id, year=None, month=None, limit=None,
                                 t_type=None, from_date=None, to_date=None):
@@ -4165,6 +4213,18 @@ def _quick_operation_payload(row: dict):
     }
 
 
+def _quick_operation_is_current(row: dict, settings: dict) -> bool:
+    category = (
+        settings.get('categories', {})
+        .get(row.get('type'), {})
+        .get(row.get('category'))
+    )
+    if not isinstance(category, dict):
+        return False
+    subcategory = row.get('subcategory') or None
+    return not subcategory or subcategory in (category.get('subcategories') or [])
+
+
 async def api_quick_templates(request: web.Request):
     """Return frequent operations and the latest operation for quick-add UI."""
     raw_limit = request.rel_url.query.get('limit')
@@ -4183,19 +4243,28 @@ async def api_quick_templates(request: web.Request):
                 {'detail': 'limit must be between 1 and 10'}, status=400
             )
 
+    # Fetch extra candidates because stale historical categories are filtered
+    # below and must not crowd out usable templates.
     templates, last_operation = await db.get_quick_templates(
-        request['user_id'], limit=limit
+        request['user_id'], limit=max(50, limit * 20)
     )
+    settings = await user_settings_for(request['user_id'])
     result = []
     for row in templates:
+        if not _quick_operation_is_current(row, settings):
+            continue
         item = _quick_operation_payload(row)
         item['usage_count'] = int(row['usage_count'])
         result.append(item)
+        if len(result) >= limit:
+            break
 
     return _json_response({
         'templates': result,
         'last_operation': (
-            _quick_operation_payload(last_operation) if last_operation else None
+            _quick_operation_payload(last_operation)
+            if last_operation and _quick_operation_is_current(last_operation, settings)
+            else None
         ),
     })
 
@@ -4291,8 +4360,6 @@ async def api_post_transaction(request: web.Request):
     if t_type not in ('income', 'expense'):
         return _json_response({'detail': 'type must be income or expense'}, status=400)
 
-    user_settings = await user_settings_for(user_id)
-
     raw_amount = body.get('amount')
     if raw_amount is None or isinstance(raw_amount, bool):
         return _json_response({'detail': 'amount required and must be a number'}, status=400)
@@ -4319,15 +4386,6 @@ async def api_post_transaction(request: web.Request):
     description = _clean_text(body.get('description'), max_len=200, default='')
     # Optional subcategory (hierarchical categories). None when absent/empty.
     subcategory = _clean_text(body.get('subcategory'), max_len=80, default='') or None
-    category_entry = user_settings.get('categories', {}).get(t_type, {}).get(category)
-    if not isinstance(category_entry, dict):
-        return _json_response({'detail': f'unknown {t_type} category "{category}"'}, status=400)
-    known_subcategories = category_entry.get('subcategories') or []
-    if subcategory and subcategory not in known_subcategories:
-        return _json_response(
-            {'detail': f'unknown subcategory "{subcategory}" for category "{category}"'},
-            status=400,
-        )
 
     if client_request_id is not None:
         existing = await db.get_transaction_by_client_request_id(
@@ -4352,6 +4410,17 @@ async def api_post_transaction(request: web.Request):
             return _json_response(
                 _transaction_write_response(existing, duplicate=True)
             )
+
+    user_settings = await user_settings_for(user_id)
+    category_entry = user_settings.get('categories', {}).get(t_type, {}).get(category)
+    if not isinstance(category_entry, dict):
+        return _json_response({'detail': f'unknown {t_type} category "{category}"'}, status=400)
+    known_subcategories = category_entry.get('subcategories') or []
+    if subcategory and subcategory not in known_subcategories:
+        return _json_response(
+            {'detail': f'unknown subcategory "{subcategory}" for category "{category}"'},
+            status=400,
+        )
 
     rate = await get_exchange_rate(currency)
     amount_uah = round(convert_to_uah(amount, currency, rate), 2)
@@ -5122,12 +5191,42 @@ async def api_time_tracks_list(request: web.Request):
     return _json_response([dict(r) for r in rows])
 
 
+def _time_track_write_response(row: dict, *, duplicate: bool):
+    client_request_id = row.get('client_request_id')
+    return {
+        'id': row['id'],
+        'user_id': str(row['user_id']),
+        'minutes': int(row['minutes']),
+        'category': row['category'],
+        'description': row.get('description') or '',
+        'date': row['date'],
+        'timestamp': row['timestamp'],
+        'client_request_id': client_request_id,
+        'duplicate': duplicate,
+        'idempotent': client_request_id is not None,
+    }
+
+
+def _time_track_payload_matches(row, *, minutes, category, description):
+    return (
+        int(row['minutes']) == minutes
+        and row['category'] == category
+        and (row.get('description') or '') == description
+    )
+
+
 async def api_time_tracks_create(request: web.Request):
     user_id = request['user_id']
     try:
         body = await request.json()
     except Exception:
         return _json_response({'detail': 'Invalid JSON'}, status=400)
+    if not isinstance(body, dict):
+        return _json_response({'detail': 'JSON body must be an object'}, status=400)
+
+    client_request_id, err = _parse_client_request_id(body)
+    if err is not None:
+        return err
 
     raw_minutes = body.get('minutes')
     if raw_minutes is None or isinstance(raw_minutes, bool):
@@ -5144,6 +5243,24 @@ async def api_time_tracks_create(request: web.Request):
     category = _clean_text(body.get('category'), max_len=60)
     if not category:
         return _json_response({'detail': 'category required'}, status=400)
+    description = _clean_text(body.get('description'), max_len=200)
+
+    if client_request_id is not None:
+        existing = await db.get_time_track_by_client_request_id(
+            user_id, client_request_id
+        )
+        if existing is not None:
+            if not _time_track_payload_matches(
+                existing,
+                minutes=minutes,
+                category=category,
+                description=description,
+            ):
+                return _idempotency_conflict_response()
+            return _json_response(
+                _time_track_write_response(existing, duplicate=True)
+            )
+
     # Whitelist against THIS user's own time categories.
     user_settings = await user_settings_for(user_id)
     known_time_cats = set(user_settings.get('time_categories') or {})
@@ -5151,15 +5268,40 @@ async def api_time_tracks_create(request: web.Request):
         return _json_response(
             {'detail': f'unknown time category "{category}"'}, status=400)
 
-    description = _clean_text(body.get('description'), max_len=200)
-
     now = datetime.now(KYIV_TZ)
     date_str = now.strftime('%Y-%m-%d')
     ts_str = now.strftime('%Y-%m-%d %H:%M:%S')
 
-    row_id = await db.add_time_track(user_id, minutes, category, description, date_str, ts_str)
+    try:
+        row_id = await db.add_time_track(
+            user_id,
+            minutes,
+            category,
+            description,
+            date_str,
+            ts_str,
+            client_request_id=client_request_id,
+        )
+    except sqlite3.IntegrityError:
+        if client_request_id is None:
+            raise
+        existing = await db.get_time_track_by_client_request_id(
+            user_id, client_request_id
+        )
+        if existing is None:
+            raise
+        if not _time_track_payload_matches(
+            existing,
+            minutes=minutes,
+            category=category,
+            description=description,
+        ):
+            return _idempotency_conflict_response()
+        return _json_response(
+            _time_track_write_response(existing, duplicate=True)
+        )
     logger.info(f"API POST /api/time-tracks user={user_id} id={row_id} {minutes}min {category}")
-    return _json_response({
+    created = {
         'id': row_id,
         'user_id': user_id,
         'minutes': minutes,
@@ -5167,7 +5309,11 @@ async def api_time_tracks_create(request: web.Request):
         'description': description,
         'date': date_str,
         'timestamp': ts_str,
-    }, status=201)
+        'client_request_id': client_request_id,
+    }
+    return _json_response(
+        _time_track_write_response(created, duplicate=False), status=201
+    )
 
 
 async def api_time_tracks_delete(request: web.Request):

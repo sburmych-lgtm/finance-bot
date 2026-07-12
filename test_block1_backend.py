@@ -65,6 +65,18 @@ def test_client_request_id_migration_adds_nullable_column_and_scoped_unique_inde
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )"""
     )
+    connection.execute(
+        """CREATE TABLE time_tracks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            minutes INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            description TEXT,
+            date DATE NOT NULL,
+            timestamp DATETIME NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )"""
+    )
     connection.commit()
     connection.close()
 
@@ -86,6 +98,23 @@ def test_client_request_id_migration_adds_nullable_column_and_scoped_unique_inde
         and "user_id" in sql
         and "client_request_id" in sql
         for sql in indexes
+    )
+    time_columns = {
+        row[1] for row in database.conn.execute("PRAGMA table_info(time_tracks)")
+    }
+    time_indexes = [
+        row[0]
+        for row in database.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='time_tracks'"
+        )
+        if row[0]
+    ]
+    assert "client_request_id" in time_columns
+    assert any(
+        "UNIQUE" in sql.upper()
+        and "user_id" in sql
+        and "client_request_id" in sql
+        for sql in time_indexes
     )
 
 
@@ -140,6 +169,31 @@ def test_reused_client_request_id_with_different_payload_is_a_conflict(
     assert created.status == 201
     assert conflict.status == 409
     assert payload(conflict)["code"] == "IDEMPOTENCY_CONFLICT"
+    assert len(run(database.get_transactions("user-1"))) == 1
+
+
+def test_transaction_replay_survives_later_category_deletion(monkeypatch, tmp_path):
+    database = use_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        bot,
+        "get_exchange_rate",
+        lambda _currency: asyncio.sleep(0, result=1.0),
+    )
+    body = transaction_body(client_request_id="req-deleted-category")
+    created = run(bot.api_post_transaction(Request(body=body)))
+
+    async def remove_category():
+        settings = await bot.user_settings_for("user-1")
+        settings["categories"]["expense"].pop("Кафе", None)
+        await bot.save_user_settings("user-1", settings)
+
+    run(remove_category())
+    replay = run(bot.api_post_transaction(Request(body=body)))
+
+    assert created.status == 201
+    assert replay.status == 200
+    assert payload(replay)["duplicate"] is True
+    assert payload(replay)["id"] == payload(created)["id"]
     assert len(run(database.get_transactions("user-1"))) == 1
 
 
@@ -203,6 +257,9 @@ def test_quick_templates_use_all_history_and_are_fully_user_isolated(
     database = use_database(monkeypatch, tmp_path)
 
     async def seed():
+        settings = await bot.user_settings_for("user-1")
+        settings["categories"]["expense"]["Кафе"]["subcategories"] = ["Напої"]
+        await bot.save_user_settings("user-1", settings)
         # The repeated template is older than the latest 15 rows. An endpoint
         # that accidentally aggregates Store/listTransactions(15) cannot find it.
         for index in range(16):
@@ -280,3 +337,58 @@ def test_quick_templates_empty_state_and_limit_validation(monkeypatch, tmp_path)
     assert payload(empty) == {"templates": [], "last_operation": None}
     assert too_large.status == 400
     assert invalid.status == 400
+
+
+def test_quick_templates_filter_deleted_categories_defensively(monkeypatch, tmp_path):
+    database = use_database(monkeypatch, tmp_path)
+
+    async def seed():
+        settings = await bot.user_settings_for("user-1")
+        settings["categories"]["expense"].pop("Кафе", None)
+        await bot.save_user_settings("user-1", settings)
+        for index in range(8):
+            await database.add_transaction(
+                "user-1", 40, "UAH", 40, "expense", "Кафе", "stale",
+                "2026-07-01", f"2026-07-01 08:{index:02d}:00",
+            )
+        await database.add_transaction(
+            "user-1", 10, "UAH", 10, "expense", "Інше", "valid",
+            "2026-07-12", "2026-07-12 12:00:00",
+        )
+
+    run(seed())
+    result = payload(run(bot.api_quick_templates(Request(query={"limit": "3"}))))
+
+    assert [item["category"] for item in result["templates"]] == ["Інше"]
+    assert result["last_operation"]["category"] == "Інше"
+
+
+def test_time_track_posts_are_idempotent_and_conflicts_are_rejected(
+    monkeypatch, tmp_path
+):
+    database = use_database(monkeypatch, tmp_path)
+
+    async def seed_category():
+        settings = await bot.user_settings_for("user-1")
+        settings["time_categories"] = {"Робота": {"emoji": "⏱"}}
+        await bot.save_user_settings("user-1", settings)
+
+    run(seed_category())
+    body = {
+        "minutes": 45,
+        "category": "Робота",
+        "description": "Планування",
+        "client_request_id": "time-20260712-0001",
+    }
+
+    first = run(bot.api_time_tracks_create(Request(body=body)))
+    repeated = run(bot.api_time_tracks_create(Request(body=body)))
+    conflict = run(bot.api_time_tracks_create(Request(body={**body, "minutes": 46})))
+
+    assert first.status == 201
+    assert repeated.status == 200
+    assert payload(repeated)["duplicate"] is True
+    assert payload(repeated)["id"] == payload(first)["id"]
+    assert conflict.status == 409
+    assert payload(conflict)["code"] == "IDEMPOTENCY_CONFLICT"
+    assert len(run(database.get_time_tracks("user-1"))) == 1
