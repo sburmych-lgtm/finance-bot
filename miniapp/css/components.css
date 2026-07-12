@@ -251,6 +251,19 @@ body::before {
   transition: background var(--t-fast) var(--ease-out);
 }
 .row:active { background: rgba(255,255,255,.06); }
+.row-action {
+  width: 100%;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.row-action > span:not(.avatar, .row-chevron) {
+  display: block;
+  min-width: 0;
+}
+.row-action .row-title,
+.row-action .row-meta { display: block; }
 .row .avatar {
   width: 44px; height: 44px;
   display: grid; place-items: center;

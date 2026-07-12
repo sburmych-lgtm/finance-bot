@@ -6,6 +6,7 @@ import { Telegram } from '../telegram.js';
 import { toast, esc, setHTML } from '../ui.js';
 import {
   ensureClientRequestId,
+  friendlySubmitError,
   normalizeQuickTemplates,
   templateToDraft,
 } from '../add-flow.js';
@@ -404,7 +405,7 @@ async function submitAdd(root) {
         client_request_id: state.clientRequestId,
       });
     } catch (error) {
-      showSubmitError(root, error?.message || 'Не вдалося зберегти запис часу');
+      showSubmitError(root, friendlySubmitError(error, 'Не вдалося зберегти запис часу'));
       return;
     }
   } else {
@@ -433,7 +434,7 @@ async function submitAdd(root) {
       });
     } catch (error) {
       // Retain clientRequestId: a retry is safe even if the first response was lost.
-      showSubmitError(root, error?.message || 'Не вдалося зберегти операцію');
+      showSubmitError(root, friendlySubmitError(error, 'Не вдалося зберегти операцію'));
       return;
     }
   }

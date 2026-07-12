@@ -75,3 +75,11 @@ export function createClientRequestId(cryptoImpl = globalThis.crypto) {
 export function ensureClientRequestId(currentId, createId = createClientRequestId) {
   return currentId || createId();
 }
+
+export function friendlySubmitError(error, fallback) {
+  const message = typeof error?.message === 'string' ? error.message.trim() : '';
+  if (/failed to fetch|networkerror|load failed/i.test(message)) {
+    return 'Немає з’єднання. Перевірте інтернет і спробуйте ще раз.';
+  }
+  return message || fallback;
+}

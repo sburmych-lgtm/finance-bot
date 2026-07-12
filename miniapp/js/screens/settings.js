@@ -51,33 +51,33 @@ function renderMain(root) {
     <div class="setting-section">
       <div class="section-head"><div class="section-title">Категорії</div></div>
       <div class="row-list">
-        <div class="row" data-go="expense_cats"><div class="avatar">−</div>
-          <div><div class="row-title">Витрати</div><div class="row-meta">Додати, перейменувати, видалити</div></div>
-          <div class="row-chevron">›</div></div>
-        <div class="row" data-go="income_cats"><div class="avatar">+</div>
-          <div><div class="row-title">Доходи</div><div class="row-meta">Додати, перейменувати, видалити</div></div>
-          <div class="row-chevron">›</div></div>
-        <div class="row" data-go="time_cats"><div class="avatar">T</div>
-          <div><div class="row-title">Час</div><div class="row-meta">Активності для трекінгу</div></div>
-          <div class="row-chevron">›</div></div>
+        <button type="button" class="row row-action" data-go="expense_cats"><span class="avatar">−</span>
+          <span><span class="row-title">Витрати</span><span class="row-meta">Додати, перейменувати, видалити</span></span>
+          <span class="row-chevron">›</span></button>
+        <button type="button" class="row row-action" data-go="income_cats"><span class="avatar">+</span>
+          <span><span class="row-title">Доходи</span><span class="row-meta">Додати, перейменувати, видалити</span></span>
+          <span class="row-chevron">›</span></button>
+        <button type="button" class="row row-action" data-go="time_cats"><span class="avatar">T</span>
+          <span><span class="row-title">Час</span><span class="row-meta">Активності для трекінгу</span></span>
+          <span class="row-chevron">›</span></button>
       </div>
     </div>
 
     <div class="setting-section">
       <div class="section-head"><div class="section-title">Команда</div></div>
       <div class="row-list">
-        <div class="row" data-go="employees"><div class="avatar">P</div>
-          <div><div class="row-title">Працівники</div><div class="row-meta">Список для ROI-звіту</div></div>
-          <div class="row-chevron">›</div></div>
+        <button type="button" class="row row-action" data-go="employees"><span class="avatar">P</span>
+          <span><span class="row-title">Працівники</span><span class="row-meta">Список для ROI-звіту</span></span>
+          <span class="row-chevron">›</span></button>
       </div>
     </div>
 
     <div class="setting-section">
       <div class="section-head"><div class="section-title">Податки</div></div>
       <div class="row-list">
-        <div class="row" data-go="tax"><div class="avatar">%</div>
-          <div><div class="row-title">Податковий профіль</div><div class="row-meta">Група, ставки та правила за роками</div></div>
-          <div class="row-chevron">›</div></div>
+        <button type="button" class="row row-action" data-go="tax"><span class="avatar">%</span>
+          <span><span class="row-title">Податковий профіль</span><span class="row-meta">Група, ставки та правила за роками</span></span>
+          <span class="row-chevron">›</span></button>
       </div>
     </div>
 
@@ -96,9 +96,9 @@ function renderMain(root) {
     <div class="setting-section">
       <div class="section-head"><div class="section-title">Приватність</div></div>
       <div class="row-list">
-        <div class="row" data-go="privacy"><div class="avatar">i</div>
-          <div><div class="row-title">Як зберігаються дані</div><div class="row-meta">Railway Volume, ізоляція за Telegram ID</div></div>
-          <div class="row-chevron">›</div></div>
+        <button type="button" class="row row-action" data-go="privacy"><span class="avatar">i</span>
+          <span><span class="row-title">Як зберігаються дані</span><span class="row-meta">Railway Volume, ізоляція за Telegram ID</span></span>
+          <span class="row-chevron">›</span></button>
       </div>
     </div>
 
@@ -149,10 +149,10 @@ async function renderCategoriesEditor(root, type, label) {
           <div class="cat-block">
             <div class="row">
               <div class="avatar">${esc(def?.emoji || '•')}</div>
-              <div class="cat-main" data-toggle-sub="${esc(name)}" style="cursor:pointer;">
-                <div class="row-title">${esc(name)} ${subs.length ? `<span class="sub-count">${subs.length}</span>` : ''}</div>
-                <div class="row-meta">${subs.length ? `${subs.length} підрозділ(ів) · торкніться, щоб відкрити` : 'Торкніться, щоб додати підрозділи'}</div>
-              </div>
+              <button type="button" class="cat-main" data-toggle-sub="${esc(name)}">
+                <span class="row-title">${esc(name)} ${subs.length ? `<span class="sub-count">${subs.length}</span>` : ''}</span>
+                <span class="row-meta">${subs.length ? `${subs.length} підрозділ(ів) · торкніться, щоб відкрити` : 'Торкніться, щоб додати підрозділи'}</span>
+              </button>
               ${name === 'Інше' ? '<div class="row-chevron">🔒</div>' : `
                 <div style="display:flex; gap:var(--sp-1);">
                   <button class="ghost-btn rename-cat" data-name="${esc(name)}" aria-label="Перейменувати">✎</button>

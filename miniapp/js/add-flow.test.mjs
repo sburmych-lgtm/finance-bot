@@ -4,9 +4,19 @@ import test from 'node:test';
 
 import {
   ensureClientRequestId,
+  friendlySubmitError,
   normalizeQuickTemplates,
   templateToDraft,
 } from './add-flow.js';
+
+test('network failures are presented in clear Ukrainian', () => {
+  assert.equal(
+    friendlySubmitError(new TypeError('Failed to fetch'), 'Не вдалося зберегти'),
+    'Немає з’єднання. Перевірте інтернет і спробуйте ще раз.',
+  );
+  assert.equal(friendlySubmitError(new Error('Сервер відмовив'), 'Fallback'), 'Сервер відмовив');
+  assert.equal(friendlySubmitError(null, 'Fallback'), 'Fallback');
+});
 
 test('retry reuses one client request id until the caller clears it after success', () => {
   let calls = 0;

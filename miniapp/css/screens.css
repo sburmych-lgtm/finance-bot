@@ -231,7 +231,18 @@
   border-radius: var(--r-lg);
   overflow: hidden;
 }
-.cat-main { flex: 1; min-width: 0; }
+.cat-main {
+  min-width: 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.cat-main .row-title,
+.cat-main .row-meta { display: block; }
 .sub-count {
   display: inline-block;
   min-width: 18px;
