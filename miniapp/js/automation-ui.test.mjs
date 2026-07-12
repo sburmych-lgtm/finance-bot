@@ -161,3 +161,13 @@ test('automation UI is opt-in, retryable, accessible and rule-based', () => {
   assert.match(css, /\.recurring-actions \.btn\s*{[^}]*min-height:\s*var\(--touch-target\)/s);
   assert.match(css, /input\[role="switch"\]\s*{[^}]*height:\s*var\(--touch-target\)/s);
 });
+
+test('automation writes cannot restore a stale view and Back keeps a 44px target', () => {
+  const automation = fs.readFileSync(new URL('./screens/automation.js', import.meta.url), 'utf8');
+  const css = fs.readFileSync(new URL('../css/automation.css', import.meta.url), 'utf8');
+
+  assert.match(automation, /const stillCurrent = \(\) => generation === renderGeneration && root\.dataset\.automationView === 'recurring'/);
+  assert.ok((automation.match(/if \(!stillCurrent\(\)\) return;/g) || []).length >= 3);
+  assert.match(automation, /root\.dataset\.automationView === 'digest'/);
+  assert.match(css, /\.automation-back \.ghost-btn\s*{[^}]*min-width:\s*var\(--touch-target\)[^}]*min-height:\s*var\(--touch-target\)/s);
+});

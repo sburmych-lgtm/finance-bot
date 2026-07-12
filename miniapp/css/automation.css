@@ -1,5 +1,10 @@
 /* Block 2B: rule-based insights, recurring operations, digest and forecast. */
 
+.automation-back .ghost-btn {
+  min-width: var(--touch-target);
+  min-height: var(--touch-target);
+}
+
 .home-insights { margin-top: var(--sp-2); }
 .insight-strip,
 .suggestion-strip {

@@ -23,6 +23,8 @@ function header(label) {
 
 function wireBack(root, onBack) {
   root.querySelector('[data-automation-back]')?.addEventListener('click', () => {
+    delete root.dataset.automationView;
+    renderGeneration += 1;
     Telegram.haptic('selection');
     onBack();
   });
@@ -174,7 +176,7 @@ function normalizedCategories(full) {
   };
 }
 
-function bindRecurringForm(root, { categoriesByType, operations, suggestions, onRefresh }) {
+function bindRecurringForm(root, { categoriesByType, operations, suggestions, generation, onRefresh }) {
   const form = root.querySelector('#recurringForm');
   const type = root.querySelector('#recurringType');
   const amount = root.querySelector('#recurringAmount');
@@ -193,6 +195,7 @@ function bindRecurringForm(root, { categoriesByType, operations, suggestions, on
   const title = root.querySelector('#recurringFormTitle');
   let editingId = null;
   let busy = false;
+  const stillCurrent = () => generation === renderGeneration && root.dataset.automationView === 'recurring';
 
   const categoriesFor = (kind) => Object.keys(categoriesByType[kind] || {});
   const syncSubcategories = (preferred = null) => {
@@ -311,8 +314,10 @@ function bindRecurringForm(root, { categoriesByType, operations, suggestions, on
       }
       Telegram.haptic('success');
       toast(editingId ? 'Регулярну операцію оновлено' : 'Регулярну операцію створено');
+      if (!stillCurrent()) return;
       await onRefresh();
     } catch (error) {
+      if (!stillCurrent()) return;
       busy = false;
       save.disabled = false;
       save.textContent = editingId ? 'Спробувати ще раз' : 'Повторити створення';
@@ -331,8 +336,10 @@ function bindRecurringForm(root, { categoriesByType, operations, suggestions, on
         await Api.patchRecurringOperation(operation.id, { active: !operation.active });
         Telegram.haptic('success');
         toast(operation.active ? 'Операцію призупинено' : 'Операцію відновлено');
+        if (!stillCurrent()) return;
         await onRefresh();
       } catch (error) {
+        if (!stillCurrent()) return;
         button.disabled = false;
         Telegram.haptic('error');
         toast(error.message || 'Не вдалося змінити стан');
@@ -349,8 +356,10 @@ function bindRecurringForm(root, { categoriesByType, operations, suggestions, on
         await Api.deleteRecurringOperation(operation.id);
         Telegram.haptic('success');
         toast('Регулярну операцію видалено');
+        if (!stillCurrent()) return;
         await onRefresh();
       } catch (error) {
+        if (!stillCurrent()) return;
         button.disabled = false;
         Telegram.haptic('error');
         toast(error.message || 'Не вдалося видалити операцію');
@@ -388,6 +397,7 @@ export async function renderRecurringSettings(root, onBack) {
       categoriesByType,
       operations,
       suggestions,
+      generation,
       onRefresh: () => renderRecurringSettings(root, onBack),
     });
   } catch (error) {
@@ -439,6 +449,7 @@ function digestMarkup(settings, digest) {
 export async function renderDigestSettings(root, onBack) {
   const generation = ++renderGeneration;
   root.dataset.automationView = 'digest';
+  const stillCurrent = () => generation === renderGeneration && root.dataset.automationView === 'digest';
   setHTML(root, loading('Недільний дайджест'));
   wireBack(root, onBack);
   try {
@@ -446,7 +457,7 @@ export async function renderDigestSettings(root, onBack) {
       Api.notificationSettings(),
       Api.weeklyDigest(currentWeekStart()),
     ]);
-    if (generation !== renderGeneration || root.dataset.automationView !== 'digest') return;
+    if (!stillCurrent()) return;
     const settings = normalizeNotificationSettings(rawSettings);
     const digest = normalizeDigest(rawDigest);
     if (!digest) throw new Error('Сервер повернув неповний попередній перегляд.');
@@ -463,11 +474,13 @@ export async function renderDigestSettings(root, onBack) {
         const saved = normalizeNotificationSettings(await Api.patchNotificationSettings({
           weekly_digest_enabled: requested,
         }));
+        if (!stillCurrent()) return;
         toggle.checked = saved.weeklyDigestEnabled;
         Telegram.haptic('success');
         toast(saved.weeklyDigestEnabled ? 'Недільний дайджест увімкнено' : 'Недільний дайджест вимкнено');
         await renderDigestSettings(root, onBack);
       } catch (error) {
+        if (!stillCurrent()) return;
         toggle.checked = !requested;
         toggle.disabled = false;
         status.textContent = error.message || 'Не вдалося зберегти налаштування.';
@@ -476,7 +489,7 @@ export async function renderDigestSettings(root, onBack) {
       }
     });
   } catch (error) {
-    if (generation !== renderGeneration || root.dataset.automationView !== 'digest') return;
+    if (!stillCurrent()) return;
     setHTML(root, errorMarkup('Недільний дайджест', error.message));
     wireBack(root, onBack);
     root.querySelector('.automation-retry')?.addEventListener('click', () => renderDigestSettings(root, onBack));
