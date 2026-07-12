@@ -2431,6 +2431,27 @@ async def show_employee_report(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(text, parse_mode='Markdown')
 
 
+def calculate_tax_group(total_income, tax_config):
+    """Return normalized tax figures for every supported FOP group."""
+    group = tax_config.get('group', 'fop3')
+    if group not in ('fop1', 'fop2', 'fop3', 'none'):
+        group = 'fop3'
+    rate = float(tax_config.get('single_tax_rate', 0.05))
+    esv_fixed = float(tax_config.get('esv_fixed', 1760))
+    if group == 'none':
+        single_tax, esv, label = 0.0, 0.0, 'Не ФОП (фізособа)'
+    elif group == 'fop1':
+        single_tax, esv, label = float(tax_config.get('fop1_fixed', 303)), esv_fixed, 'ФОП 1 група'
+    elif group == 'fop2':
+        single_tax, esv, label = float(tax_config.get('fop2_fixed', 1600)), esv_fixed, 'ФОП 2 група'
+    else:
+        single_tax, esv, label = total_income * rate, esv_fixed, 'ФОП 3 група'
+    return {
+        'group': group, 'group_label': label, 'single_tax_rate': rate,
+        'single_tax': single_tax, 'esv': esv, 'total_tax': single_tax + esv,
+    }
+
+
 async def show_tax_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show tax report"""
     query = update.callback_query
@@ -2448,11 +2469,11 @@ async def show_tax_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_expense = sum(t['amount_uah'] for t in transactions if t['type'] == 'expense')
     profit = total_income - total_expense
 
-    single_tax_rate = settings['tax_config']['single_tax_rate']
-    esv_fixed = settings['tax_config']['esv_fixed']
-
-    single_tax = total_income * single_tax_rate
-    total_tax = single_tax + esv_fixed
+    tax = calculate_tax_group(total_income, settings['tax_config'])
+    single_tax_label = (
+        f"Єдиний ({tax['single_tax_rate'] * 100:.0f}%)"
+        if tax['group'] == 'fop3' else 'Єдиний (фіксований)'
+    )
 
     import calendar
     last_day = calendar.monthrange(current_date.year, current_date.month)[1]
@@ -2466,12 +2487,12 @@ async def show_tax_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"Всього: {total_expense:.2f} грн\n\n"
     text += f"━━━ ПРИБУТОК ━━━\n"
     text += f"Чистий: {profit:.2f} грн\n\n"
-    text += f"━━━ ПОДАТКИ ━━━\n"
-    text += f"Єдиний ({single_tax_rate*100:.0f}%): {single_tax:.2f} грн\n"
-    text += f"ЄСВ: {esv_fixed:.2f} грн\n"
+    text += f"━━━ ПОДАТКИ · {tax['group_label']} ━━━\n"
+    text += f"{single_tax_label}: {tax['single_tax']:.2f} грн\n"
+    text += f"ЄСВ: {tax['esv']:.2f} грн\n"
     text += f"━━━━━━━━━━━━━━━━\n"
-    text += f"До сплати: {total_tax:.2f} грн\n\n"
-    text += f"💰 Після податків: {profit - total_tax:.2f} грн"
+    text += f"До сплати: {tax['total_tax']:.2f} грн\n\n"
+    text += f"💰 Після податків: {profit - tax['total_tax']:.2f} грн"
 
     await query.edit_message_text(text, parse_mode='Markdown')
 
@@ -3372,29 +3393,7 @@ async def api_report_tax(request: web.Request):
 
     user_settings = await user_settings_for(user_id)
     user_tax = user_settings.get('tax_config', DEFAULT_SETTINGS['tax_config'])
-    group = user_tax.get('group', 'fop3')
-    esv_fixed = user_tax.get('esv_fixed', 1760)
-    single_tax_rate = user_tax.get('single_tax_rate', 0.05)
-
-    # Tax math depends on the group. ЄСВ is the same for any ФОП group; «не ФОП»
-    # pays nothing through this app's accounting (фізособи rules differ).
-    if group == 'none':
-        single_tax = 0.0
-        esv = 0.0
-        group_label = 'Не ФОП (фізособа)'
-    elif group == 'fop1':
-        single_tax = float(user_tax.get('fop1_fixed', 303))
-        esv = esv_fixed
-        group_label = 'ФОП 1 група'
-    elif group == 'fop2':
-        single_tax = float(user_tax.get('fop2_fixed', 1600))
-        esv = esv_fixed
-        group_label = 'ФОП 2 група'
-    else:  # 'fop3' (default)
-        single_tax = total_income * single_tax_rate
-        esv = esv_fixed
-        group_label = 'ФОП 3 група'
-    total_tax = single_tax + esv
+    tax = calculate_tax_group(total_income, user_tax)
 
     import calendar
     last_day = calendar.monthrange(year, month)[1]
@@ -3405,16 +3404,16 @@ async def api_report_tax(request: web.Request):
         'year': year,
         'month': month,
         'month_name': MONTH_NAMES[month],
-        'group': group,
-        'group_label': group_label,
+        'group': tax['group'],
+        'group_label': tax['group_label'],
         'total_income': round(total_income, 2),
         'total_expense': round(total_expense, 2),
         'profit': round(profit, 2),
-        'single_tax_rate': single_tax_rate,
-        'esv_fixed': round(esv, 2),
-        'single_tax': round(single_tax, 2),
-        'total_tax': round(total_tax, 2),
-        'after_tax': round(profit - total_tax, 2),
+        'single_tax_rate': tax['single_tax_rate'],
+        'esv_fixed': round(tax['esv'], 2),
+        'single_tax': round(tax['single_tax'], 2),
+        'total_tax': round(tax['total_tax'], 2),
+        'after_tax': round(profit - tax['total_tax'], 2),
         'period_from': period_from,
         'period_to': period_to,
     })
@@ -4130,7 +4129,10 @@ def build_api_app() -> web.Application:
     app.router.add_route('POST', '/api/admin/broadcast', api_admin_broadcast)
 
     # Catch-all OPTIONS for CORS preflight on any path
-    app.router.add_route('OPTIONS', '/{path_info:.*}', lambda r: web.Response(status=204))
+    async def options_handler(_request):
+        return web.Response(status=204)
+
+    app.router.add_route('OPTIONS', '/{path_info:.*}', options_handler)
     return app
 
 

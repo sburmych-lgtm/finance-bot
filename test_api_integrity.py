@@ -1,6 +1,12 @@
 import asyncio
+import hashlib
+import hmac
 import json
+import time
 from types import SimpleNamespace
+from urllib.parse import urlencode
+
+from aiohttp.test_utils import TestClient, TestServer
 
 import bot
 
@@ -30,13 +36,54 @@ def use_database(monkeypatch, tmp_path):
     return database
 
 
+def signed_init_data(token, user_id):
+    params = {
+        "auth_date": str(int(time.time())),
+        "user": json.dumps({"id": user_id}, separators=(",", ":")),
+    }
+    check = "\n".join(f"{key}={value}" for key, value in sorted(params.items()))
+    secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    params["hash"] = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    return urlencode(params)
+
+
+def test_tax_group_calculation_is_shared_and_group_aware():
+    assert bot.calculate_tax_group(1000, {"group": "none", "esv_fixed": 1760}) == {
+        "group": "none", "group_label": "Не ФОП (фізособа)",
+        "single_tax_rate": 0.05, "single_tax": 0.0, "esv": 0.0, "total_tax": 0.0,
+    }
+    fop2 = bot.calculate_tax_group(
+        1000, {"group": "fop2", "fop2_fixed": 1600, "esv_fixed": 1760})
+    assert fop2["single_tax"] == 1600
+    assert fop2["total_tax"] == 3360
+
+
+def test_api_middleware_requires_auth_and_rejects_non_admin(monkeypatch, tmp_path):
+    use_database(monkeypatch, tmp_path)
+    token = "test-token"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
+    monkeypatch.setattr(bot, "ADMIN_IDS", {"42"})
+
+    async def exercise():
+        async with TestClient(TestServer(bot.build_api_app())) as client:
+            missing = await client.get("/api/balance")
+            forbidden = await client.post(
+                "/api/admin/broadcast",
+                headers={"X-Telegram-Init-Data": signed_init_data(token, 7)},
+                json={"text": "test"},
+            )
+            return missing.status, forbidden.status
+
+    assert run(exercise()) == (401, 403)
+
+
 def test_monthly_balance_and_breakdown_use_all_rows_and_isolate_users(monkeypatch, tmp_path):
     database = use_database(monkeypatch, tmp_path)
 
     async def seed():
         for index in range(20):
             await database.add_transaction(
-                "user-1", 10, "UAH", 10, "expense", "Житло", "", 
+                "user-1", 10, "UAH", 10, "expense", "Житло", "",
                 "2026-07-10", f"2026-07-10 10:00:{index:02d}",
                 subcategory="Комунальні" if index < 12 else None,
             )
