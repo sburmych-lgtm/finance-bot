@@ -24,6 +24,9 @@ USER_OWNED_TABLES = {
     "transactions",
     "time_tracks",
     "budgets",
+    "recurring_operations",
+    "notification_preferences",
+    "notification_deliveries",
     "subscriptions",
     "users",
     "user_settings",
@@ -96,6 +99,26 @@ def seed_two_users(database):
                (user_id, type, category, monthly_limit_uah)
                VALUES (?, 'expense', 'Інше', ?)""",
             (user_id, 1000 + index),
+        )
+        conn.execute(
+            """INSERT INTO recurring_operations
+               (user_id, type, amount, currency, amount_uah, category,
+                description, frequency, interval, start_date, anchor_day,
+                next_due_date)
+               VALUES (?, 'expense', ?, 'UAH', ?, 'Інше', ?, 'monthly', 1,
+                       '2026-07-12', 12, '2026-07-12')""",
+            (user_id, 200 + index, 200 + index, f"recurring-{user_id}"),
+        )
+        conn.execute(
+            """INSERT INTO notification_preferences
+               (user_id, weekly_digest_enabled) VALUES (?, 1)""",
+            (user_id,),
+        )
+        conn.execute(
+            """INSERT INTO notification_deliveries
+               (user_id, kind, period_key, status)
+               VALUES (?, 'weekly_digest', '2026-W28', 'sent')""",
+            (user_id,),
         )
         conn.execute(
             """INSERT INTO users
