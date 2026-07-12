@@ -25,8 +25,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from aiohttp import web
 
@@ -48,6 +50,10 @@ BUILD = (
 _JS_IMPORT_RE = re.compile(
     r"""((?:from|import)\s+|import\s*\(\s*)(['"])([./][^'"?#]+\.js)\2""",
     re.MULTILINE,
+)
+_INLINE_SCRIPT_RE = re.compile(
+    r'<script(?![^>]*\bsrc\s*=)(?P<attrs>[^>]*)>',
+    re.IGNORECASE,
 )
 
 
@@ -73,6 +79,14 @@ def _bust_html(text: str) -> str:
     return text
 
 
+def _nonce_inline_scripts(text: str, nonce: str) -> str:
+    """Authorize inline bootstrap scripts with this response's CSP nonce."""
+    return _INLINE_SCRIPT_RE.sub(
+        lambda match: f'<script nonce="{nonce}"{match.group("attrs")}>',
+        text,
+    )
+
+
 def _inject_api_base(html: str) -> str:
     if not API_BASE:
         return html
@@ -91,21 +105,89 @@ def _inject_api_base(html: str) -> str:
     )
 
 
+def _api_connect_source() -> str | None:
+    """Return a header-safe API origin, never untrusted URL text."""
+    if not API_BASE:
+        return None
+    try:
+        parsed = urlsplit(API_BASE)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    try:
+        host = parsed.hostname.encode('idna').decode('ascii')
+    except UnicodeError:
+        return None
+    if ':' in host:
+        if not re.fullmatch(r'[0-9a-fA-F:]+', host):
+            return None
+        host = f'[{host}]'
+    elif not re.fullmatch(r'[A-Za-z0-9.-]+', host):
+        return None
+    authority = f'{host}:{port}' if port is not None else host
+    return f'{parsed.scheme}://{authority}'
+
+
+def _content_security_policy(nonce: str) -> str:
+    connect_sources = ["'self'"]
+    api_source = _api_connect_source()
+    if api_source:
+        connect_sources.append(api_source)
+    # Existing components use trusted inline style attributes. Keep that
+    # compatibility exception scoped to styles; scripts remain nonce-only.
+    directives = (
+        "default-src 'self'",
+        f"script-src 'self' 'nonce-{nonce}' https://telegram.org",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src 'self' https://fonts.gstatic.com data:",
+        "img-src 'self' data: blob:",
+        f"connect-src {' '.join(connect_sources)}",
+        "object-src 'none'",
+        "base-uri 'none'",
+        "form-action 'self'",
+        "frame-ancestors 'self' https://telegram.org https://*.telegram.org",
+        "worker-src 'self' blob:",
+        "manifest-src 'self'",
+    )
+    return '; '.join(directives)
+
+
 # ── Headers / middleware ─────────────────────────────────────────
-@web.middleware
-async def no_cache_middleware(request: web.Request, handler):
-    response = await handler(request)
+def _apply_response_headers(response: web.StreamResponse, nonce: str) -> None:
     if isinstance(response, web.StreamResponse):
         response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
         response.headers['Pragma'] = 'no-cache'
         response.headers['Expires'] = '0'
         # Expose our build id so we can confirm "the right one is live"
         response.headers['X-Ruby-Build'] = BUILD
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['Referrer-Policy'] = 'no-referrer'
+        response.headers['Permissions-Policy'] = (
+            'camera=(), microphone=(), geolocation=(), payment=(), usb=(), '
+            'serial=(), accelerometer=(), gyroscope=(), magnetometer=()'
+        )
+        response.headers['Content-Security-Policy'] = _content_security_policy(nonce)
+
+
+@web.middleware
+async def no_cache_middleware(request: web.Request, handler):
+    nonce = secrets.token_urlsafe(32)
+    request['csp_nonce'] = nonce
+    try:
+        response = await handler(request)
+    except web.HTTPException as exception:
+        _apply_response_headers(exception, nonce)
+        raise
+    _apply_response_headers(response, nonce)
     return response
 
 
 # ── Route handlers ───────────────────────────────────────────────
-async def index(_request: web.Request) -> web.Response:
+async def index(request: web.Request) -> web.Response:
     path = ROOT / 'index.html'
     try:
         html = path.read_text(encoding='utf-8')
@@ -113,34 +195,33 @@ async def index(_request: web.Request) -> web.Response:
         return web.Response(status=404, text='index.html missing')
     html = _inject_api_base(html)
     html = _bust_html(html)
+    html = _nonce_inline_scripts(html, request['csp_nonce'])
     return web.Response(
         body=html,
         content_type='text/html',
         charset='utf-8',
-        headers={'X-Content-Type-Options': 'nosniff'},
     )
 
 
-def _legal_document(filename: str) -> web.Response:
+def _legal_document(filename: str, nonce: str) -> web.Response:
     path = ROOT / filename
     try:
         html = path.read_text(encoding='utf-8')
     except FileNotFoundError:
         return web.Response(status=404, text='legal document missing')
     return web.Response(
-        body=_bust_html(html),
+        body=_nonce_inline_scripts(_bust_html(html), nonce),
         content_type='text/html',
         charset='utf-8',
-        headers={'X-Content-Type-Options': 'nosniff'},
     )
 
 
-async def privacy(_request: web.Request) -> web.Response:
-    return _legal_document('privacy.html')
+async def privacy(request: web.Request) -> web.Response:
+    return _legal_document('privacy.html', request['csp_nonce'])
 
 
-async def terms(_request: web.Request) -> web.Response:
-    return _legal_document('terms.html')
+async def terms(request: web.Request) -> web.Response:
+    return _legal_document('terms.html', request['csp_nonce'])
 
 
 async def favicon(_request: web.Request) -> web.Response:
