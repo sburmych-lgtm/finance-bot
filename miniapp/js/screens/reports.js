@@ -12,11 +12,10 @@ const MONTH_NAMES = ['', 'Січень', 'Лютий', 'Березень', 'Кв
 
 const TABS = [
   { id: 'overview',   label: 'Огляд' },
-  { id: 'employees',  label: 'Працівники' },
+  { id: 'employees',  label: 'Команда' },
   { id: 'tax',        label: 'Податки' },
-  { id: 'accounting', label: 'Бухгалтерія' },
+  { id: 'accounting', label: 'Облік' },
   { id: 'time',       label: 'Час' },
-  { id: 'ai',         label: 'AI' },
 ];
 
 const state = {
@@ -146,23 +145,22 @@ function overviewMarkup(report) {
     const pct = ((s.value / (totalExpense || 1)) * 100).toFixed(0);
     // Always allow drill-down: historical transactions can retain a
     // subcategory that was later removed from the current category settings.
-    const hasSub = true;
-    const drillAttr = ` data-drill="expense" data-drill-cat="${esc(s.name)}"`;
+    const amount = fmtAmount(s.value, 'UAH');
     return `
-      <div class="legend-item ${hasSub ? 'drillable' : ''}"${drillAttr}>
+      <button type="button" class="legend-item drillable drill-row" data-drill="expense" data-drill-cat="${esc(s.name)}" aria-label="${esc(`Деталізувати витрати: ${s.name}, ${amount}`)}">
         <span class="swatch" style="background:${SLICE_COLORS[i % SLICE_COLORS.length]}"></span>
-        <span>${esc(s.name)}${hasSub ? ' <span class="drill-arrow">›</span>' : ''}</span>
-        <strong>${esc(fmtAmount(s.value, 'UAH'))} <span class="legend-pct">(${pct}%)</span></strong>
-      </div>`;
+        <span>${esc(s.name)}</span>
+        <strong>${esc(amount)} <span class="legend-pct">(${pct}%)</span></strong>
+        <span class="drill-chevron" aria-hidden="true">›</span>
+      </button>`;
   }).join('');
   const incomeBars = incomeSlices.map(({ name: k, value: v }) => {
-    const hasSub = true;
-    const drillAttr = ` data-drill="income" data-drill-cat="${esc(k)}"`;
+    const amount = fmtAmount(v, 'UAH');
     return `
-    <div class="${hasSub ? 'drillable-bar' : ''}"${drillAttr}>
-      <div class="bar-meta"><span>${esc(k)}${hasSub ? ' <span class="drill-arrow">›</span>' : ''}</span><strong>${esc(fmtAmount(v, 'UAH'))}</strong></div>
+    <button type="button" class="drillable-bar drill-row" data-drill="income" data-drill-cat="${esc(k)}" aria-label="${esc(`Деталізувати дохід: ${k}, ${amount}`)}">
+      <div class="bar-meta"><span>${esc(k)}</span><strong>${esc(amount)}</strong><span class="drill-chevron" aria-hidden="true">›</span></div>
       <div class="bar-track"><div class="bar-fill" style="width:${Math.min(100, (v / (totalIncome || 1)) * 100).toFixed(0)}%"></div></div>
-    </div>`;
+    </button>`;
   }).join('');
   return `
     <div class="balance-card" style="min-height:auto;">
@@ -174,6 +172,7 @@ function overviewMarkup(report) {
       </div>
     </div>
     <div class="section-head"><div class="section-title">Витрати по категоріях</div></div>
+    ${slices.length ? '<p class="drill-hint">Оберіть категорію, щоб побачити підрозділи ›</p>' : ''}
     <div class="panel" style="padding: var(--sp-4);">
       ${slices.length ? `
         <div class="report-row">
@@ -182,6 +181,7 @@ function overviewMarkup(report) {
         </div>` : emptyState('Немає витрат за цей місяць')}
     </div>
     <div class="section-head"><div class="section-title">Доходи по джерелах</div></div>
+    ${incomeSlices.length ? '<p class="drill-hint">Оберіть джерело, щоб побачити деталі ›</p>' : ''}
     <div class="panel" style="padding: var(--sp-4);">
       ${incomeSlices.length ? `<div class="bars">${incomeBars}</div>` : emptyState('Немає доходів за цей місяць')}
     </div>`;
@@ -496,7 +496,7 @@ async function renderCategoryDrill(container, drill) {
 }
 
 // ── Main entry ─────────────────────────────────────────────────
-export function renderReports() {
+export function renderReports(focusTabId = null) {
   const generation = ++renderGeneration;
   const root = document.getElementById('screen-reports');
   if (!root) return;
@@ -508,13 +508,43 @@ export function renderReports() {
       <div class="month-label">${esc(monthLabel())}</div>
       <button class="ghost-btn" id="nextMonth" aria-label="Наступний">›</button>
     </div>
-    <div class="tab-strip" id="tabStrip">
-      ${TABS.map((t) => `
-        <button class="tab ${state.tab === t.id ? 'active' : ''}" data-tab="${t.id}">${esc(t.label)}</button>
-      `).join('')}
+    <div class="reports-tab-shell" id="reportsTabShell">
+      <div class="tab-strip" id="tabStrip" role="tablist" aria-label="Розділи звіту">
+        ${TABS.map((t) => `
+          <button
+            type="button"
+            class="tab ${state.tab === t.id ? 'active' : ''}"
+            id="report-tab-${t.id}"
+            data-tab="${t.id}"
+            role="tab"
+            aria-selected="${state.tab === t.id}"
+            aria-controls="tab-content"
+            tabindex="${state.tab === t.id || (state.tab === 'ai' && t.id === 'overview') ? '0' : '-1'}"
+          >${esc(t.label)}</button>
+        `).join('')}
+      </div>
     </div>
-    <div id="tab-content"></div>
+    <button
+      type="button"
+      class="report-ai-action ${state.tab === 'ai' ? 'active' : ''}"
+      id="reportAiAction"
+      data-tab="ai"
+      aria-pressed="${state.tab === 'ai'}"
+    >
+      <span>🤖 AI-аналіз місяця</span>
+      <span class="report-ai-chevron" aria-hidden="true">›</span>
+    </button>
+    <div
+      id="tab-content"
+      role="tabpanel"
+      tabindex="0"
+      aria-live="polite"
+      aria-labelledby="${state.tab === 'ai' ? 'reportAiAction' : `report-tab-${state.tab}`}"
+    ></div>
   `;
+
+  wireTabEdgeFade(root);
+  wireTabKeyboard(root);
 
   // Wire month picker
   root.querySelector('#prevMonth').addEventListener('click', () => {
@@ -534,13 +564,17 @@ export function renderReports() {
 
   // Wire tabs
   root.querySelectorAll('[data-tab]').forEach((b) => {
-    b.addEventListener('click', () => {
+    b.addEventListener('click', (event) => {
       state.tab = b.dataset.tab;
       state.drill = null;
       Telegram.haptic('selection');
-      renderReports();
+      renderReports(event.detail === 0 ? b.dataset.tab : null);
     });
   });
+
+  if (focusTabId) {
+    root.querySelector(`[data-tab="${focusTabId}"]`)?.focus();
+  }
 
   // Render the active tab
   const content = root.querySelector('#tab-content');
@@ -567,6 +601,41 @@ function wireDrill(content) {
       state.drill = { type: el.dataset.drill, category: el.dataset.drillCat };
       Telegram.haptic('selection');
       renderReports();
+    });
+  });
+}
+
+function wireTabEdgeFade(root) {
+  const shell = root.querySelector('#reportsTabShell');
+  const strip = root.querySelector('#tabStrip');
+  if (!shell || !strip) return;
+
+  const update = () => {
+    shell.classList.toggle('at-start', strip.scrollLeft <= 2);
+    shell.classList.toggle(
+      'at-end',
+      strip.scrollLeft + strip.clientWidth >= strip.scrollWidth - 2,
+    );
+  };
+
+  strip.addEventListener('scroll', update, { passive: true });
+  requestAnimationFrame(update);
+}
+
+function wireTabKeyboard(root) {
+  const tabs = [...root.querySelectorAll('[role="tab"]')];
+  tabs.forEach((tab, index) => {
+    tab.addEventListener('keydown', (event) => {
+      let targetIndex = null;
+      if (event.key === 'ArrowRight') targetIndex = (index + 1) % tabs.length;
+      if (event.key === 'ArrowLeft') targetIndex = (index - 1 + tabs.length) % tabs.length;
+      if (event.key === 'Home') targetIndex = 0;
+      if (event.key === 'End') targetIndex = tabs.length - 1;
+      if (targetIndex === null) return;
+
+      event.preventDefault();
+      tabs[targetIndex].focus();
+      tabs[targetIndex].click();
     });
   });
 }

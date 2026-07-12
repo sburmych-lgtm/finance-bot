@@ -20,8 +20,8 @@
   --ruby-gold:       #D8B56D;   /* champagne hairline accents    */
   --ruby-gold-soft:  #F2E3BE;
   --ruby-ivory:      #F7F1E7;   /* primary text                  */
-  --ruby-muted:      #B8A99D;   /* secondary text                */
-  --ruby-dim:        #7A6E66;   /* tertiary text                 */
+  --ruby-muted:      #C2B3A7;   /* secondary text, WCAG AA       */
+  --ruby-dim:        #9A8C83;   /* tertiary text, WCAG AA        */
 
   --ruby-success:    #6FB67E;
   --ruby-danger:     #D45A4F;
@@ -54,6 +54,7 @@
   --fs-24: 24px;
   --fs-32: 32px;
   --fs-44: 44px;
+  --touch-target: 44px;
 
   --lh-tight: 1.05;
   --lh-snug:  1.25;
@@ -118,7 +119,7 @@
     --ruby-gold:       #D8B56D;
     --ruby-gold-soft:  #F2E3BE;
     --ruby-ivory:      #F7F1E7;
-    --ruby-muted:      #B8A99D;
-    --ruby-dim:        #7A6E66;
+    --ruby-muted:      #C2B3A7;
+    --ruby-dim:        #9A8C83;
   }
 }
