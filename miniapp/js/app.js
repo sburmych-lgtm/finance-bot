@@ -64,6 +64,20 @@ export const Store = {
 
 window.Ruby = { Store, Api, Telegram, toast, fmtMoney, fmtDate };
 
+let authExpiryShown = false;
+window.addEventListener('ruby:auth-expired', () => {
+  if (authExpiryShown) return;
+  authExpiryShown = true;
+  const message = 'Сесія Telegram завершилась. Закрийте Mini App і відкрийте його з бота ще раз.';
+  Telegram.haptic('warning');
+  const shown = Telegram.showPopup({
+    title: 'Потрібно оновити сесію',
+    message,
+    buttons: [{ id: 'close', type: 'close' }],
+  }, () => Telegram.close());
+  if (!shown) toast(message, 8000);
+});
+
 export function navigate(screen, opts = {}) {
   if (!screens[screen]) return;
   Store.screen = screen;

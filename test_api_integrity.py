@@ -135,6 +135,20 @@ def test_tax_settings_update_is_scoped_to_requested_year(monkeypatch, tmp_path):
     assert settings["tax_config"]["profiles_by_year"]["2026"]["scheme"] == "3_percent_vat"
 
 
+def test_settings_returns_fully_resolved_profiles_for_every_supported_tax_year(
+    monkeypatch, tmp_path
+):
+    use_database(monkeypatch, tmp_path)
+
+    result = payload(run(bot.api_settings(Request())))
+
+    assert result["supported_tax_years"] == [2025, 2026]
+    assert result["tax_profiles"]["2025"]["esv_fixed"] == 1760.0
+    assert result["tax_profiles"]["2026"]["esv_fixed"] == 1902.34
+    assert result["tax_profiles"]["2025"]["year"] == 2025
+    assert result["tax_profiles"]["2026"]["year"] == 2026
+
+
 def test_tax_report_exposes_military_levy_and_vat_metadata(monkeypatch, tmp_path):
     database = use_database(monkeypatch, tmp_path)
 

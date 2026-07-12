@@ -83,6 +83,16 @@ export const Telegram = {
     try { tg?.onEvent('themeChanged', cb); } catch (_) {}
   },
 
+  showPopup(params, callback) {
+    if (!tg?.showPopup) return false;
+    try {
+      tg.showPopup(params, callback);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  },
+
   close() {
     try { tg?.close(); } catch (_) {}
   },

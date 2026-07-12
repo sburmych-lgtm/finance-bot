@@ -16,9 +16,17 @@ async function request(path, { method = 'GET', body } = {}) {
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) {
-    let detail = '';
-    try { detail = (await res.json())?.detail || ''; } catch (_) {}
-    throw new Error(detail || `HTTP ${res.status}`);
+    let payload = {};
+    try { payload = (await res.json()) || {}; } catch (_) {}
+    const error = new Error(payload.detail || `HTTP ${res.status}`);
+    error.code = payload.code || `HTTP_${res.status}`;
+    error.status = res.status;
+    if (error.code === 'INIT_DATA_EXPIRED') {
+      window.dispatchEvent(new CustomEvent('ruby:auth-expired', {
+        detail: { message: error.message },
+      }));
+    }
+    throw error;
   }
   if (res.status === 204) return null;
   return res.json();

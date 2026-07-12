@@ -1,13 +1,15 @@
 import hashlib
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from backup_service import (
+    BackupConfigurationError,
     BackupIntegrityError,
     S3BackupConfig,
     create_sqlite_snapshot,
+    prune_remote_backups,
     upload_and_verify_snapshot,
     verify_sqlite_file,
 )
@@ -35,6 +37,12 @@ class FakeS3Client:
     def delete_object(self, *, Bucket, Key):
         self.deleted.append((Bucket, Key))
         self.objects.pop((Bucket, Key), None)
+
+    def list_objects_v2(self, **kwargs):
+        return {
+            "Contents": list(getattr(self, "listed_objects", [])),
+            "IsTruncated": False,
+        }
 
 
 def _create_wal_database(path):
@@ -140,3 +148,28 @@ def test_s3_config_from_env_is_optional_and_does_not_require_static_credentials(
         secret_access_key="secret-key",
         server_side_encryption="AES256",
     )
+
+    with pytest.raises(BackupConfigurationError):
+        S3BackupConfig(bucket="ruby-backups", prefix="")
+
+
+def test_prune_remote_backups_deletes_only_expired_objects_under_prefix():
+    now = datetime(2026, 7, 12, 20, 15, tzinfo=timezone.utc)
+    client = FakeS3Client()
+    client.listed_objects = [
+        {"Key": "prod/finance-20260601T030000Z.db", "LastModified": now - timedelta(days=31)},
+        {"Key": "prod/finance-20260701T030000Z.db", "LastModified": now - timedelta(days=29)},
+        {"Key": "prod/customer-export.csv", "LastModified": now - timedelta(days=90)},
+        {"Key": "other/finance-old.db", "LastModified": now - timedelta(days=90)},
+    ]
+    config = S3BackupConfig(bucket="ruby-backups", prefix="prod")
+
+    deleted = prune_remote_backups(
+        config,
+        retention_days=30,
+        client=client,
+        now=now,
+    )
+
+    assert deleted == ["prod/finance-20260601T030000Z.db"]
+    assert client.deleted == [("ruby-backups", "prod/finance-20260601T030000Z.db")]

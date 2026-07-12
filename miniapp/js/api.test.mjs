@@ -28,3 +28,29 @@ test('deleteAccount sends an authenticated DELETE with exact confirmation', asyn
   assert.equal(calls[0].options.headers['X-Telegram-Init-Data'], 'signed-init-data');
   assert.deepEqual(JSON.parse(calls[0].options.body), { confirmation: 'ВИДАЛИТИ' });
 });
+
+test('expired Telegram auth exposes a stable code and dispatches a reopen event', async () => {
+  const events = [];
+  globalThis.window = {
+    __RUBY_API_BASE__: 'https://api.example',
+    dispatchEvent: (event) => events.push(event),
+  };
+  globalThis.CustomEvent = class CustomEvent {
+    constructor(type, options) { this.type = type; this.detail = options?.detail; }
+  };
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    detail: 'Telegram session expired. Reopen the Mini App.',
+    code: 'INIT_DATA_EXPIRED',
+  }), {
+    status: 401,
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  const { Api } = await import(`data:text/javascript,${encodeURIComponent(testableSource)}#expired`);
+  await assert.rejects(
+    Api.me(),
+    (error) => error.code === 'INIT_DATA_EXPIRED',
+  );
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, 'ruby:auth-expired');
+});

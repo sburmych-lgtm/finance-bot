@@ -16,13 +16,16 @@ import tempfile
 import uuid
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping, Protocol
 
 
 _CHUNK_SIZE = 1024 * 1024
 _SAFE_PREFIX = re.compile(r"^[A-Za-z0-9._-]+$")
+_BACKUP_OBJECT_NAME = re.compile(
+    r"^finance-\d{8}T\d{6}Z(?:-\d+)?\.db$"
+)
 
 
 class BackupError(RuntimeError):
@@ -79,6 +82,8 @@ class S3BackupConfig:
             raise BackupConfigurationError("BACKUP_S3_BUCKET must not be empty")
 
         prefix = "/".join(part for part in self.prefix.strip().split("/") if part)
+        if not prefix:
+            raise BackupConfigurationError("BACKUP_S3_PREFIX must be a dedicated non-empty prefix")
         if any(part in {".", ".."} for part in prefix.split("/") if part):
             raise BackupConfigurationError("BACKUP_S3_PREFIX contains an unsafe segment")
         if bool(self.access_key_id) != bool(self.secret_access_key):
@@ -129,6 +134,8 @@ class _S3Client(Protocol):
     def download_file(self, bucket: str, key: str, filename: str) -> None: ...
 
     def delete_object(self, *, Bucket: str, Key: str) -> object: ...
+
+    def list_objects_v2(self, **kwargs) -> dict: ...
 
 
 def _sha256_file(path: Path) -> str:
@@ -309,3 +316,66 @@ def upload_and_verify_snapshot(
         size_bytes=local.size_bytes,
         sha256=local.sha256,
     )
+
+
+def prune_remote_backups(
+    config: S3BackupConfig,
+    *,
+    retention_days: int = 30,
+    client: _S3Client | None = None,
+    now: datetime | None = None,
+) -> list[str]:
+    """Delete verified-backup objects older than the declared retention.
+
+    Bucket lifecycle rules remain a useful second layer, but enforcing the
+    same limit here keeps the privacy promise independent of provider setup.
+    Only objects under the configured prefix are ever considered.
+    """
+    if retention_days <= 0:
+        raise BackupConfigurationError("backup retention must be positive")
+
+    moment = now or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    cutoff = moment.astimezone(timezone.utc) - timedelta(days=retention_days)
+    s3 = client or _build_s3_client(config)
+    prefix = f"{config.prefix}/" if config.prefix else ""
+    continuation_token: str | None = None
+    deleted: list[str] = []
+
+    while True:
+        params = {"Bucket": config.bucket, "Prefix": prefix}
+        if continuation_token:
+            params["ContinuationToken"] = continuation_token
+        try:
+            page = s3.list_objects_v2(**params)
+        except Exception as exc:
+            raise BackupRemoteError("could not list remote backups for retention") from exc
+
+        for item in page.get("Contents") or []:
+            key = str(item.get("Key") or "")
+            modified = item.get("LastModified")
+            filename = key.rsplit("/", 1)[-1]
+            if (
+                not key.startswith(prefix)
+                or not _BACKUP_OBJECT_NAME.fullmatch(filename)
+                or not isinstance(modified, datetime)
+            ):
+                continue
+            if modified.tzinfo is None:
+                modified = modified.replace(tzinfo=timezone.utc)
+            if modified.astimezone(timezone.utc) >= cutoff:
+                continue
+            try:
+                s3.delete_object(Bucket=config.bucket, Key=key)
+            except Exception as exc:
+                raise BackupRemoteError(f"could not delete expired backup {key}") from exc
+            deleted.append(key)
+
+        if not page.get("IsTruncated"):
+            break
+        continuation_token = page.get("NextContinuationToken")
+        if not continuation_token:
+            raise BackupRemoteError("remote backup listing was truncated without a token")
+
+    return deleted

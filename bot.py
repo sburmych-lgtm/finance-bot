@@ -4,6 +4,9 @@ import sqlite3
 import json
 import hmac
 import hashlib
+import math
+import secrets
+from pathlib import Path
 from urllib.parse import parse_qsl, unquote
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -22,6 +25,18 @@ from collections import defaultdict
 import asyncio
 import aiohttp
 from aiohttp import web
+from dotenv import load_dotenv
+
+from backup_service import (
+    BackupError,
+    S3BackupConfig,
+    create_sqlite_snapshot,
+    prune_remote_backups,
+    upload_and_verify_snapshot,
+)
+from security_controls import TokenBucketLimiter
+
+load_dotenv()
 
 # Logging setup
 logging.basicConfig(
@@ -31,61 +46,135 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ========== TELEGRAM INIT DATA VALIDATION ==========
-def validate_init_data(raw_init_data: str, bot_token: str) -> dict | None:
-    """Validate Telegram Mini App initData per official HMAC-SHA256 spec.
+def parse_sentry_traces_sample_rate(raw_value, *, default=0.0) -> float:
+    """Parse a Sentry sampling rate without allowing config to brick boot."""
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        return float(default)
+    return value
 
-    Returns parsed dict (with user already JSON-decoded) on success, None on failure.
-    """
+
+def sanitize_sentry_event(event, hint):
+    """Remove credentials and financial request bodies before telemetry."""
+    sanitized = dict(event or {})
+    request = dict(sanitized.get('request') or {})
+    headers = dict(request.get('headers') or {})
+    sensitive_headers = {
+        'authorization',
+        'cookie',
+        'set-cookie',
+        'x-telegram-init-data',
+    }
+    request['headers'] = {
+        key: value
+        for key, value in headers.items()
+        if str(key).lower() not in sensitive_headers
+    }
+    request.pop('data', None)
+    request.pop('cookies', None)
+    sanitized['request'] = request
+    extra = dict(sanitized.get('extra') or {})
+    for key in tuple(extra):
+        if str(key).lower() in {'request_body', 'body', 'payload', 'init_data'}:
+            extra.pop(key, None)
+    sanitized['extra'] = extra
+    return sanitized
+
+
+try:
+    import sentry_sdk
+
+    if os.getenv('SENTRY_DSN'):
+        try:
+            sentry_sdk.init(
+                dsn=os.environ['SENTRY_DSN'],
+                traces_sample_rate=parse_sentry_traces_sample_rate(
+                    os.getenv('SENTRY_TRACES_SAMPLE_RATE', '0')
+                ),
+                send_default_pii=False,
+                max_request_body_size='never',
+                before_send=sanitize_sentry_event,
+            )
+        except Exception as exc:
+            logger.warning('Sentry disabled because initialization failed: %s', type(exc).__name__)
+except ImportError:
+    sentry_sdk = None
+
+
+# ========== TELEGRAM INIT DATA VALIDATION ==========
+def _init_data_max_age_seconds() -> int:
+    try:
+        value = int(os.getenv('INIT_DATA_MAX_AGE_SECONDS', '21600'))
+    except ValueError:
+        value = 21600
+    return value if value > 0 else 21600
+
+
+def validate_init_data_result(
+    raw_init_data: str,
+    bot_token: str,
+    max_age_seconds: int | None = None,
+) -> tuple[dict | None, str | None]:
+    """Validate signature first, then classify freshness for reliable UX."""
+    if not bot_token:
+        return None, 'INVALID_INIT_DATA'
     try:
         params = dict(parse_qsl(raw_init_data, keep_blank_values=True))
     except Exception:
-        return None
+        return None, 'INVALID_INIT_DATA'
 
     received_hash = params.pop('hash', None)
     if not received_hash:
-        return None
-
-    # Check auth_date freshness (24 h window)
-    auth_date_str = params.get('auth_date', '')
-    try:
-        auth_ts = int(auth_date_str)
-        age_seconds = datetime.now(timezone.utc).timestamp() - auth_ts
-        # Permit minor clock drift, but reject replayed data and timestamps
-        # forged materially in the future.
-        if age_seconds > 86400 or age_seconds < -30:
-            return None
-    except (ValueError, TypeError):
-        return None
-
-    # Build data-check-string: sorted key=value pairs joined by \n
+        return None, 'INVALID_INIT_DATA'
     data_check_string = '\n'.join(
-        f'{k}={v}' for k, v in sorted(params.items())
+        f'{key}={value}' for key, value in sorted(params.items())
     )
-
     secret_key = hmac.new(
-        b'WebAppData',
-        bot_token.encode(),
-        hashlib.sha256
+        b'WebAppData', bot_token.encode(), hashlib.sha256
     ).digest()
-
     expected_hash = hmac.new(
-        secret_key,
-        data_check_string.encode(),
-        hashlib.sha256
+        secret_key, data_check_string.encode(), hashlib.sha256
     ).hexdigest()
-
     if not hmac.compare_digest(expected_hash, received_hash):
-        return None
+        return None, 'INVALID_INIT_DATA'
 
-    # Decode user JSON if present
+    freshness = max_age_seconds
+    if freshness is None:
+        freshness = _init_data_max_age_seconds()
+    if freshness <= 0:
+        freshness = 21600
+    try:
+        auth_ts = int(params.get('auth_date', ''))
+        age_seconds = datetime.now(timezone.utc).timestamp() - auth_ts
+    except (TypeError, ValueError):
+        return None, 'INVALID_INIT_DATA'
+    if age_seconds > freshness:
+        return None, 'INIT_DATA_EXPIRED'
+    if age_seconds < -30:
+        return None, 'INVALID_INIT_DATA'
+
     if 'user' in params:
         try:
             params['user'] = json.loads(params['user'])
         except (json.JSONDecodeError, TypeError):
             pass
+    return params, None
 
-    return params
+
+def validate_init_data(raw_init_data: str, bot_token: str, max_age_seconds: int | None = None) -> dict | None:
+    """Validate Telegram Mini App initData per official HMAC-SHA256 spec.
+
+    Returns parsed dict (with user already JSON-decoded) on success, None on failure.
+    """
+    parsed, _error_code = validate_init_data_result(
+        raw_init_data,
+        bot_token,
+        max_age_seconds=max_age_seconds,
+    )
+    return parsed
 
 
 # Configuration
@@ -95,6 +184,102 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.environ.get('DB_FILE', os.path.join(DATA_DIR, 'finance.db'))
 SETTINGS_FILE = os.environ.get('SETTINGS_FILE', os.path.join(DATA_DIR, 'settings.json'))
 ADMIN_IDS = {x.strip() for x in os.environ.get('ADMIN_IDS', '').split(',') if x.strip()}
+
+
+def _positive_env_int(name, default):
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        value = default
+    return value if value > 0 else default
+
+
+def _env_flag(name, default=False):
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+_preauth_limiter = TokenBucketLimiter.per_minute(
+    _positive_env_int('RATE_LIMIT_PREAUTH_PER_MINUTE', 120),
+    burst=_positive_env_int('RATE_LIMIT_PREAUTH_BURST', 60),
+)
+_read_limiter = TokenBucketLimiter.per_minute(
+    _positive_env_int('RATE_LIMIT_READ_PER_MINUTE', 120),
+    burst=_positive_env_int('RATE_LIMIT_READ_BURST', 60),
+)
+_write_limiter = TokenBucketLimiter.per_minute(
+    _positive_env_int('RATE_LIMIT_WRITE_PER_MINUTE', 30),
+    burst=_positive_env_int('RATE_LIMIT_WRITE_BURST', 20),
+)
+_admin_limiter = TokenBucketLimiter.per_minute(
+    _positive_env_int('RATE_LIMIT_ADMIN_PER_MINUTE', 5),
+    burst=_positive_env_int('RATE_LIMIT_ADMIN_BURST', 3),
+)
+_broadcast_limiter = TokenBucketLimiter(capacity=1, refill_rate=1 / 300)
+_broadcast_confirmations: dict[str, dict] = {}
+
+
+def _broadcast_text_digest(text: str) -> str:
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def _issue_broadcast_confirmation(
+    admin_id,
+    text: str,
+    *,
+    recipient_ids=None,
+    ttl_seconds=600,
+) -> tuple[str, str]:
+    now = datetime.now(timezone.utc).timestamp()
+    for stale_token, preview in tuple(_broadcast_confirmations.items()):
+        if float(preview.get('expires_at', 0)) <= now:
+            _broadcast_confirmations.pop(stale_token, None)
+    token = secrets.token_urlsafe(24)
+    expires_at = now + ttl_seconds
+    _broadcast_confirmations[token] = {
+        'admin_id': str(admin_id),
+        'text_sha256': _broadcast_text_digest(text),
+        'text': text,
+        'recipient_ids': tuple(str(value) for value in (recipient_ids or ())),
+        'expires_at': expires_at,
+    }
+    return token, datetime.fromtimestamp(expires_at, timezone.utc).isoformat()
+
+
+def _broadcast_confirmation_matches(admin_id, text: str, token: str) -> bool:
+    preview = _broadcast_confirmations.get(token)
+    if not preview:
+        return False
+    now = datetime.now(timezone.utc).timestamp()
+    matches = (
+        preview.get('admin_id') == str(admin_id)
+        and preview.get('text_sha256') == _broadcast_text_digest(text)
+        and float(preview.get('expires_at', 0)) > now
+    )
+    return matches
+
+
+def _consume_broadcast_confirmation(admin_id, text: str, token: str) -> bool:
+    if not _broadcast_confirmation_matches(admin_id, text, token):
+        return False
+    _broadcast_confirmations.pop(token, None)
+    return True
+
+
+def _consume_chat_broadcast_confirmation(admin_id, token: str) -> str | None:
+    preview = _broadcast_confirmations.get(token)
+    if not preview:
+        return None
+    now = datetime.now(timezone.utc).timestamp()
+    if (
+        preview.get('admin_id') != str(admin_id)
+        or float(preview.get('expires_at', 0)) <= now
+    ):
+        return None
+    _broadcast_confirmations.pop(token, None)
+    return str(preview.get('text') or '') or None
 
 # Lock for database operations
 db_lock = asyncio.Lock()
@@ -117,6 +302,13 @@ exchange_rates_cache = {
     'USD': 41.5,
     'EUR': 45.2,
     'last_update': None
+}
+
+backup_status = {
+    'last_success': None,
+    'last_error': None,
+    'last_remote_key': None,
+    'last_checksum': None,
 }
 
 # Official standard tax rules, versioned by report year. Fixed-tax values for
@@ -143,7 +335,25 @@ TAX_RULES_BY_YEAR = {
         'military_rate': 0.01,
     },
 }
-CURRENT_TAX_RULES_YEAR = max(TAX_RULES_BY_YEAR)
+
+
+def current_tax_rules_year(*, now: datetime | None = None) -> int:
+    """Return the explicitly supported Kyiv calendar year.
+
+    We deliberately fail closed when the new year's official rules have not
+    been encoded yet, and do not switch early merely because future rules are
+    staged in the codebase.
+    """
+    moment = now or datetime.now(KYIV_TZ)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=KYIV_TZ)
+    calendar_year = moment.astimezone(KYIV_TZ).year
+    if calendar_year not in TAX_RULES_BY_YEAR:
+        raise ValueError(f'tax rules unavailable for {calendar_year}')
+    return calendar_year
+
+
+CURRENT_TAX_RULES_YEAR = current_tax_rules_year()
 TAX_DISCLAIMER = (
     'Розрахунок інформаційний і не є податковою консультацією. '
     'ПДВ та спеціальні пільги автоматично не розраховуються.'
@@ -342,6 +552,17 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_receipts_broadcast
             ON broadcast_receipts(broadcast_id)
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS admin_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT,
+                status TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
 
         self.conn.commit()
 
@@ -448,6 +669,36 @@ class Database:
             self.conn.commit()
             return cursor.rowcount > 0
 
+    async def delete_user_account(self, user_id):
+        """Irreversibly delete every row owned by one Telegram user.
+
+        The operation is intentionally one SQLite transaction: a partial
+        privacy deletion is worse than a visible failure. Shared broadcast
+        batches remain, while the user's per-recipient receipt is removed.
+        """
+        owner = str(user_id)
+        tables = (
+            'broadcast_receipts',
+            'transactions',
+            'time_tracks',
+            'subscriptions',
+            'user_settings',
+            'users',
+        )
+        async with db_lock:
+            cursor = self.conn.cursor()
+            deleted_rows = {}
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                for table in tables:
+                    cursor.execute(f'DELETE FROM {table} WHERE user_id = ?', (owner,))
+                    deleted_rows[table] = cursor.rowcount
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+        return {'deleted_user_id': owner, 'deleted_rows': deleted_rows}
+
     async def upsert_user(self, user):
         if not user:
             return
@@ -540,6 +791,35 @@ class Database:
             )
             receipts = [dict(r) for r in cursor.fetchall()]
             return {'broadcast': dict(b), 'receipts': receipts}
+
+    async def log_admin_action(self, admin_id, action, *, target=None,
+                               status='ok', metadata=None):
+        """Persist a minimal forensic record without secrets or message text."""
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "INSERT INTO admin_audit_log "
+                "(admin_id, action, target, status, metadata_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    str(admin_id),
+                    str(action)[:80],
+                    None if target is None else str(target)[:120],
+                    str(status)[:24],
+                    json.dumps(metadata or {}, ensure_ascii=False)[:2000],
+                ),
+            )
+            self.conn.commit()
+            return cursor.lastrowid
+
+    async def list_admin_audit(self, limit=100):
+        async with db_lock:
+            rows = self.conn.execute(
+                "SELECT id, admin_id, action, target, status, metadata_json, created_at "
+                "FROM admin_audit_log ORDER BY id DESC LIMIT ?",
+                (max(1, min(int(limit), 500)),),
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     async def get_subscription(self, user_id):
         async with db_lock:
@@ -1540,10 +1820,46 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• БД зберігається на Railway (хмарний хостинг, Europe/Kyiv TZ)\n"
         "• Power Olesia не має доступу до даних інших користувачів\n"
         "• `/clear` (через меню) видаляє всі ваші дані без можливості відновлення\n"
-        "• Адміністратор отримує щодобовий зашифрований бекап БД\n"
+        "• Резервні копії створюються окремо від робочої бази та перевіряються\n"
         "• Telegram бачить лише ваші повідомлення боту, не БД",
         reply_markup=get_main_keyboard(),
         parse_mode='Markdown'
+    )
+
+
+def _miniapp_public_url(path=''):
+    base = os.getenv(
+        'MINIAPP_PUBLIC_URL',
+        'https://finance-bot-production-5de8.up.railway.app',
+    ).rstrip('/')
+    return f'{base}/{path.lstrip("/")}'
+
+
+async def privacy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        '🔒 Політика приватності Ruby Finance:\n'
+        f'{_miniapp_public_url("privacy")}\n\n'
+        'Для повного видалення облікового запису використайте /clear.'
+    )
+
+
+async def terms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        '📄 Умови використання Ruby Finance:\n'
+        f'{_miniapp_public_url("terms")}'
+    )
+
+
+async def clear_account_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton('ВИДАЛИТИ ВСІ МОЇ ДАНІ', callback_data='account_delete:confirm'),
+    ], [
+        InlineKeyboardButton('Скасувати', callback_data='cancel'),
+    ]])
+    await update.message.reply_text(
+        '⚠️ Повністю видалити транзакції, записи часу, налаштування та профіль?\n\n'
+        'Цю дію неможливо скасувати.',
+        reply_markup=keyboard,
     )
 
 
@@ -1703,6 +2019,54 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data_parts = query.data.split(':')
     action = data_parts[0]
     user_id = str(query.from_user.id)
+
+    if action == 'admin_broadcast':
+        if not is_admin(user_id):
+            await query.edit_message_text('⛔ Дія доступна лише адміністратору.')
+            return
+        mode = data_parts[1] if len(data_parts) > 1 else ''
+        token = data_parts[2] if len(data_parts) > 2 else ''
+        preview = _broadcast_confirmations.get(token)
+        valid_preview = bool(
+            preview
+            and preview.get('admin_id') == user_id
+            and float(preview.get('expires_at', 0)) > datetime.now(timezone.utc).timestamp()
+        )
+        if not valid_preview:
+            await query.edit_message_text('Термін підтвердження минув. Створіть новий preview.')
+            return
+        if mode == 'cancel':
+            _broadcast_confirmations.pop(token, None)
+            await query.edit_message_text('Розсилку скасовано.')
+            return
+        if mode != 'confirm':
+            await query.edit_message_text('Невідома дія розсилки.')
+            return
+        decision = _broadcast_limiter.check(user_id)
+        if not decision.allowed:
+            await query.edit_message_text(
+                f'Зачекайте {decision.retry_after} с перед наступною розсилкою.'
+            )
+            return
+        recipient_ids = tuple(preview.get('recipient_ids') or ())
+        message_text = _consume_chat_broadcast_confirmation(user_id, token)
+        if not message_text:
+            await query.edit_message_text('Підтвердження вже використано або прострочене.')
+            return
+        await query.edit_message_text('Надсилаю підтверджену розсилку…')
+        result = await _send_broadcast_with_bot(
+            user_id,
+            message_text,
+            context.bot,
+            recipient_ids=recipient_ids,
+        )
+        await query.edit_message_text(
+            '📣 Розсилка завершена. '
+            f"Надіслано: {result['sent']}, помилок: {result['failed']}, "
+            f"пропущено: {result['skipped']}."
+        )
+        return
+
     user_settings = await user_settings_for(user_id)
     user_categories = user_settings['categories']
     user_employees = user_settings['employees']
@@ -1785,6 +2149,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("✅ Транзакцію видалено!")
         else:
             await query.edit_message_text("❌ Помилка видалення")
+        return
+
+    elif action == "account_delete":
+        if len(data_parts) < 2 or data_parts[1] != 'confirm':
+            await query.edit_message_text('❌ Невірне підтвердження.')
+            return
+        await db.delete_user_account(user_id)
+        await query.edit_message_text(
+            '✅ Ваш обліковий запис і всі пов’язані фінансові дані видалено.'
+        )
         return
 
     elif action == "settings":
@@ -3003,6 +3377,13 @@ async def admin_cleanup_users(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Команда доступна лише адміністратору.")
         return
+    admin_id = str(update.effective_user.id)
+    decision = _admin_limiter.check((admin_id, 'cleanup_users'))
+    if not decision.allowed:
+        await update.message.reply_text(
+            f'Зачекайте {decision.retry_after} с перед повторною операцією.'
+        )
+        return
     async with db_lock:
         cursor = db.conn.cursor()
         # Find users with zero activity who aren't admins
@@ -3033,6 +3414,18 @@ async def admin_cleanup_users(update: Update, context: ContextTypes.DEFAULT_TYPE
             cursor.execute("DELETE FROM subscriptions WHERE user_id = ?", (uid,))
             removed.append((uid, row['first_name'] or '?', row['username']))
         db.conn.commit()
+    await db.log_admin_action(
+        admin_id,
+        'cleanup_users',
+        target='inactive_users',
+        status='ok',
+        metadata={
+            'removed_count': len(removed),
+            'removed_ids_sha256': hashlib.sha256(
+                ','.join(sorted(str(item[0]) for item in removed)).encode('utf-8')
+            ).hexdigest(),
+        },
+    )
     text = f"🧹 *Cleanup done* · removed {len(removed)} users\n\n"
     for uid, name, uname in removed[:20]:
         text += f"`{uid}` · {name} · {('@' + uname) if uname else '—'}\n"
@@ -3062,6 +3455,14 @@ async def admin_reset_user_settings(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
+    admin_id = str(update.effective_user.id)
+    decision = _admin_limiter.check((admin_id, 'reset_user_settings'))
+    if not decision.allowed:
+        await update.message.reply_text(
+            f'Зачекайте {decision.retry_after} с перед повторною операцією.'
+        )
+        return
+
     targets: list[str] = []
     if arg == 'me':
         targets = [str(update.effective_user.id)]
@@ -3085,6 +3486,14 @@ async def admin_reset_user_settings(update: Update, context: ContextTypes.DEFAUL
             cursor.execute("DELETE FROM user_settings WHERE user_id = ?", (uid,))
         db.conn.commit()
 
+    await db.log_admin_action(
+        admin_id,
+        'reset_user_settings',
+        target=arg,
+        status='ok',
+        metadata={'target_count': len(targets)},
+    )
+
     await update.message.reply_text(
         f"🧹 Скинуто налаштувань: {len(targets)}.\n"
         f"Наступне відкриття Mini App перезапише їх з нейтрального шаблону "
@@ -3093,8 +3502,70 @@ async def admin_reset_user_settings(update: Update, context: ContextTypes.DEFAUL
     )
 
 
+async def _send_broadcast_with_bot(
+    admin_id: str,
+    message_text: str,
+    telegram_bot,
+    *,
+    recipient_ids=None,
+) -> dict:
+    """Execute a previously confirmed in-chat broadcast."""
+    user_ids = (
+        list(recipient_ids)
+        if recipient_ids is not None
+        else await db.get_all_user_ids()
+    )
+    now_str = datetime.now(KYIV_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    broadcast_id = await db.create_broadcast(message_text, now_str)
+    sent = failed = skipped = 0
+    receipts = []
+    for uid in user_ids:
+        if str(uid).startswith('999000'):
+            skipped += 1
+            receipts.append((uid, 'skipped', None, 'synthetic test id'))
+            continue
+        try:
+            sent_message = await telegram_bot.send_message(chat_id=int(uid), text=message_text)
+            sent += 1
+            receipts.append((uid, 'sent', getattr(sent_message, 'message_id', None), None))
+            await asyncio.sleep(0.05)
+        except Exception as exc:
+            failed += 1
+            receipts.append((uid, 'failed', None, type(exc).__name__))
+            logger.warning('broadcast failed for %s: %s', uid, exc)
+    await db.save_broadcast_receipts(
+        broadcast_id,
+        receipts,
+        now_str,
+        sent=sent,
+        failed=failed,
+        skipped=skipped,
+        total=len(user_ids),
+    )
+    await db.log_admin_action(
+        admin_id,
+        'broadcast',
+        target='all_users',
+        metadata={
+            'broadcast_id': broadcast_id,
+            'text_sha256': _broadcast_text_digest(message_text),
+            'text_length': len(message_text),
+            'sent': sent,
+            'failed': failed,
+            'skipped': skipped,
+        },
+    )
+    return {
+        'broadcast_id': broadcast_id,
+        'sent': sent,
+        'failed': failed,
+        'skipped': skipped,
+        'total_users': len(user_ids),
+    }
+
+
 async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Broadcast message to all users — admin only"""
+    """Preview a broadcast; sending requires the inline confirmation."""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Команда доступна лише адміністратору.")
         return
@@ -3106,49 +3577,104 @@ async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Приклад: /broadcast 🛠 Бот оновлено, доступні нові функції."
         )
         return
-    message_text = parts[1]
+    admin_id = str(update.effective_user.id)
+    message_text = parts[1].strip()
+    if len(message_text) > 4096:
+        await update.message.reply_text('Текст розсилки не може перевищувати 4096 символів.')
+        return
     user_ids = await db.get_all_user_ids()
     if not user_ids:
         await update.message.reply_text("📭 Поки що немає користувачів у БД.")
         return
-    sent, failed = 0, 0
-    for uid in user_ids:
-        try:
-            await context.bot.send_message(chat_id=int(uid), text=message_text)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            failed += 1
-            logger.warning(f"broadcast failed for {uid}: {e}")
-    await update.message.reply_text(f"📣 Розсилка завершена. Надіслано: {sent}, помилок: {failed}.")
+    skipped = sum(str(uid).startswith('999000') for uid in user_ids)
+    token, _expires_at = _issue_broadcast_confirmation(
+        admin_id,
+        message_text,
+        recipient_ids=user_ids,
+    )
+    controls = (
+        f'Отримувачів: {len(user_ids) - skipped}; пропущено QA: {skipped}.\n'
+        'Надсилання почнеться лише після підтвердження.'
+    )
+    markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                'Надіслати всім',
+                callback_data=f'admin_broadcast:confirm:{token}',
+            ),
+            InlineKeyboardButton(
+                'Скасувати',
+                callback_data=f'admin_broadcast:cancel:{token}',
+            ),
+        ]])
+    if len(message_text) > 3500:
+        await update.message.reply_text('📣 Попередній перегляд розсилки:')
+        await update.message.reply_text(message_text)
+        await update.message.reply_text(controls, reply_markup=markup)
+    else:
+        await update.message.reply_text(
+            f'📣 Попередній перегляд розсилки\n\n{message_text}\n\n{controls}',
+            reply_markup=markup,
+        )
 
 
 async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Send finance.db to first admin chat once per day"""
-    if not ADMIN_IDS:
-        return
-    admin_id = sorted(ADMIN_IDS)[0]
+    """Create a consistent snapshot and verify/prune an off-site copy."""
+    admin_id = sorted(ADMIN_IDS)[0] if ADMIN_IDS else None
+    backup_dir = Path(DATA_DIR) / 'backups'
     try:
         if not os.path.exists(DB_FILE):
             return
-        ts = datetime.now(KYIV_TZ).strftime('%Y%m%d-%H%M')
-        with open(DB_FILE, 'rb') as f:
-            await context.bot.send_document(
-                chat_id=int(admin_id),
-                document=f,
-                filename=f'finance-backup-{ts}.db',
-                caption=f'🗄 Daily DB backup ({ts} Kyiv)'
+        artifact = await asyncio.to_thread(
+            create_sqlite_snapshot,
+            DB_FILE,
+            backup_dir,
+            prefix='finance',
+        )
+        config = S3BackupConfig.from_env()
+        if config is not None:
+            remote = await asyncio.to_thread(upload_and_verify_snapshot, artifact, config)
+            backup_status['last_remote_key'] = remote.key
+            logger.info('verified off-site backup s3://%s/%s', remote.bucket, remote.key)
+            retention_days = _positive_env_int('BACKUP_REMOTE_RETENTION_DAYS', 30)
+            await asyncio.to_thread(
+                prune_remote_backups,
+                config,
+                retention_days=retention_days,
             )
-        if os.path.exists(SETTINGS_FILE):
-            with open(SETTINGS_FILE, 'rb') as f:
-                await context.bot.send_document(
-                    chat_id=int(admin_id),
-                    document=f,
-                    filename=f'settings-backup-{ts}.json'
-                )
-        logger.info(f"daily backup sent to {admin_id}")
+        elif _env_flag('BACKUP_REQUIRED'):
+            raise BackupError('off-site backup is required but not configured')
+        else:
+            logger.warning('off-site backup is not configured; retained verified local snapshot only')
+
+        backup_status.update({
+            'last_success': datetime.now(timezone.utc).isoformat(),
+            'last_error': None,
+            'last_checksum': artifact.sha256,
+        })
     except Exception as e:
+        backup_status['last_error'] = type(e).__name__
         logger.warning(f"backup failed: {e}")
+        if admin_id is not None:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(admin_id),
+                    text=f'⚠️ Ruby Finance backup failed: {type(e).__name__}',
+                )
+            except Exception:
+                pass
+    finally:
+        # A remote outage must not fill the Railway Volume with local copies.
+        retain = _positive_env_int('BACKUP_LOCAL_RETENTION', 7)
+        try:
+            snapshots = sorted(
+                backup_dir.glob('finance-*.db'),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for stale in snapshots[retain:]:
+                stale.unlink(missing_ok=True)
+        except Exception:
+            logger.exception('local backup retention cleanup failed')
 
 
 async def post_init_notify(application: Application):
@@ -3245,27 +3771,85 @@ async def init_data_middleware(request: web.Request, handler):
     if request.path in _SKIP_AUTH_PATHS:
         return await handler(request)
 
-    raw = (
-        request.headers.get('X-Telegram-Init-Data')
-        or request.rel_url.query.get('initData', '')
-    )
+    raw = request.headers.get('X-Telegram-Init-Data', '')
 
     bot_token = os.getenv('TELEGRAM_BOT_TOKEN', '')
-    parsed = validate_init_data(raw, bot_token) if raw else None
+    parsed, validation_code = (
+        validate_init_data_result(raw, bot_token)
+        if raw else (None, 'INVALID_INIT_DATA')
+    )
 
     if parsed is None:
-        return web.json_response({'detail': 'Invalid initData'}, status=401)
+        code = validation_code or 'INVALID_INIT_DATA'
+        detail = (
+            'Telegram session expired. Reopen the Mini App.'
+            if code == 'INIT_DATA_EXPIRED'
+            else 'Invalid initData'
+        )
+        return web.json_response({'detail': detail, 'code': code}, status=401)
 
     tg_user = parsed.get('user') or {}
     user_id_val = tg_user.get('id')
     # Reject auth that passes HMAC but carries no user.id — without this guard
     # every such request would aggregate into one shared "" bucket in the DB.
     if not user_id_val:
-        return web.json_response({'detail': 'user id missing'}, status=401)
+        return web.json_response(
+            {'detail': 'user id missing', 'code': 'INVALID_INIT_DATA'}, status=401)
     request['user_id'] = str(user_id_val)
     request['tg_user'] = tg_user
-    # Auto-register the user so /admin_stats reflects real activity, even if
-    # they only ever launched the Mini App and never sent /start.
+    return await handler(request)
+
+
+def _rate_limited_response(decision):
+    response = _json_response(
+        {'detail': 'Too many requests. Please retry later.', 'code': 'RATE_LIMITED'},
+        status=429,
+    )
+    response.headers.update(decision.headers())
+    return response
+
+
+@web.middleware
+async def preauth_rate_limit_middleware(request: web.Request, handler):
+    """Best-effort protection for public endpoints and invalid-HMAC floods."""
+    if request.method == 'OPTIONS':
+        return await handler(request)
+    key = request.remote or 'unknown'
+    decision = _preauth_limiter.check((key, request.path))
+    if not decision.allowed:
+        return _rate_limited_response(decision)
+    return await handler(request)
+
+
+@web.middleware
+async def user_rate_limit_middleware(request: web.Request, handler):
+    """Per-user quotas after successful Telegram authentication."""
+    if request.method == 'OPTIONS' or request.path in _SKIP_AUTH_PATHS:
+        return await handler(request)
+    user_id = str(request.get('user_id', ''))
+    if not user_id:
+        return _json_response({'detail': 'Invalid initData'}, status=401)
+
+    if request.path.startswith('/api/admin/'):
+        limiter = _admin_limiter
+    elif request.method in {'POST', 'PATCH', 'PUT', 'DELETE'}:
+        limiter = _write_limiter
+    else:
+        limiter = _read_limiter
+    decision = limiter.check(user_id)
+    if not decision.allowed:
+        return _rate_limited_response(decision)
+    response = await handler(request)
+    response.headers.update(decision.headers())
+    return response
+
+
+@web.middleware
+async def user_context_middleware(request: web.Request, handler):
+    """Register/auth-context only after the request passes its user quota."""
+    if request.method == 'OPTIONS' or request.path in _SKIP_AUTH_PATHS:
+        return await handler(request)
+    tg_user = request.get('tg_user') or {}
     try:
         await db.upsert_user(_UserObj(tg_user))
     except Exception as e:
@@ -3309,7 +3893,42 @@ async def _ensure_fresh_rates():
 # ---- route handlers ----
 
 async def api_health(request: web.Request):
-    return _json_response({'ok': True, 'service': 'ruby-finance-api'})
+    try:
+        async with db_lock:
+            db.conn.execute('SELECT 1').fetchone()
+        database_ok = True
+    except Exception:
+        logger.exception('health database probe failed')
+        database_ok = False
+    try:
+        offsite_configured = S3BackupConfig.from_env() is not None
+        backup_config_error = None
+    except BackupError as exc:
+        offsite_configured = False
+        backup_config_error = type(exc).__name__
+    backup_required = _env_flag('BACKUP_REQUIRED')
+    backup_ready = bool(
+        offsite_configured
+        and backup_status.get('last_success')
+        and backup_status.get('last_remote_key')
+        and not backup_status.get('last_error')
+    )
+    service_ready = database_ok and (not backup_required or backup_ready)
+    payload = {
+        'ok': service_ready,
+        'service': 'ruby-finance-api',
+        'build': os.getenv('RAILWAY_GIT_COMMIT_SHA') or os.getenv('BUILD_ID'),
+        'database': 'ok' if database_ok else 'error',
+        'backup': {
+            'required': backup_required,
+            'ready': backup_ready,
+            'offsite_configured': offsite_configured,
+            'configuration_error': backup_config_error,
+            'last_success': backup_status['last_success'],
+            'last_error': backup_status['last_error'],
+        },
+    }
+    return _json_response(payload, status=200 if service_ready else 503)
 
 
 async def api_me(request: web.Request):
@@ -3598,12 +4217,17 @@ async def api_categories(request: web.Request):
 
 async def api_settings(request: web.Request):
     s = await user_settings_for(request['user_id'])
+    tax_config = s.get('tax_config', {})
     return _json_response({
         'employees': s.get('employees', []),
-        'tax_config': s.get('tax_config', {}),
+        'tax_config': tax_config,
         'tax_year': CURRENT_TAX_RULES_YEAR,
         'tax_profile': tax_profile_for_year(
-            s.get('tax_config', {}), CURRENT_TAX_RULES_YEAR),
+            tax_config, CURRENT_TAX_RULES_YEAR),
+        'tax_profiles': {
+            str(year): tax_profile_for_year(tax_config, year)
+            for year in sorted(TAX_RULES_BY_YEAR)
+        },
         'supported_tax_years': sorted(TAX_RULES_BY_YEAR),
     })
 
@@ -4298,6 +4922,30 @@ async def api_time_tracks_delete(request: web.Request):
     return web.Response(status=204)
 
 
+# ---- privacy / account deletion ----
+
+ACCOUNT_DELETE_CONFIRMATION = 'ВИДАЛИТИ'
+
+
+async def api_account_delete(request: web.Request):
+    """Permanently delete the authenticated user's complete account data."""
+    user_id = request['user_id']
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+    confirmation = body.get('confirmation') if isinstance(body, dict) else None
+    if not isinstance(confirmation, str) or confirmation.strip() != ACCOUNT_DELETE_CONFIRMATION:
+        return _json_response(
+            {'detail': f'confirmation must be exactly {ACCOUNT_DELETE_CONFIRMATION}'},
+            status=400,
+        )
+
+    result = await db.delete_user_account(user_id)
+    logger.info('account data deleted for authenticated user=%s', user_id)
+    return _json_response({'ok': True, **result})
+
+
 # ---- tax settings ----
 
 async def api_settings_tax_update(request: web.Request):
@@ -4390,6 +5038,7 @@ async def api_admin_broadcast(request: web.Request):
     'chat not found' for stale entries."""
     if not is_admin(request['user_id']):
         return _json_response({'detail': 'admin only'}, status=403)
+    admin_id = request['user_id']
     try:
         body = await request.json()
     except Exception:
@@ -4398,11 +5047,45 @@ async def api_admin_broadcast(request: web.Request):
     text = (body.get('text') or '').strip()
     if not text:
         return _json_response({'detail': 'text required'}, status=400)
+    if len(text) > 4096:
+        return _json_response({'detail': 'text cannot exceed 4096 characters'}, status=400)
 
-    user_ids = await db.get_all_user_ids()
+    if body.get('confirm') is not True:
+        user_ids = await db.get_all_user_ids()
+        skipped = sum(str(uid).startswith('999000') for uid in user_ids)
+        confirmation_token, expires_at = _issue_broadcast_confirmation(
+            admin_id,
+            text,
+            recipient_ids=user_ids,
+        )
+        return _json_response({
+            'preview': True,
+            'confirmation_token': confirmation_token,
+            'expires_at': expires_at,
+            'text_sha256': _broadcast_text_digest(text),
+            'text_length': len(text),
+            'total_users': len(user_ids),
+            'eligible': len(user_ids) - skipped,
+            'skipped': skipped,
+        })
+
+    confirmation_token = str(body.get('confirmation_token') or '')
+    if not _broadcast_confirmation_matches(admin_id, text, confirmation_token):
+        return _json_response(
+            {'detail': 'invalid, expired, or already used confirmation token'},
+            status=400,
+        )
+    preview_record = _broadcast_confirmations[confirmation_token]
+    decision = _broadcast_limiter.check(admin_id)
+    if not decision.allowed:
+        return _rate_limited_response(decision)
+
+    user_ids = list(preview_record.get('recipient_ids') or ())
     token = os.getenv('TELEGRAM_BOT_TOKEN', '')
     if not token:
         return _json_response({'detail': 'bot token unavailable'}, status=500)
+    if not _consume_broadcast_confirmation(admin_id, text, confirmation_token):
+        return _json_response({'detail': 'confirmation already used'}, status=409)
 
     now_str = datetime.now(KYIV_TZ).strftime('%Y-%m-%d %H:%M:%S')
     broadcast_id = await db.create_broadcast(text, now_str)
@@ -4444,10 +5127,24 @@ async def api_admin_broadcast(request: web.Request):
         sent=len(sent_ids), failed=len(failed_ids),
         skipped=len(skipped_ids), total=len(user_ids),
     )
+    await db.log_admin_action(
+        admin_id,
+        'broadcast',
+        target='all_users',
+        metadata={
+            'broadcast_id': broadcast_id,
+            'text_sha256': hashlib.sha256(text.encode()).hexdigest(),
+            'text_length': len(text),
+            'sent': len(sent_ids),
+            'failed': len(failed_ids),
+            'skipped': len(skipped_ids),
+        },
+    )
 
     logger.info(f"API admin broadcast #{broadcast_id}: sent={len(sent_ids)} "
                 f"failed={len(failed_ids)} skipped={len(skipped_ids)}")
     return _json_response({
+        'confirmed': True,
         'broadcast_id': broadcast_id,
         'sent': len(sent_ids), 'failed': len(failed_ids), 'skipped': len(skipped_ids),
         'total_users': len(user_ids),
@@ -4461,6 +5158,12 @@ async def api_admin_broadcasts_list(request: web.Request):
         return _json_response({'detail': 'admin only'}, status=403)
     rows = await db.list_broadcasts(limit=50)
     return _json_response({'broadcasts': rows})
+
+
+async def api_admin_audit(request: web.Request):
+    if not is_admin(request['user_id']):
+        return _json_response({'detail': 'admin only'}, status=403)
+    return _json_response({'events': await db.list_admin_audit(limit=100)})
 
 
 async def api_admin_broadcast_detail(request: web.Request):
@@ -4497,7 +5200,14 @@ def build_api_app() -> web.Application:
     """Build and return the aiohttp API application."""
     # Order matters: json_errors first (catches everything else), then CORS
     # (so the error JSON also carries CORS headers), then init-data auth.
-    app = web.Application(middlewares=[json_errors_middleware, cors_middleware, init_data_middleware])
+    app = web.Application(middlewares=[
+        json_errors_middleware,
+        cors_middleware,
+        preauth_rate_limit_middleware,
+        init_data_middleware,
+        user_rate_limit_middleware,
+        user_context_middleware,
+    ])
     app.router.add_route('GET', '/api/health', api_health)
     app.router.add_route('GET', '/api/me', api_me)
     app.router.add_route('GET', '/api/exchange-rates', api_exchange_rates)
@@ -4540,10 +5250,12 @@ def build_api_app() -> web.Application:
     # tax settings
     app.router.add_route('PATCH', '/api/settings/tax', api_settings_tax_update)
     app.router.add_route('DELETE', '/api/settings', api_settings_reset)
+    app.router.add_route('DELETE', '/api/account', api_account_delete)
     # admin
     app.router.add_route('POST', '/api/admin/broadcast', api_admin_broadcast)
     app.router.add_route('GET', '/api/admin/broadcasts', api_admin_broadcasts_list)
     app.router.add_route('GET', '/api/admin/broadcasts/{id}', api_admin_broadcast_detail)
+    app.router.add_route('GET', '/api/admin/audit', api_admin_audit)
     app.router.add_route('GET', '/api/admin/users', api_admin_users)
 
     # Catch-all OPTIONS for CORS preflight on any path
@@ -4567,6 +5279,9 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("info", show_info))
     application.add_handler(CommandHandler("settings", show_settings))
+    application.add_handler(CommandHandler("privacy", privacy_command))
+    application.add_handler(CommandHandler("terms", terms_command))
+    application.add_handler(CommandHandler(["clear", "очистити"], clear_account_command))
     application.add_handler(CommandHandler("admin_stats", admin_stats))
     application.add_handler(CommandHandler("stats", admin_stats))  # short alias
     application.add_handler(CommandHandler("admin", admin_stats))  # shorter alias
@@ -4585,7 +5300,12 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
 
     # Daily DB backup at 03:00 Kyiv time
-    if application.job_queue and ADMIN_IDS:
+    if application.job_queue:
+        application.job_queue.run_once(
+            daily_backup_job,
+            when=10,
+            name='startup_backup',
+        )
         application.job_queue.run_daily(
             daily_backup_job,
             time=_dt.time(hour=3, minute=0, tzinfo=KYIV_TZ),

@@ -76,7 +76,7 @@ function renderMain(root) {
       <div class="section-head"><div class="section-title">Податки</div></div>
       <div class="row-list">
         <div class="row" data-go="tax"><div class="avatar">%</div>
-          <div><div class="row-title">ФОП 3 група</div><div class="row-meta">Ставка єдиного податку та ЄСВ</div></div>
+          <div><div class="row-title">Податковий профіль</div><div class="row-meta">Група, ставки та правила за роками</div></div>
           <div class="row-chevron">›</div></div>
       </div>
     </div>
@@ -403,7 +403,7 @@ const TAX_GROUPS = [
   { id: 'none', label: 'Я не ФОП',        hint: 'Фізособа — нічого не нараховуємо' },
 ];
 
-async function renderTaxSettings(root) {
+async function renderTaxSettings(root, selectedTaxYear = null) {
   root.innerHTML = backHeader('Податкові налаштування');
   wireBack(root);
   const body = document.createElement('div');
@@ -413,8 +413,17 @@ async function renderTaxSettings(root) {
   try {
     const s = await Api.settings();
     const tax = s?.tax_config || {};
-    const taxYear = Number(s?.tax_year || new Date().getFullYear());
-    const profile = s?.tax_profile || tax?.profiles_by_year?.[String(taxYear)] || tax;
+    const supportedYears = Array.isArray(s?.supported_tax_years)
+      ? s.supported_tax_years.map(Number).filter(Number.isFinite)
+      : [Number(s?.tax_year || new Date().getFullYear())];
+    const defaultYear = Number(s?.tax_year || supportedYears.at(-1));
+    const taxYear = supportedYears.includes(Number(selectedTaxYear))
+      ? Number(selectedTaxYear)
+      : defaultYear;
+    const profile = s?.tax_profiles?.[String(taxYear)]
+      || (taxYear === defaultYear ? s?.tax_profile : null)
+      || tax?.profiles_by_year?.[String(taxYear)]
+      || tax;
     const group = profile.group || 'fop3';
     const scheme = profile.scheme || '5_percent';
     const fop1 = profile.fop1_fixed ?? 332.80;
@@ -422,7 +431,7 @@ async function renderTaxSettings(root) {
     const esv = profile.esv_fixed ?? 1902.34;
     const militaryFixed = profile.military_fixed ?? 864.70;
     const militaryRate = profile.military_rate ?? 0.01;
-    const draft = { scheme, fop1, fop2, esv, militaryFixed, militaryRate };
+    const draft = { scheme, fop1, fop2, esv, militaryFixed, militaryRate, taxYear };
 
     const groupCards = TAX_GROUPS.map((g) => `
       <button class="tax-group-card ${group === g.id ? 'active' : ''}" data-group="${esc(g.id)}">
@@ -432,6 +441,13 @@ async function renderTaxSettings(root) {
     `).join('');
 
     body.innerHTML = `
+      <div class="panel" style="padding: var(--sp-4); margin-bottom: var(--sp-3);">
+        <label for="taxYearSelect" style="font-size:10px; letter-spacing:.14em; text-transform:uppercase; font-weight:800; color: var(--ruby-gold); display:block; margin-bottom: var(--sp-2);">Рік податкових правил</label>
+        <select class="input" id="taxYearSelect">
+          ${supportedYears.map((year) => `<option value="${esc(String(year))}" ${year === taxYear ? 'selected' : ''}>${esc(String(year))}</option>`).join('')}
+        </select>
+      </div>
+
       <div class="panel" style="padding: var(--sp-4);">
         <label style="font-size:10px; letter-spacing:.14em; text-transform:uppercase; font-weight:800; color: var(--ruby-gold); display:block; margin-bottom: var(--sp-2);">Оберіть групу · правила ${esc(String(taxYear))}</label>
         <div class="tax-group-grid">${groupCards}</div>
@@ -453,6 +469,10 @@ async function renderTaxSettings(root) {
         </div>
       </div>
     `;
+
+    body.querySelector('#taxYearSelect')?.addEventListener('change', (event) => {
+      renderTaxSettings(root, Number(event.target.value));
+    });
 
     // Reactive group selector — re-renders fields panel when group changes
     body.querySelectorAll('[data-group]').forEach((btn) => {
@@ -519,7 +539,7 @@ function captureTaxDraft(root, draft) {
   if (['5_percent', '3_percent_vat'].includes(scheme)) draft.scheme = scheme;
 }
 
-function renderTaxFields(group, { scheme, fop1, fop2, esv, militaryFixed, militaryRate }) {
+function renderTaxFields(group, { scheme, fop1, fop2, esv, militaryFixed, militaryRate, taxYear }) {
   if (group === 'none') {
     return `
       <div class="empty-state" style="padding: var(--sp-4);">
@@ -535,14 +555,14 @@ function renderTaxFields(group, { scheme, fop1, fop2, esv, militaryFixed, milita
       <div class="field">
         <label>Єдиний податок (₴/міс)</label>
         <input class="input" id="taxFop1" type="number" step="1" min="0" max="10000" value="${esc(String(fop1))}">
-        <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">До 10% прожиткового мінімуму. Максимум у 2026 році — 332,80 ₴; місцева ставка може бути нижчою.</p>
+        <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">До 10% прожиткового мінімуму. Максимум за правилами ${esc(String(taxYear))} року — ${esc(String(fop1).replace('.', ','))} ₴; місцева ставка може бути нижчою.</p>
       </div>`;
   } else if (group === 'fop2') {
     html += `
       <div class="field">
         <label>Єдиний податок (₴/міс)</label>
         <input class="input" id="taxFop2" type="number" step="1" min="0" max="20000" value="${esc(String(fop2))}">
-        <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">До 20% мінімальної зарплати. Максимум у 2026 році — 1 729,40 ₴; місцева ставка може бути нижчою.</p>
+        <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">До 20% мінімальної зарплати. Максимум за правилами ${esc(String(taxYear))} року — ${esc(Number(fop2).toLocaleString('uk-UA', { minimumFractionDigits: 2, maximumFractionDigits: 2 }))} ₴; місцева ставка може бути нижчою.</p>
       </div>`;
   } else {  // fop3
     html += `
@@ -559,7 +579,7 @@ function renderTaxFields(group, { scheme, fop1, fop2, esv, militaryFixed, milita
     <div class="field">
       <label>Фіксований ЄСВ (₴/міс)</label>
       <input class="input" id="taxEsv" type="number" step="1" min="0" max="50000" value="${esc(String(esv))}">
-      <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">22% × мінімальна зарплата. Мінімальний платіж у 2026 році — 1 902,34 ₴.</p>
+      <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">22% × мінімальна зарплата. Мінімальний платіж за правилами ${esc(String(taxYear))} року — ${esc(Number(esv).toLocaleString('uk-UA', { minimumFractionDigits: 2, maximumFractionDigits: 2 }))} ₴.</p>
     </div>
     <div class="field">
       <label>Військовий збір</label>
