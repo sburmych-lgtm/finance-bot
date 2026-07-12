@@ -115,6 +115,34 @@ def test_repeated_transaction_post_is_idempotent_per_user(monkeypatch, tmp_path)
     assert len(run(database.get_transactions("user-2"))) == 1
 
 
+def test_reused_client_request_id_with_different_payload_is_a_conflict(
+    monkeypatch, tmp_path
+):
+    database = use_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        bot,
+        "get_exchange_rate",
+        lambda _currency: asyncio.sleep(0, result=1.0),
+    )
+    key = "req-conflict-0001"
+
+    created = run(
+        bot.api_post_transaction(
+            Request(body=transaction_body(client_request_id=key))
+        )
+    )
+    conflict = run(
+        bot.api_post_transaction(
+            Request(body=transaction_body(client_request_id=key, amount=41))
+        )
+    )
+
+    assert created.status == 201
+    assert conflict.status == 409
+    assert payload(conflict)["code"] == "IDEMPOTENCY_CONFLICT"
+    assert len(run(database.get_transactions("user-1"))) == 1
+
+
 def test_concurrent_duplicate_posts_create_exactly_one_transaction(monkeypatch, tmp_path):
     database = use_database(monkeypatch, tmp_path)
     monkeypatch.setattr(

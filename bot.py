@@ -4246,6 +4246,33 @@ def _transaction_write_response(row: dict, *, duplicate: bool):
     }
 
 
+def _idempotency_payload_matches(
+    row: dict,
+    *,
+    amount: float,
+    currency: str,
+    t_type: str,
+    category: str,
+    subcategory: str | None,
+    description: str,
+) -> bool:
+    return (
+        math.isclose(float(row['amount']), amount, rel_tol=0, abs_tol=1e-9)
+        and row['currency'] == currency
+        and row['type'] == t_type
+        and row['category'] == category
+        and (row.get('subcategory') or None) == subcategory
+        and (row.get('description') or '') == description
+    )
+
+
+def _idempotency_conflict_response():
+    return _json_response({
+        'detail': 'client_request_id was already used for a different transaction',
+        'code': 'IDEMPOTENCY_CONFLICT',
+    }, status=409)
+
+
 async def api_post_transaction(request: web.Request):
     user_id = request['user_id']
     tg_user = request['tg_user']
@@ -4260,20 +4287,6 @@ async def api_post_transaction(request: web.Request):
     client_request_id, err = _parse_client_request_id(body)
     if err is not None:
         return err
-    if client_request_id is not None:
-        existing = await db.get_transaction_by_client_request_id(
-            user_id, client_request_id
-        )
-        if existing is not None:
-            await db.upsert_user(_UserObj(tg_user))
-            logger.info(
-                "API POST /api/transactions idempotent replay "
-                f"user={user_id} id={existing['id']}"
-            )
-            return _json_response(
-                _transaction_write_response(existing, duplicate=True)
-            )
-
     t_type = body.get('type')
     if t_type not in ('income', 'expense'):
         return _json_response({'detail': 'type must be income or expense'}, status=400)
@@ -4316,6 +4329,30 @@ async def api_post_transaction(request: web.Request):
             status=400,
         )
 
+    if client_request_id is not None:
+        existing = await db.get_transaction_by_client_request_id(
+            user_id, client_request_id
+        )
+        if existing is not None:
+            if not _idempotency_payload_matches(
+                existing,
+                amount=amount,
+                currency=currency,
+                t_type=t_type,
+                category=category,
+                subcategory=subcategory,
+                description=description,
+            ):
+                return _idempotency_conflict_response()
+            await db.upsert_user(_UserObj(tg_user))
+            logger.info(
+                "API POST /api/transactions idempotent replay "
+                f"user={user_id} id={existing['id']}"
+            )
+            return _json_response(
+                _transaction_write_response(existing, duplicate=True)
+            )
+
     rate = await get_exchange_rate(currency)
     amount_uah = round(convert_to_uah(amount, currency, rate), 2)
     # Reject sub-kopiyka amounts: storing amount=0.001 UAH and amount_uah=0.0
@@ -4346,6 +4383,16 @@ async def api_post_transaction(request: web.Request):
         )
         if existing is None:
             raise
+        if not _idempotency_payload_matches(
+            existing,
+            amount=amount,
+            currency=currency,
+            t_type=t_type,
+            category=category,
+            subcategory=subcategory,
+            description=description,
+        ):
+            return _idempotency_conflict_response()
         await db.upsert_user(_UserObj(tg_user))
         logger.info(
             "API POST /api/transactions concurrent idempotent replay "
