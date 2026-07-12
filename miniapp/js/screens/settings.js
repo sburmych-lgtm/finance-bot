@@ -4,6 +4,10 @@ import { Store, navigate } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
 import { toast, esc, setHTML } from '../ui.js';
+import {
+  ACCOUNT_DELETE_CONFIRMATION,
+  isAccountDeleteConfirmation,
+} from '../privacy.js';
 
 const state = {
   section: 'main',  // main | expense_cats | income_cats | time_cats | employees | tax | privacy
@@ -575,18 +579,23 @@ function renderPrivacy(root) {
     <div class="panel" style="padding: var(--sp-4);">
       <p style="color: var(--ruby-ivory); font-weight: 700; margin-top: 0;">Де зберігаються дані</p>
       <p style="color: var(--ruby-muted); font-size: var(--fs-13); line-height: 1.6;">
-        Усі ваші транзакції, час і налаштування зберігаються в SQLite-базі на Railway Volume у EU-регіоні.
+        Усі ваші транзакції, час і налаштування зберігаються в SQLite-базі на інфраструктурі Railway.
         Дані ізольовано за вашим Telegram ID — інші користувачі їх не бачать.
       </p>
       <p style="color: var(--ruby-ivory); font-weight: 700; margin-top: var(--sp-4);">Хто має доступ</p>
       <p style="color: var(--ruby-muted); font-size: var(--fs-13); line-height: 1.6;">
-        Тільки ви та адміністратор сервісу для технічного супроводу та щодобових бекапів.
+        З боку Ruby Finance доступ має лише адміністратор у межах технічного супроводу.
         AI-сервіси (ChatGPT, Claude) дані НЕ отримують — все що передається їм, ви робите вручну.
       </p>
       <p style="color: var(--ruby-ivory); font-weight: 700; margin-top: var(--sp-4);">Право на видалення</p>
       <p style="color: var(--ruby-muted); font-size: var(--fs-13); line-height: 1.6;">
-        Повне видалення транзакцій і налаштувань доступне в чаті бота через команду <b>/очистити</b>.
+        Ви можете назавжди видалити профіль, фінансові операції, записи часу,
+        налаштування та статус підписки у «Небезпечній зоні» нижче.
       </p>
+      <div class="legal-links" aria-label="Юридичні документи">
+        <a href="/privacy" target="_blank" rel="noopener noreferrer">Політика приватності</a>
+        <a href="/terms" target="_blank" rel="noopener noreferrer">Умови користування</a>
+      </div>
     </div>
     <div class="panel" style="padding: var(--sp-4); margin-top: var(--sp-3);">
       <button class="btn btn-secondary" id="resetBtn">
@@ -596,6 +605,34 @@ function renderPrivacy(root) {
         Скидає тільки <b>налаштування</b> (працівники, категорії, податки) до базового стану.
         Транзакції та час залишаються незмінними.
       </p>
+    </div>
+    <div class="panel danger-zone" aria-labelledby="deleteAccountTitle">
+      <div class="danger-zone-kicker">Небезпечна зона</div>
+      <h3 id="deleteAccountTitle">Видалити акаунт і всі дані</h3>
+      <p>
+        Цю дію неможливо скасувати. Для підтвердження введіть
+        <strong>${ACCOUNT_DELETE_CONFIRMATION}</strong> без пробілів.
+      </p>
+      <label class="danger-confirm-label" for="deleteAccountConfirmation">
+        Підтвердження
+      </label>
+      <input
+        class="input danger-confirm-input"
+        id="deleteAccountConfirmation"
+        type="text"
+        autocomplete="off"
+        autocapitalize="characters"
+        spellcheck="false"
+        aria-describedby="deleteAccountHint deleteAccountStatus"
+        placeholder="${ACCOUNT_DELETE_CONFIRMATION}"
+      >
+      <div class="danger-confirm-hint" id="deleteAccountHint">
+        Буде видалено лише ваш акаунт. Дані інших користувачів не зміняться.
+      </div>
+      <div class="danger-status" id="deleteAccountStatus" role="status" aria-live="polite"></div>
+      <button class="btn danger-delete-btn" id="deleteAccountBtn" disabled>
+        Назавжди видалити акаунт
+      </button>
     </div>
   `;
   root.appendChild(body);
@@ -613,6 +650,63 @@ function renderPrivacy(root) {
       toast(e.message || 'Помилка');
     }
   });
+
+  const confirmationInput = body.querySelector('#deleteAccountConfirmation');
+  const deleteButton = body.querySelector('#deleteAccountBtn');
+  const deleteStatus = body.querySelector('#deleteAccountStatus');
+  let deleting = false;
+
+  const showDeleteStatus = (message, kind = '') => {
+    deleteStatus.textContent = message;
+    deleteStatus.className = `danger-status${kind ? ` ${kind}` : ''}`;
+  };
+
+  const syncDeleteButton = () => {
+    const confirmed = isAccountDeleteConfirmation(confirmationInput.value);
+    deleteButton.disabled = deleting || !confirmed;
+    deleteButton.setAttribute('aria-busy', deleting ? 'true' : 'false');
+  };
+
+  confirmationInput.addEventListener('input', () => {
+    if (!deleting) showDeleteStatus('');
+    syncDeleteButton();
+  });
+
+  deleteButton.addEventListener('click', async () => {
+    if (deleting || !isAccountDeleteConfirmation(confirmationInput.value)) {
+      showDeleteStatus(`Введіть точно ${ACCOUNT_DELETE_CONFIRMATION}.`, 'error');
+      syncDeleteButton();
+      return;
+    }
+
+    const approved = window.confirm(
+      'Назавжди видалити ваш акаунт, усі фінансові операції, записи часу та налаштування?'
+    );
+    if (!approved) return;
+
+    deleting = true;
+    confirmationInput.disabled = true;
+    deleteButton.textContent = 'Видаляємо…';
+    showDeleteStatus('Видаляємо ваші дані. Не закривайте Mini App…');
+    syncDeleteButton();
+
+    try {
+      await Api.deleteAccount(ACCOUNT_DELETE_CONFIRMATION);
+      Telegram.haptic('success');
+      deleteButton.textContent = 'Акаунт видалено';
+      showDeleteStatus('Ваш акаунт і дані видалено. Mini App можна закрити.', 'success');
+      window.setTimeout(() => Telegram.close(), 1600);
+    } catch (error) {
+      deleting = false;
+      confirmationInput.disabled = false;
+      deleteButton.textContent = 'Повторити видалення';
+      showDeleteStatus(error.message || 'Не вдалося видалити акаунт. Спробуйте ще раз.', 'error');
+      Telegram.haptic('error');
+      syncDeleteButton();
+    }
+  });
+
+  syncDeleteButton();
 }
 
 // ── Main entry ─────────────────────────────────────────────────

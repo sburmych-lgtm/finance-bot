@@ -84,5 +84,6 @@ export const Api = {
   settings:        ()                    => request('/api/settings'),
   patchTax:        (payload)             => request('/api/settings/tax',                     { method: 'PATCH',  body: payload }),
   resetSettings:   ()                    => request('/api/settings',                         { method: 'DELETE' }),
+  deleteAccount:   (confirmation)        => request('/api/account',                          { method: 'DELETE', body: { confirmation } }),
   exchangeRates:   ()                    => request('/api/exchange-rates'),
 };

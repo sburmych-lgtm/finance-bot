@@ -121,6 +121,32 @@ async def index(_request: web.Request) -> web.Response:
     )
 
 
+def _legal_document(filename: str) -> web.Response:
+    path = ROOT / filename
+    try:
+        html = path.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return web.Response(status=404, text='legal document missing')
+    return web.Response(
+        body=_bust_html(html),
+        content_type='text/html',
+        charset='utf-8',
+        headers={'X-Content-Type-Options': 'nosniff'},
+    )
+
+
+async def privacy(_request: web.Request) -> web.Response:
+    return _legal_document('privacy.html')
+
+
+async def terms(_request: web.Request) -> web.Response:
+    return _legal_document('terms.html')
+
+
+async def favicon(_request: web.Request) -> web.Response:
+    return web.Response(status=204)
+
+
 async def health(_request: web.Request) -> web.Response:
     return web.json_response({
         'ok': True,
@@ -152,6 +178,11 @@ def build_app() -> web.Application:
     app = web.Application(middlewares=[no_cache_middleware])
     app.router.add_get('/', index)
     app.router.add_get('/index.html', index)
+    app.router.add_get('/privacy', privacy)
+    app.router.add_get('/privacy.html', privacy)
+    app.router.add_get('/terms', terms)
+    app.router.add_get('/terms.html', terms)
+    app.router.add_get('/favicon.ico', favicon)
     app.router.add_get('/health', health)
     # JS — through the rewriter so internal imports are also versioned
     app.router.add_get('/js/{tail:.+\\.js}', serve_js)
