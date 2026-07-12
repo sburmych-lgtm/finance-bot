@@ -31,6 +31,8 @@ USER_OWNED_TABLES = {
     "users",
     "user_settings",
     "broadcast_receipts",
+    "feature_reactions",
+    "feature_comments",
 }
 
 
@@ -135,6 +137,18 @@ def seed_two_users(database):
                (broadcast_id, user_id, status, message_id, reason, created_at)
                VALUES (?, ?, 'sent', ?, NULL, ?)""",
             (broadcast_id, user_id, 1000 + index, "2026-07-12 10:01:00"),
+        )
+        conn.execute(
+            """INSERT INTO feature_reactions
+               (user_id, feature, reaction, created_at)
+               VALUES (?, 'import', 'up', ?)""",
+            (user_id, "2026-07-12 10:02:00"),
+        )
+        conn.execute(
+            """INSERT INTO feature_comments
+               (user_id, comment, created_at)
+               VALUES (?, ?, ?)""",
+            (user_id, f"comment-{user_id}", "2026-07-12 10:03:00"),
         )
 
     conn.commit()

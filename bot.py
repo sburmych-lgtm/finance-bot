@@ -482,6 +482,15 @@ MONTH_NAMES = ['', 'Січень', 'Лютий', 'Березень', 'Квіте
 PAYMENT_SOURCES = ('cash', 'card', 'transfer', 'other')
 PAYMENT_SOURCE_UNCLASSIFIED = 'unclassified'
 
+# Feature-feedback announcement: per-feature 👍/👎 reaction keys + display labels.
+FEEDBACK_FEATURE_LABELS = {
+    'import': 'Імпорт виписок',
+    'declaration': 'Декларація ФОП',
+    'ai': 'AI-помічник',
+    'ocr': 'Сканування чеків',
+    'charts': 'Графіки потоку',
+}
+
 
 def _transaction_request_fingerprint(
     *, amount, currency, t_type, category, subcategory, payment_source,
@@ -825,6 +834,33 @@ class Database:
             except Exception as e:
                 logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
 
+        # 20260713_feature_feedback
+        #   Announcement reaction buttons: per-feature 👍/👎 + free-text ideas.
+        mig = '20260713_feature_feedback'
+        if not applied(mig):
+            try:
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS feature_reactions (
+                        user_id TEXT NOT NULL,
+                        feature TEXT NOT NULL,
+                        reaction TEXT NOT NULL,
+                        created_at TEXT,
+                        PRIMARY KEY (user_id, feature)
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS feature_comments (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT NOT NULL,
+                        comment TEXT NOT NULL,
+                        created_at TEXT
+                    )
+                ''')
+                mark(mig)
+                logger.info(f"Migration {mig}: feedback tables ready")
+            except Exception as e:
+                logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
+
         # 20260712_add_client_request_id
         #   Mini App writes can be retried after a timeout or a double tap. A
         #   caller-provided request id makes those retries safe, while scoping
@@ -1003,6 +1039,8 @@ class Database:
         owner = str(user_id)
         tables = (
             'broadcast_receipts',
+            'feature_reactions',
+            'feature_comments',
             'transactions',
             'time_tracks',
             'budgets',
@@ -1073,6 +1111,59 @@ class Database:
             )
             self.conn.commit()
             return cursor.lastrowid
+
+    # ---- feature-feedback (announcement reactions + ideas) ----
+    async def record_feature_reaction(self, user_id, feature, reaction, created_at):
+        """One current 👍/👎 per (user, feature); re-tapping replaces the vote."""
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "INSERT INTO feature_reactions (user_id, feature, reaction, created_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(user_id, feature) DO UPDATE SET "
+                "reaction=excluded.reaction, created_at=excluded.created_at",
+                (str(user_id), str(feature)[:40], str(reaction)[:10], created_at),
+            )
+            self.conn.commit()
+
+    async def add_feature_comment(self, user_id, comment, created_at):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "INSERT INTO feature_comments (user_id, comment, created_at) "
+                "VALUES (?, ?, ?)",
+                (str(user_id), str(comment)[:2000], created_at),
+            )
+            self.conn.commit()
+            return cursor.lastrowid
+
+    async def get_feedback_summary(self):
+        """Per-feature up/down tally + every reaction and free-text comment."""
+        async with db_lock:
+            cursor = self.conn.cursor()
+            tally = {}
+            try:
+                cursor.execute(
+                    "SELECT feature, reaction, COUNT(*) AS n FROM feature_reactions "
+                    "GROUP BY feature, reaction"
+                )
+                for row in cursor.fetchall():
+                    tally.setdefault(row['feature'], {'up': 0, 'down': 0})
+                    tally[row['feature']][row['reaction']] = row['n']
+                cursor.execute(
+                    "SELECT user_id, feature, reaction, created_at FROM feature_reactions "
+                    "ORDER BY created_at DESC"
+                )
+                reactions = [dict(r) for r in cursor.fetchall()]
+                cursor.execute(
+                    "SELECT id, user_id, comment, created_at FROM feature_comments "
+                    "ORDER BY id DESC"
+                )
+                comments = [dict(r) for r in cursor.fetchall()]
+            except Exception as e:
+                logger.warning(f"get_feedback_summary failed: {e}")
+                reactions, comments = [], []
+            return {'tally': tally, 'reactions': reactions, 'comments': comments}
 
     async def save_broadcast_receipts(self, broadcast_id, receipts, created_at,
                                       sent, failed, skipped, total):
@@ -3084,9 +3175,44 @@ async def show_report_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ========== CALLBACK HANDLERS ==========
+async def _handle_feedback_callback(query, context):
+    """Announcement buttons: record a per-feature 👍/👎, or start the free-text
+    feedback flow. Owns its answer()/toast, so it must run before the generic ack."""
+    parts = (query.data or '').split(':')
+    user_id = str(query.from_user.id)
+    now = datetime.now(KYIV_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    if len(parts) >= 2 and parts[1] == 'comment':
+        context.user_data['waiting_for'] = 'feedback_comment'
+        await query.answer()
+        try:
+            await query.message.reply_text(
+                '💬 Напишіть ваш відгук або ідею одним повідомленням 👇'
+            )
+        except Exception:
+            pass
+        return
+    if len(parts) >= 3 and parts[2] in ('up', 'down'):
+        feature, reaction = parts[1], parts[2]
+        try:
+            await db.record_feature_reaction(user_id, feature, reaction, now)
+        except Exception as e:
+            logger.warning(f'feedback reaction save failed: {e}')
+        label = FEEDBACK_FEATURE_LABELS.get(feature, feature)
+        emoji = '👍' if reaction == 'up' else '👎'
+        await query.answer(
+            f'{emoji} Ваш голос за «{label}» враховано. Дякуємо!',
+            show_alert=False,
+        )
+        return
+    await query.answer()
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all callback queries"""
     query = update.callback_query
+    if (query.data or '').startswith('fb:'):
+        await _handle_feedback_callback(query, context)
+        return
     await query.answer()
 
     data_parts = query.data.split(':')
@@ -3711,6 +3837,23 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
     # Check if waiting for specific input
     waiting_for = context.user_data.get('waiting_for')
     user_id = str(update.effective_user.id)
+
+    if waiting_for == 'feedback_comment':
+        context.user_data['waiting_for'] = None
+        comment = (update.message.text or '').strip()
+        if comment:
+            try:
+                await db.add_feature_comment(
+                    user_id, comment,
+                    datetime.now(KYIV_TZ).strftime('%Y-%m-%d %H:%M:%S'),
+                )
+            except Exception as e:
+                logger.warning(f'feedback comment save failed: {e}')
+        await update.message.reply_text(
+            'Дякуємо за відгук! Ми обов’язково його врахуємо ❤️'
+        )
+        return
+
     user_settings = await user_settings_for(user_id)
     user_categories = user_settings['categories']
     user_employees = user_settings['employees']
@@ -7725,6 +7868,13 @@ async def api_admin_users(request: web.Request):
     })
 
 
+async def api_admin_feedback(request: web.Request):
+    """GET /api/admin/feedback — per-feature 👍/👎 tally + who reacted + comments."""
+    if not is_admin(request['user_id']):
+        return _json_response({'detail': 'admin only'}, status=403)
+    return _json_response(await db.get_feedback_summary())
+
+
 def build_api_app() -> web.Application:
     """Build and return the aiohttp API application."""
     # Order matters: json_errors first (catches everything else), then CORS
@@ -7820,6 +7970,7 @@ def build_api_app() -> web.Application:
     app.router.add_route('GET', '/api/admin/broadcasts/{id}', api_admin_broadcast_detail)
     app.router.add_route('GET', '/api/admin/audit', api_admin_audit)
     app.router.add_route('GET', '/api/admin/users', api_admin_users)
+    app.router.add_route('GET', '/api/admin/feedback', api_admin_feedback)
 
     # Catch-all OPTIONS for CORS preflight on any path
     async def options_handler(_request):
