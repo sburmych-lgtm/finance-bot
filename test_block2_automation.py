@@ -1,4 +1,5 @@
 import asyncio
+import calendar
 import copy
 import json
 from datetime import date, datetime
@@ -142,7 +143,11 @@ def test_recurring_crud_is_validated_and_owner_scoped(monkeypatch, tmp_path):
     recurring_id = created["id"]
 
     assert created_response.status == 201
-    assert created["next_due_date"] == "2026-01-31"
+    first_due = date.fromisoformat(created["next_due_date"])
+    assert first_due >= datetime.now(bot.KYIV_TZ).date()
+    assert first_due.day == calendar.monthrange(
+        first_due.year, first_due.month
+    )[1]
     assert created["payment_source"] == "transfer"
     assert payload(run(bot.api_recurring_list(Request()))) == [created]
     assert payload(run(bot.api_recurring_list(Request("user-2")))) == []
@@ -201,6 +206,11 @@ def test_due_recurring_generation_is_month_end_safe_and_idempotent(
     created = payload(
         run(bot.api_recurring_create(Request(body=recurring_body())))
     )
+    database.conn.execute(
+        "UPDATE recurring_operations SET next_due_date='2026-01-31' WHERE id=?",
+        (created["id"],),
+    )
+    database.conn.commit()
 
     first = run(bot.process_due_recurring_operations(date(2026, 3, 31)))
     second = run(bot.process_due_recurring_operations(date(2026, 3, 31)))
@@ -461,6 +471,11 @@ def test_schedule_patch_preserves_progress_and_never_backfills_to_today(
         bot, "get_exchange_rate", lambda _currency: asyncio.sleep(0, result=1.0)
     )
     created = payload(run(bot.api_recurring_create(Request(body=recurring_body()))))
+    database.conn.execute(
+        "UPDATE recurring_operations SET next_due_date='2026-01-31' WHERE id=?",
+        (created["id"],),
+    )
+    database.conn.commit()
     run(bot.process_due_recurring_operations(date(2026, 3, 31)))
 
     patched = payload(
@@ -490,7 +505,12 @@ def test_account_delete_coordinates_with_inflight_recurring_generation(
 ):
     database = use_database(monkeypatch, tmp_path)
     run(database.save_user_settings("user-1", settings()))
-    run(bot.api_recurring_create(Request(body=recurring_body())))
+    created = payload(run(bot.api_recurring_create(Request(body=recurring_body()))))
+    database.conn.execute(
+        "UPDATE recurring_operations SET next_due_date='2026-01-31' WHERE id=?",
+        (created["id"],),
+    )
+    database.conn.commit()
 
     async def exercise():
         rate_started = asyncio.Event()

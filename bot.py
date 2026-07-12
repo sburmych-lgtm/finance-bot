@@ -6,6 +6,7 @@ import hmac
 import hashlib
 import math
 import secrets
+import weakref
 from functools import wraps
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote
@@ -299,7 +300,21 @@ def _consume_chat_broadcast_confirmation(admin_id, token: str) -> str | None:
 
 # Lock for database operations
 db_lock = asyncio.Lock()
-_recurring_user_locks = defaultdict(asyncio.Lock)
+
+
+class _LoopLocalLockMap:
+    """Per-key asyncio locks that never leak across separate event loops."""
+
+    def __init__(self):
+        self._loops = weakref.WeakKeyDictionary()
+
+    def __getitem__(self, key):
+        loop = asyncio.get_running_loop()
+        locks = self._loops.setdefault(loop, {})
+        return locks.setdefault(str(key), asyncio.Lock())
+
+
+_recurring_user_locks = _LoopLocalLockMap()
 
 
 def is_admin(user_id) -> bool:
@@ -913,7 +928,10 @@ class Database:
             return cursor.rowcount > 0
 
     async def reset_user_settings(self, user_id):
-        """Atomically reset settings and category-dependent budget config."""
+        """Reset config atomically: delete budgets and pause all recurring.
+
+        Historical transactions/time rows are intentionally retained.
+        """
         owner = str(user_id)
         async with db_lock:
             cursor = self.conn.cursor()
@@ -1708,6 +1726,48 @@ class Database:
                 self.conn.rollback()
                 raise
 
+    async def save_employee_delete(self, user_id, employee_name, settings):
+        """Remove generated config dependencies while retaining history."""
+        owner = str(user_id)
+        categories = (
+            ('income', f'Від {employee_name}'),
+            ('expense', f'ЗП {employee_name}'),
+        )
+        async with db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                deleted_budgets = paused_recurring = 0
+                for category_type, category in categories:
+                    cursor.execute('''
+                        DELETE FROM budgets
+                        WHERE user_id = ? AND type = ? AND category = ?
+                    ''', (owner, category_type, category))
+                    deleted_budgets += cursor.rowcount
+                    cursor.execute('''
+                        UPDATE recurring_operations
+                        SET active = 0, updated_at = CURRENT_TIMESTAMP
+                        WHERE user_id = ? AND type = ? AND category = ?
+                          AND active = 1
+                    ''', (owner, category_type, category))
+                    paused_recurring += cursor.rowcount
+                cursor.execute('''
+                    INSERT INTO user_settings
+                        (user_id, settings_json, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        settings_json = excluded.settings_json,
+                        updated_at = CURRENT_TIMESTAMP
+                ''', (owner, json.dumps(settings, ensure_ascii=False)))
+                self.conn.commit()
+                return {
+                    'budgets': deleted_budgets,
+                    'recurring_operations_paused': paused_recurring,
+                }
+            except Exception:
+                self.conn.rollback()
+                raise
+
     async def delete_transaction(self, transaction_id, user_id=None):
         """Delete a transaction. If user_id is given, scope the delete
         to that owner — preferred path from the API. Bot's inline-button
@@ -1992,6 +2052,17 @@ def update_tax_profile(settings: dict, year: int, changes: dict) -> dict:
     return tax_profile_for_year(config, normalized_year)
 
 
+EMPLOYEE_CATEGORY_PREFIXES = {
+    'income': 'Від ',
+    'expense': 'ЗП ',
+}
+
+
+def _is_employee_category_namespace(category_type, name):
+    prefix = EMPLOYEE_CATEGORY_PREFIXES.get(category_type)
+    return bool(prefix and isinstance(name, str) and name.startswith(prefix))
+
+
 def _employee_categories_dict(employees):
     income_emp = {}
     expense_emp = {}
@@ -2005,6 +2076,23 @@ def _employee_categories_dict(employees):
             'keywords': [f'зп {emp.lower()}', f'зарплата {emp.lower()}'],
         }
     return income_emp, expense_emp
+
+
+def employee_names_for_report(settings, transactions):
+    """Current employees plus names preserved in historical employee rows."""
+    names = list(dict.fromkeys(settings.get('employees', [])))
+    seen = set(names)
+    historical = set()
+    for row in transactions:
+        category_type = row.get('type')
+        category = row.get('category') or ''
+        prefix = EMPLOYEE_CATEGORY_PREFIXES.get(category_type)
+        if prefix and category.startswith(prefix):
+            employee = category[len(prefix):].strip()
+            if employee and employee not in seen:
+                historical.add(employee)
+    names.extend(sorted(historical, key=str.casefold))
+    return names
 
 
 def rebuild_user_categories(settings):
@@ -2046,7 +2134,7 @@ async def save_user_settings(user_id, settings):
     await db.save_user_settings(user_id, settings)
 
 
-_user_settings_locks = defaultdict(asyncio.Lock)
+_user_settings_locks = _LoopLocalLockMap()
 
 
 def serialized_user_settings_write(handler):
@@ -2087,6 +2175,53 @@ async def update_user_settings(user_id, mutator):
         result = mutator(settings)
         await save_user_settings(user_id, settings)
         return settings if result is None else result
+
+
+async def _delete_employee_locked(user_id, employee_name):
+    settings = _copy.deepcopy(await user_settings_for(user_id))
+    employees = settings.setdefault('employees', [])
+    if employee_name not in employees:
+        return False
+    employees.remove(employee_name)
+    normalize_tax_config(settings)
+    rebuild_user_categories(settings)
+    await db.save_employee_delete(user_id, employee_name, settings)
+    return True
+
+
+async def delete_employee_for_user(user_id, employee_name):
+    """Dependency-aware employee deletion shared by API and bot chat flows."""
+    owner = str(user_id)
+    async with _user_settings_locks[owner]:
+        async with _recurring_user_locks[owner]:
+            return await _delete_employee_locked(owner, employee_name)
+
+
+async def delete_category_for_user(user_id, category_type, category):
+    owner = str(user_id)
+    async with _user_settings_locks[owner]:
+        async with _recurring_user_locks[owner]:
+            if _is_employee_category_namespace(category_type, category):
+                return False
+            settings = _copy.deepcopy(await user_settings_for(owner))
+            bucket = settings.get('categories', {}).get(category_type, {})
+            if category not in bucket or category == 'Інше':
+                return False
+            del bucket[category]
+            normalize_tax_config(settings)
+            rebuild_user_categories(settings)
+            await db.save_category_delete(
+                owner, category_type, category, settings
+            )
+            return True
+
+
+async def reset_user_configuration(user_id):
+    """Reset settings/budgets and pause recurring templates under one lock."""
+    owner = str(user_id)
+    async with _user_settings_locks[owner]:
+        async with _recurring_user_locks[owner]:
+            return await db.reset_user_settings(owner)
 
 
 # ========== EXCHANGE RATES ==========
@@ -2998,9 +3133,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "emp_del":
         emp_name = ':'.join(data_parts[1:])
         if emp_name in user_employees:
-            await update_user_settings(
-                user_id, lambda s: s['employees'].remove(emp_name)
-                if emp_name in s['employees'] else None)
+            await delete_employee_for_user(user_id, emp_name)
 
             await query.edit_message_text(
                 f"✅ Працівника \"{emp_name}\" видалено!",
@@ -3024,9 +3157,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cat_type = data_parts[1]
         cat_name = ':'.join(data_parts[2:])
 
-        if cat_name in user_categories[cat_type] and cat_name != 'Інше':
-            await update_user_settings(
-                user_id, lambda s: s['categories'][cat_type].pop(cat_name, None))
+        if (
+            cat_name in user_categories[cat_type]
+            and cat_name != 'Інше'
+            and not _is_employee_category_namespace(cat_type, cat_name)
+        ):
+            await delete_category_for_user(user_id, cat_type, cat_name)
 
             cat_type_name = "витрат" if cat_type == "expense" else "доходів"
             await query.edit_message_text(
@@ -3376,7 +3512,7 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
         if len(cat_name) < 2:
             await update.message.reply_text("❌ Назва занадто коротка. Спробуйте ще раз.")
             return
-        
+
         if cat_name in user_time_categories:
             await update.message.reply_text(f"⚠️ Категорія \"{cat_name}\" вже існує!")
             return
@@ -3441,6 +3577,12 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
 
         if len(cat_name) < 2:
             await update.message.reply_text("❌ Назва занадто коротка. Спробуйте ще раз.")
+            return
+
+        if _is_employee_category_namespace(cat_type, cat_name):
+            await update.message.reply_text(
+                "❌ Ця назва зарезервована для автоматичних категорій працівників."
+            )
             return
 
         if cat_name in user_categories[cat_type]:
@@ -3865,7 +4007,7 @@ async def show_employee_report(update: Update, context: ContextTypes.DEFAULT_TYP
 
     text = f"👥 **ЗВІТ ПО ПРАЦІВНИКАХ**\n{MONTH_NAMES[current_date.month]} {current_date.year}\n\n"
 
-    for emp in settings['employees']:
+    for emp in employee_names_for_report(settings, transactions):
         income_cat = f'Від {emp}'
         salary_cat = f'ЗП {emp}'
 
@@ -4278,24 +4420,29 @@ async def admin_reset_user_settings(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("📭 Нікого скидати.")
         return
 
-    async with db_lock:
-        cursor = db.conn.cursor()
-        for uid in targets:
-            cursor.execute("DELETE FROM user_settings WHERE user_id = ?", (uid,))
-        db.conn.commit()
+    reset_results = []
+    for uid in targets:
+        reset_results.append(await reset_user_configuration(uid))
 
     await db.log_admin_action(
         admin_id,
         'reset_user_settings',
         target=arg,
         status='ok',
-        metadata={'target_count': len(targets)},
+        metadata={
+            'target_count': len(targets),
+            'budgets_deleted': sum(item['budgets'] for item in reset_results),
+            'recurring_paused': sum(
+                item['recurring_operations_paused'] for item in reset_results
+            ),
+        },
     )
 
     await update.message.reply_text(
         f"🧹 Скинуто налаштувань: {len(targets)}.\n"
         f"Наступне відкриття Mini App перезапише їх з нейтрального шаблону "
         f"(працівники = пусто, категорії = базові, ФОП 3 група).\n"
+        f"Бюджети видалено, регулярні операції призупинено.\n"
         f"Транзакції та час НЕ зачеплено."
     )
 
@@ -5377,7 +5524,8 @@ async def api_settings_reset(request: web.Request):
     """Wipe this user's settings row → next request rebuilds it from
     DEFAULT_SETTINGS. Used by the «Reset to defaults» button in the
     Mini App, and as the recovery path for users who imported legacy
-    employees/categories they didn't actually have."""
+    employees/categories they didn't actually have. Budgets are deleted and
+    every recurring template is paused; transaction/time history is retained."""
     user_id = request['user_id']
     await db.reset_user_settings(user_id)
     logger.info(f"API DELETE /api/settings user={user_id} (reset to defaults)")
@@ -5481,6 +5629,7 @@ def _parse_budget_limit(body):
     return value, None
 
 
+@serialized_user_settings_write
 async def api_budgets_put(request: web.Request):
     try:
         body = await request.json()
@@ -5554,6 +5703,7 @@ async def api_budgets_get(request: web.Request):
     })
 
 
+@serialized_user_settings_write
 async def api_budgets_delete(request: web.Request):
     budget_type = request.match_info.get('type')
     category = unquote(request.match_info.get('category', ''))
@@ -5561,8 +5711,7 @@ async def api_budgets_delete(request: web.Request):
         return _json_response(
             {'detail': 'type must be income or expense'}, status=400
         )
-    settings = await user_settings_for(request['user_id'])
-    if category not in settings.get('categories', {}).get(budget_type, {}):
+    if not category or len(category) > 80:
         return _json_response({'detail': 'Not found'}, status=404)
     deleted = await db.delete_budget(
         request['user_id'], budget_type, category
@@ -5610,6 +5759,18 @@ def _next_recurrence_after(start, frequency, interval, anchor_day, baseline):
             candidate, frequency, interval=interval, anchor_day=anchor_day
         )
     raise ValueError('recurring schedule is too old')
+
+
+def _first_recurrence_on_or_after(
+    start, frequency, interval, anchor_day, target
+):
+    return _next_recurrence_after(
+        start,
+        frequency,
+        interval,
+        anchor_day,
+        target - timedelta(days=1),
+    )
 
 
 async def _validate_recurring_values(user_id, body, existing=None):
@@ -5757,24 +5918,33 @@ async def _validate_recurring_values(user_id, body, existing=None):
     else:
         amount_uah = float(existing['amount_uah'])
 
-    schedule_changed = existing is None or bool(
+    schedule_fields_changed = bool(
         {'frequency', 'interval', 'start_date'} & set(body)
     )
-    if schedule_changed:
+    today = datetime.now(KYIV_TZ).date()
+    reactivating = (
+        existing is not None
+        and not bool(existing['active'])
+        and active
+    )
+    if existing is None:
         anchor_day = start.day
-        if existing is None:
-            next_due_date = start.isoformat()
-            last_generated_date = None
-        else:
-            last_generated_date = existing.get('last_generated_date')
-            baseline = datetime.now(KYIV_TZ).date()
-            if last_generated_date:
-                baseline = max(
-                    baseline, date.fromisoformat(last_generated_date)
-                )
-            next_due_date = _next_recurrence_after(
-                start, frequency, interval, anchor_day, baseline
-            ).isoformat()
+        last_generated_date = None
+        next_due_date = _first_recurrence_on_or_after(
+            start, frequency, interval, anchor_day, today
+        ).isoformat()
+    elif schedule_fields_changed or reactivating:
+        anchor_day = start.day if schedule_fields_changed else int(existing['anchor_day'])
+        last_generated_date = existing.get('last_generated_date')
+        target = today
+        if last_generated_date:
+            target = max(
+                target,
+                date.fromisoformat(last_generated_date) + timedelta(days=1),
+            )
+        next_due_date = _first_recurrence_on_or_after(
+            start, frequency, interval, anchor_day, target
+        ).isoformat()
     else:
         next_due_date = existing['next_due_date']
         last_generated_date = existing.get('last_generated_date')
@@ -6031,6 +6201,7 @@ async def api_notification_settings(request: web.Request):
     )
 
 
+@serialized_user_settings_write
 async def api_notification_settings_patch(request: web.Request):
     try:
         body = await request.json()
@@ -6131,7 +6302,7 @@ async def api_report_employees(request: web.Request):
 
     transactions = await db.get_transactions(user_id, year=year, month=month)
     user_settings = await user_settings_for(user_id)
-    user_employees = user_settings.get('employees', [])
+    user_employees = employee_names_for_report(user_settings, transactions)
 
     employees = []
     for emp in user_employees:
@@ -6324,6 +6495,7 @@ async def api_categories_full(request: web.Request):
     return _json_response(cats)
 
 
+@serialized_user_settings_write
 async def api_categories_create(request: web.Request):
     user_id = request['user_id']
     try:
@@ -6340,6 +6512,10 @@ async def api_categories_create(request: web.Request):
         return _json_response({'detail': 'name required'}, status=400)
     if len(str(body.get('name') or '').strip()) > 80:
         return _json_response({'detail': 'name must be at most 80 characters'}, status=400)
+    if _is_employee_category_namespace(cat_type, name):
+        return _json_response(
+            {'detail': 'employee category namespace is reserved'}, status=400
+        )
 
     settings = await user_settings_for(user_id)
     bucket = settings.setdefault('categories', {}).setdefault(cat_type, {})
@@ -6375,6 +6551,11 @@ async def api_categories_update(request: web.Request):
     name = unquote(request.match_info.get('name', ''))
     if cat_type not in ('income', 'expense'):
         return _json_response({'detail': 'type must be income or expense'}, status=400)
+    if _is_employee_category_namespace(cat_type, name):
+        return _json_response(
+            {'detail': 'generated employee categories are managed via employees'},
+            status=400,
+        )
 
     settings = _copy.deepcopy(await user_settings_for(user_id))
     bucket = settings.get('categories', {}).get(cat_type, {})
@@ -6396,6 +6577,10 @@ async def api_categories_update(request: web.Request):
     if len(raw_new_name) > 80:
         return _json_response({'detail': 'new_name must be at most 80 characters'}, status=400)
     new_name = raw_new_name or name
+    if _is_employee_category_namespace(cat_type, new_name):
+        return _json_response(
+            {'detail': 'employee category namespace is reserved'}, status=400
+        )
 
     if not isinstance(new_keywords, list) or not all(isinstance(k, str) for k in new_keywords):
         return _json_response({'detail': 'keywords must be a list of strings'}, status=400)
@@ -6444,6 +6629,11 @@ async def api_categories_delete(request: web.Request):
     name = unquote(request.match_info.get('name', ''))
     if cat_type not in ('income', 'expense'):
         return _json_response({'detail': 'type must be income or expense'}, status=400)
+    if _is_employee_category_namespace(cat_type, name):
+        return _json_response(
+            {'detail': 'delete the employee instead of its generated category'},
+            status=400,
+        )
     if name == 'Інше':
         return _json_response({'detail': 'cannot delete "Інше"'}, status=400)
 
@@ -6466,6 +6656,7 @@ async def api_categories_delete(request: web.Request):
 
 # ---- subcategories CRUD (per-user, nested under a category) ----
 
+@serialized_user_settings_write
 async def api_subcategories_create(request: web.Request):
     """POST /api/categories/{type}/{name}/subcategories  body {name}"""
     user_id = request['user_id']
@@ -6500,6 +6691,7 @@ async def api_subcategories_create(request: web.Request):
     return _json_response({'category': cat_name, 'subcategory': sub_name}, status=201)
 
 
+@serialized_user_settings_write
 async def api_subcategories_delete(request: web.Request):
     """DELETE /api/categories/{type}/{name}/subcategories/{sub}"""
     user_id = request['user_id']
@@ -6604,6 +6796,7 @@ async def api_employees_list(request: web.Request):
     return _json_response(settings.get('employees', []))
 
 
+@serialized_user_settings_write
 async def api_employees_create(request: web.Request):
     user_id = request['user_id']
     try:
@@ -6625,17 +6818,13 @@ async def api_employees_create(request: web.Request):
     return _json_response({'name': name}, status=201)
 
 
+@serialized_user_settings_write
 async def api_employees_delete(request: web.Request):
     user_id = request['user_id']
     name = unquote(request.match_info.get('name', ''))
 
-    settings = await user_settings_for(user_id)
-    employees_list = settings.setdefault('employees', [])
-    if name not in employees_list:
+    if not await _delete_employee_locked(user_id, name):
         return _json_response({'detail': 'employee not found'}, status=404)
-
-    employees_list.remove(name)
-    await save_user_settings(user_id, settings)
     return web.Response(status=204)
 
 
@@ -6646,6 +6835,7 @@ async def api_time_categories_list(request: web.Request):
     return _json_response(settings.get('time_categories', {}))
 
 
+@serialized_user_settings_write
 async def api_time_categories_create(request: web.Request):
     user_id = request['user_id']
     try:
@@ -6668,6 +6858,7 @@ async def api_time_categories_create(request: web.Request):
     return _json_response({'name': name, **entry}, status=201)
 
 
+@serialized_user_settings_write
 async def api_time_categories_delete(request: web.Request):
     user_id = request['user_id']
     name = unquote(request.match_info.get('name', ''))
@@ -6870,6 +7061,7 @@ async def api_account_delete(request: web.Request):
 
 # ---- tax settings ----
 
+@serialized_user_settings_write
 async def api_settings_tax_update(request: web.Request):
     user_id = request['user_id']
     try:
