@@ -18,7 +18,7 @@ from telegram.ext import (
     ContextTypes,
     filters
 )
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 import re
@@ -36,6 +36,16 @@ from backup_service import (
     upload_and_verify_snapshot,
 )
 from security_controls import TokenBucketLimiter
+from finance_features import (
+    SUPPORTED_FREQUENCIES,
+    advance_recurrence,
+    build_financial_insights,
+    build_weekly_digest,
+    detect_recurring_candidates,
+    due_recurrence_dates,
+    forecast_month_result,
+    recurrence_occurrence_key,
+)
 
 load_dotenv()
 
@@ -202,6 +212,11 @@ def _env_flag(name, default=False):
     return raw.strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
+# Existing worker behavior remains enabled by default. A future redirect-only
+# service must set this false, preventing duplicate finance/notification jobs.
+ENABLE_SCHEDULED_JOBS = _env_flag('ENABLE_SCHEDULED_JOBS', default=True)
+
+
 _preauth_limiter = TokenBucketLimiter.per_minute(
     _positive_env_int('RATE_LIMIT_PREAUTH_PER_MINUTE', 120),
     burst=_positive_env_int('RATE_LIMIT_PREAUTH_BURST', 60),
@@ -284,6 +299,7 @@ def _consume_chat_broadcast_confirmation(admin_id, token: str) -> str | None:
 
 # Lock for database operations
 db_lock = asyncio.Lock()
+_recurring_user_locks = defaultdict(asyncio.Lock)
 
 
 def is_admin(user_id) -> bool:
@@ -417,6 +433,29 @@ MONTH_NAMES = ['', 'Січень', 'Лютий', 'Березень', 'Квіте
 PAYMENT_SOURCES = ('cash', 'card', 'transfer', 'other')
 PAYMENT_SOURCE_UNCLASSIFIED = 'unclassified'
 
+
+def _transaction_request_fingerprint(
+    *, amount, currency, t_type, category, subcategory, payment_source,
+    description,
+):
+    """Hash the immutable normalized create request, not mutable row fields."""
+    normalized_amount = format(Decimal(str(amount)).normalize(), 'f')
+    canonical = json.dumps(
+        [
+            normalized_amount,
+            currency,
+            t_type,
+            category,
+            subcategory,
+            payment_source,
+            description,
+        ],
+        ensure_ascii=False,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return hashlib.sha256(canonical).hexdigest()
+
+
 # Category labels are currently the relationship key. Keep all dependent-table
 # writes in these registries so a future recurring-operations table can join
 # the same atomic rename/delete transaction with one explicit hook.
@@ -429,10 +468,20 @@ CATEGORY_RENAME_DEPENDENCY_HOOKS = (
         UPDATE budgets SET category = ?, updated_at = CURRENT_TIMESTAMP
         WHERE user_id = ? AND type = ? AND category = ?
     '''),
+    ('recurring_operations', '''
+        UPDATE recurring_operations
+        SET category = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ? AND type = ? AND category = ?
+    '''),
 )
 CATEGORY_DELETE_DEPENDENCY_HOOKS = (
     ('budgets', '''
         DELETE FROM budgets
+        WHERE user_id = ? AND type = ? AND category = ?
+    '''),
+    ('recurring_operations', '''
+        UPDATE recurring_operations
+        SET active = 0, updated_at = CURRENT_TIMESTAMP
         WHERE user_id = ? AND type = ? AND category = ?
     '''),
 )
@@ -568,6 +617,57 @@ class Database:
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_budgets_user
             ON budgets(user_id)
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS recurring_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL,
+                amount_uah REAL NOT NULL,
+                category TEXT NOT NULL,
+                subcategory TEXT,
+                description TEXT,
+                payment_source TEXT,
+                frequency TEXT NOT NULL,
+                interval INTEGER NOT NULL DEFAULT 1,
+                start_date DATE NOT NULL,
+                anchor_day INTEGER NOT NULL,
+                next_due_date DATE NOT NULL,
+                last_generated_date DATE,
+                auto_create INTEGER NOT NULL DEFAULT 1,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_recurring_user_due
+            ON recurring_operations(user_id, active, next_due_date)
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS notification_preferences (
+                user_id TEXT PRIMARY KEY,
+                weekly_digest_enabled INTEGER NOT NULL DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS notification_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                period_key TEXT NOT NULL,
+                status TEXT NOT NULL,
+                message_id INTEGER,
+                error TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, kind, period_key)
+            )
         ''')
 
         # Broadcast audit trail: one row per broadcast batch, plus one receipt
@@ -748,6 +848,27 @@ class Database:
                     cursor.execute(
                         "ALTER TABLE transactions ADD COLUMN request_fingerprint TEXT"
                     )
+                cursor.execute('''
+                    SELECT id, amount, currency, type, category, subcategory,
+                           payment_source, description
+                    FROM transactions
+                    WHERE client_request_id IS NOT NULL
+                      AND request_fingerprint IS NULL
+                ''')
+                for row in cursor.fetchall():
+                    fingerprint = _transaction_request_fingerprint(
+                        amount=row['amount'],
+                        currency=row['currency'],
+                        t_type=row['type'],
+                        category=row['category'],
+                        subcategory=row['subcategory'],
+                        payment_source=row['payment_source'],
+                        description=row['description'] or '',
+                    )
+                    cursor.execute('''
+                        UPDATE transactions SET request_fingerprint = ?
+                        WHERE id = ? AND request_fingerprint IS NULL
+                    ''', (fingerprint, row['id']))
                 mark(mig)
             except Exception as e:
                 logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
@@ -800,6 +921,12 @@ class Database:
                 cursor.execute('BEGIN IMMEDIATE')
                 cursor.execute("DELETE FROM budgets WHERE user_id = ?", (owner,))
                 deleted_budgets = cursor.rowcount
+                cursor.execute('''
+                    UPDATE recurring_operations
+                    SET active = 0, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ? AND active = 1
+                ''', (owner,))
+                paused_recurring = cursor.rowcount
                 cursor.execute(
                     "DELETE FROM user_settings WHERE user_id = ?", (owner,)
                 )
@@ -807,6 +934,7 @@ class Database:
                 self.conn.commit()
                 return {
                     'budgets': deleted_budgets,
+                    'recurring_operations_paused': paused_recurring,
                     'user_settings': deleted_settings,
                 }
             except Exception:
@@ -826,22 +954,28 @@ class Database:
             'transactions',
             'time_tracks',
             'budgets',
+            'notification_deliveries',
+            'notification_preferences',
+            'recurring_operations',
             'subscriptions',
             'user_settings',
             'users',
         )
-        async with db_lock:
-            cursor = self.conn.cursor()
-            deleted_rows = {}
-            try:
-                cursor.execute('BEGIN IMMEDIATE')
-                for table in tables:
-                    cursor.execute(f'DELETE FROM {table} WHERE user_id = ?', (owner,))
-                    deleted_rows[table] = cursor.rowcount
-                self.conn.commit()
-            except Exception:
-                self.conn.rollback()
-                raise
+        async with _recurring_user_locks[owner]:
+            async with db_lock:
+                cursor = self.conn.cursor()
+                deleted_rows = {}
+                try:
+                    cursor.execute('BEGIN IMMEDIATE')
+                    for table in tables:
+                        cursor.execute(
+                            f'DELETE FROM {table} WHERE user_id = ?', (owner,)
+                        )
+                        deleted_rows[table] = cursor.rowcount
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+                    raise
         return {'deleted_user_id': owner, 'deleted_rows': deleted_rows}
 
     async def upsert_user(self, user):
@@ -1256,6 +1390,268 @@ class Database:
             self.conn.commit()
             return cursor.rowcount > 0
 
+    async def get_budgets(self, user_id):
+        async with db_lock:
+            rows = self.conn.execute('''
+                SELECT type, category, monthly_limit_uah
+                FROM budgets
+                WHERE user_id = ?
+                ORDER BY type, category
+            ''', (str(user_id),)).fetchall()
+            return [dict(row) for row in rows]
+
+    async def create_recurring_operation(self, user_id, values):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT INTO recurring_operations (
+                    user_id, type, amount, currency, amount_uah, category,
+                    subcategory, description, payment_source, frequency,
+                    interval, start_date, anchor_day, next_due_date,
+                    last_generated_date, auto_create, active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                str(user_id), values['type'], values['amount'], values['currency'],
+                values['amount_uah'], values['category'], values['subcategory'],
+                values['description'], values['payment_source'], values['frequency'],
+                values['interval'], values['start_date'], values['anchor_day'],
+                values['next_due_date'], values.get('last_generated_date'),
+                int(values['auto_create']), int(values['active']),
+            ))
+            recurring_id = cursor.lastrowid
+            row = cursor.execute(
+                "SELECT * FROM recurring_operations WHERE id = ?",
+                (recurring_id,),
+            ).fetchone()
+            self.conn.commit()
+            return dict(row)
+
+    async def get_recurring_operation(self, user_id, recurring_id):
+        async with db_lock:
+            row = self.conn.execute('''
+                SELECT * FROM recurring_operations
+                WHERE id = ? AND user_id = ?
+            ''', (int(recurring_id), str(user_id))).fetchone()
+            return dict(row) if row else None
+
+    async def list_recurring_operations(self, user_id):
+        async with db_lock:
+            rows = self.conn.execute('''
+                SELECT * FROM recurring_operations
+                WHERE user_id = ?
+                ORDER BY id
+            ''', (str(user_id),)).fetchall()
+            return [dict(row) for row in rows]
+
+    async def update_recurring_operation(self, user_id, recurring_id, values):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                UPDATE recurring_operations SET
+                    type = ?, amount = ?, currency = ?, amount_uah = ?,
+                    category = ?, subcategory = ?, description = ?,
+                    payment_source = ?, frequency = ?, interval = ?,
+                    start_date = ?, anchor_day = ?, next_due_date = ?,
+                    last_generated_date = ?, auto_create = ?, active = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+            ''', (
+                values['type'], values['amount'], values['currency'],
+                values['amount_uah'], values['category'], values['subcategory'],
+                values['description'], values['payment_source'], values['frequency'],
+                values['interval'], values['start_date'], values['anchor_day'],
+                values['next_due_date'], values.get('last_generated_date'),
+                int(values['auto_create']), int(values['active']),
+                int(recurring_id), str(user_id),
+            ))
+            if cursor.rowcount == 0:
+                self.conn.commit()
+                return None
+            row = cursor.execute('''
+                SELECT * FROM recurring_operations
+                WHERE id = ? AND user_id = ?
+            ''', (int(recurring_id), str(user_id))).fetchone()
+            self.conn.commit()
+            return dict(row)
+
+    async def delete_recurring_operation(self, user_id, recurring_id):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                DELETE FROM recurring_operations
+                WHERE id = ? AND user_id = ?
+            ''', (int(recurring_id), str(user_id)))
+            self.conn.commit()
+            return cursor.rowcount > 0
+
+    async def list_due_recurring_operations(self, through_date):
+        async with db_lock:
+            rows = self.conn.execute('''
+                SELECT * FROM recurring_operations
+                WHERE active = 1 AND auto_create = 1 AND next_due_date <= ?
+                ORDER BY id
+            ''', (str(through_date),)).fetchall()
+            return [dict(row) for row in rows]
+
+    async def mark_recurring_generated(
+        self, user_id, recurring_id, last_generated_date, next_due_date
+    ):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                UPDATE recurring_operations
+                SET last_generated_date = ?, next_due_date = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+            ''', (
+                str(last_generated_date), str(next_due_date), int(recurring_id),
+                str(user_id),
+            ))
+            self.conn.commit()
+            return cursor.rowcount > 0
+
+    async def materialize_recurring_occurrences(
+        self,
+        user_id,
+        recurring_id,
+        *,
+        expected_next_due,
+        expected_currency,
+        due_dates,
+        rate,
+        next_due_date,
+    ):
+        """Atomically re-check, create due rows, and advance the template."""
+        owner = str(user_id)
+        async with db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                row = cursor.execute('''
+                    SELECT * FROM recurring_operations
+                    WHERE id = ? AND user_id = ?
+                      AND active = 1 AND auto_create = 1
+                ''', (int(recurring_id), owner)).fetchone()
+                if (
+                    row is None
+                    or row['next_due_date'] != expected_next_due
+                    or row['currency'] != expected_currency
+                ):
+                    self.conn.commit()
+                    return {'created': 0, 'processed': False}
+
+                amount_uah = round(convert_to_uah(
+                    float(row['amount']), row['currency'], rate
+                ), 2)
+                if amount_uah < 0.01:
+                    raise ValueError('UAH equivalent must be at least 0.01')
+                created = 0
+                for due_date in due_dates:
+                    request_id = recurrence_occurrence_key(row['id'], due_date)
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO transactions (
+                            user_id, amount, currency, amount_uah, type,
+                            category, subcategory, description, date, timestamp,
+                            client_request_id, payment_source
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        owner, row['amount'], row['currency'], amount_uah,
+                        row['type'], row['category'], row['subcategory'],
+                        row['description'], due_date.isoformat(),
+                        f'{due_date.isoformat()} 12:00:00', request_id,
+                        row['payment_source'],
+                    ))
+                    created += max(cursor.rowcount, 0)
+                cursor.execute('''
+                    UPDATE recurring_operations
+                    SET last_generated_date = ?, next_due_date = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ? AND active = 1
+                ''', (
+                    due_dates[-1].isoformat(), next_due_date.isoformat(),
+                    int(recurring_id), owner,
+                ))
+                processed = cursor.rowcount > 0
+                self.conn.commit()
+                return {'created': created, 'processed': processed}
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    async def get_notification_preferences(self, user_id):
+        async with db_lock:
+            row = self.conn.execute('''
+                SELECT weekly_digest_enabled
+                FROM notification_preferences
+                WHERE user_id = ?
+            ''', (str(user_id),)).fetchone()
+            return {
+                'weekly_digest_enabled': bool(row['weekly_digest_enabled']) if row else False
+            }
+
+    async def set_notification_preferences(self, user_id, enabled):
+        async with db_lock:
+            self.conn.execute('''
+                INSERT INTO notification_preferences
+                    (user_id, weekly_digest_enabled, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    weekly_digest_enabled = excluded.weekly_digest_enabled,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (str(user_id), int(enabled)))
+            self.conn.commit()
+            return {'weekly_digest_enabled': bool(enabled)}
+
+    async def list_weekly_digest_users(self):
+        async with db_lock:
+            rows = self.conn.execute('''
+                SELECT user_id FROM notification_preferences
+                WHERE weekly_digest_enabled = 1
+                ORDER BY user_id
+            ''').fetchall()
+            return [str(row['user_id']) for row in rows]
+
+    async def claim_notification_delivery(self, user_id, kind, period_key):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                INSERT OR IGNORE INTO notification_deliveries
+                    (user_id, kind, period_key, status)
+                VALUES (?, ?, ?, 'processing')
+            ''', (str(user_id), kind, period_key))
+            claimed = cursor.rowcount > 0
+            if not claimed:
+                cursor.execute('''
+                    UPDATE notification_deliveries
+                    SET status = 'processing', message_id = NULL, error = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ? AND kind = ? AND period_key = ?
+                      AND (
+                          status = 'failed'
+                          OR (
+                              status = 'processing'
+                              AND updated_at < datetime('now', '-15 minutes')
+                          )
+                      )
+                ''', (str(user_id), kind, period_key))
+                claimed = cursor.rowcount > 0
+            self.conn.commit()
+            return claimed
+
+    async def finish_notification_delivery(
+        self, user_id, kind, period_key, status, *, message_id=None, error=None
+    ):
+        async with db_lock:
+            self.conn.execute('''
+                UPDATE notification_deliveries
+                SET status = ?, message_id = ?, error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = ? AND kind = ? AND period_key = ?
+            ''', (
+                status, message_id, error, str(user_id), kind, period_key,
+            ))
+            self.conn.commit()
+
     async def save_category_rename(
         self, user_id, category_type, old_name, new_name, settings
     ):
@@ -1663,13 +2059,23 @@ def serialized_user_settings_write(handler):
     async def wrapped(request):
         if request.get('_settings_lock_held'):
             return await handler(request)
-        lock = _user_settings_locks[str(request['user_id'])]
-        async with lock:
-            request['_settings_lock_held'] = True
-            try:
-                return await handler(request)
-            finally:
-                request.pop('_settings_lock_held', None)
+        owner = str(request['user_id'])
+        async with _user_settings_locks[owner]:
+            async with _recurring_user_locks[owner]:
+                request['_settings_lock_held'] = True
+                try:
+                    return await handler(request)
+                finally:
+                    request.pop('_settings_lock_held', None)
+    return wrapped
+
+
+def serialized_recurring_write(handler):
+    @wraps(handler)
+    async def wrapped(request):
+        owner = str(request['user_id'])
+        async with _recurring_user_locks[owner]:
+            return await handler(request)
     return wrapped
 
 
@@ -4254,12 +4660,14 @@ async def user_context_middleware(request: web.Request, handler):
                                      '/api/time-categories', '/api/settings'))
     )
     if settings_write:
-        async with _user_settings_locks[request['user_id']]:
-            request['_settings_lock_held'] = True
-            try:
-                return await handler(request)
-            finally:
-                request.pop('_settings_lock_held', None)
+        owner = str(request['user_id'])
+        async with _user_settings_locks[owner]:
+            async with _recurring_user_locks[owner]:
+                request['_settings_lock_held'] = True
+                try:
+                    return await handler(request)
+                finally:
+                    request.pop('_settings_lock_held', None)
     return await handler(request)
 
 
@@ -4577,28 +4985,6 @@ def _parse_payment_source(body: dict, *, required=False):
             'detail': 'payment_source must be cash, card, transfer, other, or null'
         }, status=400)
     return value, None
-
-
-def _transaction_request_fingerprint(
-    *, amount, currency, t_type, category, subcategory, payment_source,
-    description,
-):
-    """Hash the immutable normalized create request, not mutable row fields."""
-    normalized_amount = format(Decimal(str(amount)).normalize(), 'f')
-    canonical = json.dumps(
-        [
-            normalized_amount,
-            currency,
-            t_type,
-            category,
-            subcategory,
-            payment_source,
-            description,
-        ],
-        ensure_ascii=False,
-        separators=(',', ':'),
-    ).encode('utf-8')
-    return hashlib.sha256(canonical).hexdigest()
 
 
 def _transaction_write_response(row: dict, *, duplicate: bool):
@@ -5184,6 +5570,554 @@ async def api_budgets_delete(request: web.Request):
     if not deleted:
         return _json_response({'detail': 'Not found'}, status=404)
     return web.Response(status=204)
+
+
+# ---- recurring operations, insights, digest, forecast ----
+
+def _recurring_payload(row):
+    return {
+        'id': row['id'],
+        'type': row['type'],
+        'amount': float(row['amount']),
+        'currency': row['currency'],
+        'amount_uah': _round_money(row['amount_uah']),
+        'category': row['category'],
+        'subcategory': row.get('subcategory'),
+        'description': row.get('description') or '',
+        'payment_source': row.get('payment_source'),
+        'frequency': row['frequency'],
+        'interval': int(row['interval']),
+        'start_date': row['start_date'],
+        'next_due_date': row['next_due_date'],
+        'last_generated_date': row.get('last_generated_date'),
+        'auto_create': bool(row['auto_create']),
+        'active': bool(row['active']),
+    }
+
+
+def _next_recurrence_after(start, frequency, interval, anchor_day, baseline):
+    if start > baseline:
+        return start
+    if frequency in ('daily', 'weekly'):
+        step_days = interval if frequency == 'daily' else interval * 7
+        steps = (baseline - start).days // step_days + 1
+        return start + timedelta(days=steps * step_days)
+    candidate = start
+    for _ in range(5000):
+        if candidate > baseline:
+            return candidate
+        candidate = advance_recurrence(
+            candidate, frequency, interval=interval, anchor_day=anchor_day
+        )
+    raise ValueError('recurring schedule is too old')
+
+
+async def _validate_recurring_values(user_id, body, existing=None):
+    if not isinstance(body, dict):
+        return None, _json_response(
+            {'detail': 'JSON body must be an object'}, status=400
+        )
+    allowed = {
+        'type', 'amount', 'currency', 'category', 'subcategory', 'description',
+        'payment_source', 'frequency', 'interval', 'start_date', 'auto_create',
+        'active',
+    }
+    unknown = set(body) - allowed
+    if unknown:
+        return None, _json_response(
+            {'detail': f'unsupported fields: {", ".join(sorted(unknown))}'},
+            status=400,
+        )
+
+    def current(name, default=None):
+        if name in body:
+            return body[name]
+        if existing is not None:
+            return existing.get(name, default)
+        return default
+
+    recurring_type = current('type')
+    if recurring_type not in ('income', 'expense'):
+        return None, _json_response(
+            {'detail': 'type must be income or expense'}, status=400
+        )
+
+    raw_amount = current('amount')
+    if raw_amount is None or isinstance(raw_amount, bool):
+        return None, _json_response(
+            {'detail': 'amount must be a positive number'}, status=400
+        )
+    try:
+        amount = float(raw_amount)
+    except (TypeError, ValueError):
+        return None, _json_response(
+            {'detail': 'amount must be a positive number'}, status=400
+        )
+    if not math.isfinite(amount) or not 0 < amount <= 1_000_000_000:
+        return None, _json_response(
+            {'detail': 'amount must be between 0 and 1000000000'}, status=400
+        )
+
+    currency = str(current('currency', 'UAH')).upper()
+    if currency not in ('UAH', 'USD', 'EUR'):
+        return None, _json_response(
+            {'detail': 'currency must be UAH, USD, or EUR'}, status=400
+        )
+
+    raw_category = current('category')
+    if not isinstance(raw_category, str):
+        return None, _json_response(
+            {'detail': 'category must be a string'}, status=400
+        )
+    category = raw_category.strip()
+    if not category or len(category) > 80:
+        return None, _json_response(
+            {'detail': 'category must be 1-80 characters'}, status=400
+        )
+
+    raw_subcategory = current('subcategory')
+    if raw_subcategory is not None and not isinstance(raw_subcategory, str):
+        return None, _json_response(
+            {'detail': 'subcategory must be a string or null'}, status=400
+        )
+    subcategory = raw_subcategory.strip() if raw_subcategory else None
+    if subcategory and len(subcategory) > 80:
+        return None, _json_response(
+            {'detail': 'subcategory must be at most 80 characters'}, status=400
+        )
+
+    raw_description = current('description', '')
+    if raw_description is not None and not isinstance(raw_description, str):
+        return None, _json_response(
+            {'detail': 'description must be a string'}, status=400
+        )
+    description = (raw_description or '').strip()
+    if len(description) > 200:
+        return None, _json_response(
+            {'detail': 'description must be at most 200 characters'}, status=400
+        )
+
+    source_body = {'payment_source': current('payment_source')}
+    payment_source, source_error = _parse_payment_source(source_body)
+    if source_error is not None:
+        return None, source_error
+
+    frequency = current('frequency')
+    if frequency not in SUPPORTED_FREQUENCIES:
+        return None, _json_response(
+            {'detail': 'frequency must be daily, weekly, monthly, or yearly'},
+            status=400,
+        )
+    interval = current('interval', 1)
+    if isinstance(interval, bool) or not isinstance(interval, int) or not 1 <= interval <= 365:
+        return None, _json_response(
+            {'detail': 'interval must be an integer between 1 and 365'}, status=400
+        )
+
+    raw_start = current('start_date')
+    try:
+        start = date.fromisoformat(str(raw_start))
+    except (TypeError, ValueError):
+        return None, _json_response(
+            {'detail': 'start_date must be YYYY-MM-DD'}, status=400
+        )
+
+    auto_create = (
+        body['auto_create']
+        if 'auto_create' in body
+        else bool(existing['auto_create']) if existing is not None else True
+    )
+    active = (
+        body['active']
+        if 'active' in body
+        else bool(existing['active']) if existing is not None else True
+    )
+    if not isinstance(auto_create, bool) or not isinstance(active, bool):
+        return None, _json_response(
+            {'detail': 'auto_create and active must be booleans'}, status=400
+        )
+
+    settings = await user_settings_for(user_id)
+    category_entry = (
+        settings.get('categories', {}).get(recurring_type, {}).get(category)
+    )
+    if not isinstance(category_entry, dict):
+        return None, _json_response({'detail': 'unknown category'}, status=400)
+    if subcategory and subcategory not in (category_entry.get('subcategories') or []):
+        return None, _json_response({'detail': 'unknown subcategory'}, status=400)
+
+    amount_changed = existing is None or 'amount' in body or 'currency' in body
+    if amount_changed:
+        rate = await get_exchange_rate(currency)
+        amount_uah = round(convert_to_uah(amount, currency, rate), 2)
+        if amount_uah < 0.01:
+            return None, _json_response(
+                {'detail': 'UAH equivalent must be at least 0.01'}, status=400
+            )
+    else:
+        amount_uah = float(existing['amount_uah'])
+
+    schedule_changed = existing is None or bool(
+        {'frequency', 'interval', 'start_date'} & set(body)
+    )
+    if schedule_changed:
+        anchor_day = start.day
+        if existing is None:
+            next_due_date = start.isoformat()
+            last_generated_date = None
+        else:
+            last_generated_date = existing.get('last_generated_date')
+            baseline = datetime.now(KYIV_TZ).date()
+            if last_generated_date:
+                baseline = max(
+                    baseline, date.fromisoformat(last_generated_date)
+                )
+            next_due_date = _next_recurrence_after(
+                start, frequency, interval, anchor_day, baseline
+            ).isoformat()
+    else:
+        next_due_date = existing['next_due_date']
+        last_generated_date = existing.get('last_generated_date')
+        anchor_day = int(existing['anchor_day'])
+
+    return {
+        'type': recurring_type,
+        'amount': amount,
+        'currency': currency,
+        'amount_uah': amount_uah,
+        'category': category,
+        'subcategory': subcategory,
+        'description': description,
+        'payment_source': payment_source,
+        'frequency': frequency,
+        'interval': interval,
+        'start_date': start.isoformat(),
+        'anchor_day': anchor_day,
+        'next_due_date': next_due_date,
+        'last_generated_date': last_generated_date,
+        'auto_create': auto_create,
+        'active': active,
+    }, None
+
+
+async def api_recurring_list(request: web.Request):
+    rows = await db.list_recurring_operations(request['user_id'])
+    return _json_response([_recurring_payload(row) for row in rows])
+
+
+@serialized_recurring_write
+async def api_recurring_create(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+    values, err = await _validate_recurring_values(request['user_id'], body)
+    if err is not None:
+        return err
+    row = await db.create_recurring_operation(request['user_id'], values)
+    return _json_response(_recurring_payload(row), status=201)
+
+
+@serialized_recurring_write
+async def api_recurring_patch(request: web.Request):
+    try:
+        recurring_id = int(request.match_info['id'])
+    except (KeyError, TypeError, ValueError):
+        return _json_response({'detail': 'Invalid id'}, status=400)
+    existing = await db.get_recurring_operation(request['user_id'], recurring_id)
+    if existing is None:
+        return _json_response({'detail': 'Not found'}, status=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+    values, err = await _validate_recurring_values(
+        request['user_id'], body, existing=existing
+    )
+    if err is not None:
+        return err
+    row = await db.update_recurring_operation(
+        request['user_id'], recurring_id, values
+    )
+    if row is None:
+        return _json_response({'detail': 'Not found'}, status=404)
+    return _json_response(_recurring_payload(row))
+
+
+@serialized_recurring_write
+async def api_recurring_delete(request: web.Request):
+    try:
+        recurring_id = int(request.match_info['id'])
+    except (KeyError, TypeError, ValueError):
+        return _json_response({'detail': 'Invalid id'}, status=400)
+    deleted = await db.delete_recurring_operation(
+        request['user_id'], recurring_id
+    )
+    if not deleted:
+        return _json_response({'detail': 'Not found'}, status=404)
+    return web.Response(status=204)
+
+
+async def process_due_recurring_operations(through_date=None):
+    through = through_date or datetime.now(KYIV_TZ).date()
+    if not isinstance(through, date):
+        through = date.fromisoformat(str(through))
+    templates = await db.list_due_recurring_operations(through.isoformat())
+    created = failed = processed = 0
+    for candidate in templates:
+        owner = str(candidate['user_id'])
+        async with _recurring_user_locks[owner]:
+            try:
+                template = await db.get_recurring_operation(
+                    owner, candidate['id']
+                )
+                if (
+                    template is None
+                    or not bool(template['active'])
+                    or not bool(template['auto_create'])
+                    or template['next_due_date'] > through.isoformat()
+                ):
+                    continue
+                first_due = date.fromisoformat(template['next_due_date'])
+                due_dates = due_recurrence_dates(
+                    start_date=first_due,
+                    through=through,
+                    frequency=template['frequency'],
+                    interval=int(template['interval']),
+                    anchor_day=int(template['anchor_day']),
+                )
+                if not due_dates:
+                    continue
+                next_due = advance_recurrence(
+                    due_dates[-1],
+                    template['frequency'],
+                    interval=int(template['interval']),
+                    anchor_day=int(template['anchor_day']),
+                )
+                rate = await get_exchange_rate(template['currency'])
+                materialized = await db.materialize_recurring_occurrences(
+                    owner,
+                    template['id'],
+                    expected_next_due=template['next_due_date'],
+                    expected_currency=template['currency'],
+                    due_dates=due_dates,
+                    rate=rate,
+                    next_due_date=next_due,
+                )
+                created += materialized['created']
+                processed += int(materialized['processed'])
+            except Exception as exc:
+                failed += 1
+                logger.exception(
+                    'recurring operation failed id=%s: %s',
+                    candidate.get('id'),
+                    exc,
+                )
+    return {'created': created, 'failed': failed, 'processed': processed}
+
+
+async def api_recurring_suggestions(request: web.Request):
+    rows = await db.get_transactions(request['user_id'])
+    return _json_response(list(detect_recurring_candidates(rows)))
+
+
+def _query_date(request, field, default):
+    raw = request.rel_url.query.get(field)
+    if raw is None:
+        return default, None
+    try:
+        return date.fromisoformat(raw), None
+    except (TypeError, ValueError):
+        return None, _json_response(
+            {'detail': f'{field} must be YYYY-MM-DD'}, status=400
+        )
+
+
+async def api_insights(request: web.Request):
+    today, err = _query_date(
+        request, 'as_of', datetime.now(KYIV_TZ).date()
+    )
+    if err is not None:
+        return err
+    rows = await db.get_transactions(request['user_id'])
+    budgets = [
+        budget for budget in await db.get_budgets(request['user_id'])
+        if budget.get('type') == 'expense'
+    ]
+    return _json_response(list(build_financial_insights(
+        rows, budgets=budgets, today=today
+    )))
+
+
+async def api_weekly_digest(request: web.Request):
+    today = datetime.now(KYIV_TZ).date()
+    default_start = today - timedelta(days=today.weekday())
+    week_start, err = _query_date(request, 'week_start', default_start)
+    if err is not None:
+        return err
+    if week_start.weekday() != 0:
+        return _json_response(
+            {'detail': 'week_start must be a Monday'}, status=400
+        )
+    rows = await db.get_transactions(request['user_id'])
+    return _json_response(build_weekly_digest(rows, week_start=week_start))
+
+
+def _scheduled_occurrences_for_month(
+    recurring_rows, *, year, month, as_of
+):
+    _, month_end_text = _month_date_bounds(year, month)
+    month_end = date.fromisoformat(month_end_text) - timedelta(days=1)
+    result = []
+    for row in recurring_rows:
+        if not bool(row['active']):
+            continue
+        start = date.fromisoformat(row['next_due_date'])
+        due_dates = due_recurrence_dates(
+            start_date=start,
+            through=month_end,
+            frequency=row['frequency'],
+            interval=int(row['interval']),
+            anchor_day=int(row['anchor_day']),
+        )
+        for due_date in due_dates:
+            if due_date <= as_of or due_date.year != year or due_date.month != month:
+                continue
+            result.append({
+                'date': due_date.isoformat(),
+                'type': row['type'],
+                'amount_uah': row['amount_uah'],
+            })
+    return result
+
+
+async def api_forecast(request: web.Request):
+    year, month, err = _parse_year_month(request)
+    if err is not None:
+        return err
+    as_of, err = _query_date(
+        request, 'as_of', datetime.now(KYIV_TZ).date()
+    )
+    if err is not None:
+        return err
+    rows = await db.get_transactions(request['user_id'], year=year, month=month)
+    recurring = await db.list_recurring_operations(request['user_id'])
+    scheduled = _scheduled_occurrences_for_month(
+        recurring, year=year, month=month, as_of=as_of
+    )
+    projected_income = sum(
+        Decimal(str(row['amount_uah']))
+        for row in (*rows, *scheduled) if row['type'] == 'income'
+    )
+    settings = await user_settings_for(request['user_id'])
+    try:
+        tax = calculate_tax_group(
+            projected_income, settings.get('tax_config'), year=year
+        )
+    except ValueError as exc:
+        return _json_response({'detail': str(exc)}, status=422)
+    return _json_response(forecast_month_result(
+        rows,
+        scheduled,
+        year=year,
+        month=month,
+        estimated_tax_uah=tax['total_tax'],
+    ))
+
+
+async def api_notification_settings(request: web.Request):
+    return _json_response(
+        await db.get_notification_preferences(request['user_id'])
+    )
+
+
+async def api_notification_settings_patch(request: web.Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+    if not isinstance(body, dict) or set(body) != {'weekly_digest_enabled'}:
+        return _json_response(
+            {'detail': 'weekly_digest_enabled is required'}, status=400
+        )
+    enabled = body['weekly_digest_enabled']
+    if not isinstance(enabled, bool):
+        return _json_response(
+            {'detail': 'weekly_digest_enabled must be boolean'}, status=400
+        )
+    return _json_response(await db.set_notification_preferences(
+        request['user_id'], enabled
+    ))
+
+
+def _weekly_digest_message(digest):
+    return (
+        '📊 Тижневий дайджест Ruby Finance\n\n'
+        f'Доходи: {digest["total_income"]} ₴\n'
+        f'Витрати: {digest["total_expense"]} ₴\n'
+        f'Чистий результат: {digest["net"]} ₴'
+    )
+
+
+async def send_weekly_digests(telegram_bot, *, week_start=None):
+    start = week_start or (
+        datetime.now(KYIV_TZ).date()
+        - timedelta(days=datetime.now(KYIV_TZ).date().weekday())
+    )
+    if not isinstance(start, date):
+        start = date.fromisoformat(str(start))
+    if start.weekday() != 0:
+        raise ValueError('week_start must be a Monday')
+    period_key = f'{start.isocalendar().year}-W{start.isocalendar().week:02d}'
+    sent = failed = skipped = 0
+    for user_id in await db.list_weekly_digest_users():
+        async with _recurring_user_locks[str(user_id)]:
+            preferences = await db.get_notification_preferences(user_id)
+            if not preferences['weekly_digest_enabled']:
+                continue
+            claimed = await db.claim_notification_delivery(
+                user_id, 'weekly_digest', period_key
+            )
+            if not claimed:
+                skipped += 1
+                continue
+            try:
+                rows = await db.get_transactions(user_id)
+                digest = build_weekly_digest(rows, week_start=start)
+                message = await telegram_bot.send_message(
+                    chat_id=user_id, text=_weekly_digest_message(digest)
+                )
+                await db.finish_notification_delivery(
+                    user_id,
+                    'weekly_digest',
+                    period_key,
+                    'sent',
+                    message_id=getattr(message, 'message_id', None),
+                )
+                sent += 1
+            except Exception as exc:
+                await db.finish_notification_delivery(
+                    user_id, 'weekly_digest', period_key, 'failed',
+                    error=str(exc)[:200],
+                )
+                failed += 1
+    return {'sent': sent, 'failed': failed, 'skipped': skipped}
+
+
+async def recurring_operations_job(context: ContextTypes.DEFAULT_TYPE):
+    result = await process_due_recurring_operations()
+    logger.info('recurring scheduled job complete: %s', result)
+
+
+async def weekly_digest_job(context: ContextTypes.DEFAULT_TYPE, *, today=None):
+    # Registered daily for timezone/DST safety; Sunday sends the current week.
+    current_day = today or datetime.now(KYIV_TZ).date()
+    if current_day.weekday() != 6:
+        return
+    result = await send_weekly_digests(
+        context.bot, week_start=current_day - timedelta(days=6)
+    )
+    logger.info('weekly digest scheduled job complete: %s', result)
 
 
 # ---- reports parity ----
@@ -6214,6 +7148,30 @@ def build_api_app() -> web.Application:
     app.router.add_route(
         'DELETE', '/api/budgets/{type}/{category}', api_budgets_delete
     )
+    app.router.add_route(
+        'GET', '/api/recurring-operations', api_recurring_list
+    )
+    app.router.add_route(
+        'POST', '/api/recurring-operations', api_recurring_create
+    )
+    app.router.add_route(
+        'PATCH', '/api/recurring-operations/{id}', api_recurring_patch
+    )
+    app.router.add_route(
+        'DELETE', '/api/recurring-operations/{id}', api_recurring_delete
+    )
+    app.router.add_route(
+        'GET', '/api/recurring-suggestions', api_recurring_suggestions
+    )
+    app.router.add_route('GET', '/api/insights', api_insights)
+    app.router.add_route('GET', '/api/digest/weekly', api_weekly_digest)
+    app.router.add_route('GET', '/api/forecast', api_forecast)
+    app.router.add_route(
+        'GET', '/api/settings/notifications', api_notification_settings
+    )
+    app.router.add_route(
+        'PATCH', '/api/settings/notifications', api_notification_settings_patch
+    )
     app.router.add_route('GET', '/api/categories', api_categories)
     app.router.add_route('GET', '/api/settings', api_settings)
 
@@ -6297,8 +7255,9 @@ def main():
     # Text messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
 
-    # Daily DB backup at 03:00 Kyiv time
-    if application.job_queue:
+    # Only the primary worker may register jobs. Redirect/migration services
+    # set ENABLE_SCHEDULED_JOBS=false to avoid duplicate writes/messages.
+    if application.job_queue and ENABLE_SCHEDULED_JOBS:
         application.job_queue.run_once(
             daily_backup_job,
             when=10,
@@ -6309,7 +7268,21 @@ def main():
             time=_dt.time(hour=3, minute=0, tzinfo=KYIV_TZ),
             name='daily_backup'
         )
-        logger.info("Daily backup scheduled at 03:00 Kyiv")
+        application.job_queue.run_daily(
+            recurring_operations_job,
+            time=_dt.time(hour=4, minute=0, tzinfo=KYIV_TZ),
+            name='recurring_operations',
+        )
+        application.job_queue.run_daily(
+            weekly_digest_job,
+            time=_dt.time(hour=19, minute=0, tzinfo=KYIV_TZ),
+            name='weekly_digest',
+        )
+        logger.info(
+            "Scheduled jobs enabled: backup, recurring operations, weekly digest"
+        )
+    elif not ENABLE_SCHEDULED_JOBS:
+        logger.info("Scheduled jobs disabled by ENABLE_SCHEDULED_JOBS")
 
     logger.info("🤖 Бот @Olesia_money_bot запущено!")
     logger.info(f"📊 Database: {DB_FILE}")

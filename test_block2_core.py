@@ -679,3 +679,81 @@ def test_budget_progress_quantizes_sqlite_real_before_comparison(
     assert result["remaining_uah"] == 0.0
     assert result["progress_percent"] == 100.0
     assert result["is_exceeded"] is False
+
+
+def test_fingerprint_migration_backfills_legacy_idempotent_rows(
+    monkeypatch, tmp_path
+):
+    path = tmp_path / "legacy-fingerprint.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """CREATE TABLE transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            amount REAL NOT NULL,
+            currency TEXT DEFAULT 'UAH',
+            amount_uah REAL NOT NULL,
+            type TEXT NOT NULL,
+            category TEXT NOT NULL,
+            subcategory TEXT,
+            description TEXT,
+            date DATE NOT NULL,
+            timestamp DATETIME NOT NULL,
+            client_request_id TEXT,
+            payment_source TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )"""
+    )
+    connection.execute(
+        """INSERT INTO transactions (
+            user_id, amount, currency, amount_uah, type, category,
+            description, date, timestamp, client_request_id, payment_source
+        ) VALUES (
+            'user-1', 40, 'UAH', 40, 'expense', 'Old', 'Lunch',
+            '2026-07-01', '2026-07-01 10:00:00',
+            'legacy-key-1', 'cash'
+        )"""
+    )
+    connection.commit()
+    connection.close()
+    database = bot.Database(str(path))
+    monkeypatch.setattr(bot, "db", database)
+    run(database.save_user_settings("user-1", user_settings(expense=("Old",))))
+
+    assert database.conn.execute(
+        "SELECT request_fingerprint FROM transactions WHERE id=1"
+    ).fetchone()[0]
+    run(
+        bot.api_patch_transaction(
+            Request(
+                body={"payment_source": "card"},
+                match_info={"id": "1"},
+                method="PATCH",
+            )
+        )
+    )
+    run(
+        bot.api_categories_update(
+            Request(
+                body={"new_name": "New"},
+                match_info={"type": "expense", "name": "Old"},
+                method="PATCH",
+            )
+        )
+    )
+    replay = run(
+        bot.api_post_transaction(
+            Request(
+                body=transaction_body(
+                    category="Old",
+                    payment_source="cash",
+                    client_request_id="legacy-key-1",
+                )
+            )
+        )
+    )
+
+    assert replay.status == 200
+    assert payload(replay)["duplicate"] is True
+    assert payload(replay)["category"] == "New"
+    assert payload(replay)["payment_source"] == "card"
