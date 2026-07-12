@@ -23,6 +23,13 @@ Telegram-бот і Mini App для персонального та ФОП-обл
 | `API_BASE_URL` | Mini App | HTTPS URL worker-сервісу без кінцевого `/`. |
 | `BUILD_ID` | Mini App | Необов’язковий cache-busting ID. |
 | `PORT` | обидва | Локальний override; Railway встановлює автоматично. |
+| `BACKUP_S3_BUCKET` | worker | Вмикає off-site backup до S3-compatible bucket. |
+| `BACKUP_S3_PREFIX` | worker | Необов’язковий object prefix, наприклад `production/worker`. |
+| `BACKUP_S3_ENDPOINT_URL` | worker | Endpoint для R2/B2; для AWS S3 не задається. |
+| `BACKUP_S3_REGION` | worker | Region (`auto` для Cloudflare R2). |
+| `BACKUP_S3_ACCESS_KEY_ID` / `BACKUP_S3_SECRET_ACCESS_KEY` | worker | Облікові дані storage; задаються разом і лише в env. |
+| `BACKUP_S3_SESSION_TOKEN` | worker | Необов’язковий temporary credential token. |
+| `BACKUP_S3_SSE` | worker | Необов’язковий S3 server-side encryption mode. |
 
 ## Локальний запуск
 
@@ -60,3 +67,5 @@ CI виконує ці перевірки на push у `main` і для pull req
 - Deployment model: push to GitHub `main` → Railway auto-deploy.
 
 Токени ротуються через BotFather і оновлюються лише в Railway Variables та локальному `.env`, ніколи в коді.
+
+Backup створюється SQLite Backup API, проходить `PRAGMA integrity_check` і SHA-256 verification. При налаштованому S3-compatible storage об’єкт після upload завантажується назад і повторно перевіряється.
