@@ -1,42 +1,115 @@
-"""Clean up any leftover transactions on the test user_id."""
-import io, os, sys, hmac, hashlib, time, json, requests
-from urllib.parse import urlencode
+"""Permanently delete explicitly named synthetic Ruby Finance QA accounts."""
+
+from __future__ import annotations
+
+import os
+import sys
+from typing import Mapping, Sequence
+
+import requests
 
 try:
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-except Exception:
-    pass
-
-BASE_URL = "https://worker-production-68b3.up.railway.app"
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is required for production QA cleanup")
-TEST_USER_ID = 999000777
-
-
-def make_init_data(user_id, token):
-    user_json = json.dumps({"id": user_id, "first_name": "QAv2", "username": "qa2"}, separators=(",", ":"))
-    params = {"auth_date": str(int(time.time())), "user": user_json, "query_id": "QA"}
-    pairs = sorted(f"{k}={v}" for k, v in params.items())
-    data_check = "\n".join(pairs)
-    secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
-    h = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
-    params["hash"] = h
-    return urlencode(params)
+    from qa_test.qa_runner import (
+        ACCOUNT_DELETE_CONFIRMATION,
+        SYNTHETIC_PREFIX,
+        QaConfigError,
+        _configure_utf8_console,
+        _validate_base_url,
+        make_init_data,
+    )
+except ModuleNotFoundError:  # direct: python qa_test/cleanup_leftovers.py ...
+    from qa_runner import (  # type: ignore
+        ACCOUNT_DELETE_CONFIRMATION,
+        SYNTHETIC_PREFIX,
+        QaConfigError,
+        _configure_utf8_console,
+        _validate_base_url,
+        make_init_data,
+    )
 
 
-HEADERS = {"X-Telegram-Init-Data": make_init_data(TEST_USER_ID, BOT_TOKEN), "Content-Type": "application/json"}
+def parse_user_ids(
+    arguments: Sequence[str], env: Mapping[str, str] | None = None
+) -> tuple[int, ...]:
+    source = os.environ if env is None else env
+    raw_values = list(arguments)
+    if not raw_values:
+        combined = str(source.get("QA_USER_IDS", "")).strip()
+        raw_values = [item.strip() for item in combined.split(",") if item.strip()]
+    if not raw_values:
+        raw_values = [
+            str(source.get(name, "")).strip()
+            for name in ("QA_USER_ID_A", "QA_USER_ID_B")
+            if str(source.get(name, "")).strip()
+        ]
+    if not raw_values:
+        raise QaConfigError(
+            "provide synthetic ids as arguments or QA_USER_IDS/QA_USER_ID_A/B"
+        )
+    try:
+        user_ids = tuple(dict.fromkeys(int(value) for value in raw_values))
+    except ValueError as exc:
+        raise QaConfigError("QA user ids must be integers") from exc
+    if any(not str(user_id).startswith(SYNTHETIC_PREFIX) for user_id in user_ids):
+        raise QaConfigError(f"cleanup ids must start with {SYNTHETIC_PREFIX}")
+    return user_ids
 
-r = requests.get(f"{BASE_URL}/api/transactions?limit=all", headers=HEADERS, timeout=30)
-rows = r.json() if r.headers.get("content-type", "").startswith("application/json") else []
-print(f"Found {len(rows)} existing transactions on user {TEST_USER_ID}")
-for row in rows:
-    tid = row.get("id")
-    time.sleep(1.05)
-    d = requests.delete(f"{BASE_URL}/api/transactions/{tid}", headers=HEADERS, timeout=30)
-    print(f"  DELETE {tid} type={row.get('type')} amt={row.get('amount')} cat={row.get('category')} -> {d.status_code}")
 
-time.sleep(1.05)
-r2 = requests.get(f"{BASE_URL}/api/transactions?limit=all", headers=HEADERS, timeout=30)
-left = r2.json() if r2.headers.get("content-type", "").startswith("application/json") else []
-print(f"After cleanup: {len(left)} transactions remain")
+def cleanup_account(
+    base_url: str,
+    token: str,
+    user_id: int,
+    *,
+    timeout: float = 30.0,
+) -> int:
+    user = {
+        "id": user_id,
+        "first_name": "Ruby QA cleanup",
+        "username": f"ruby_qa_{str(user_id)[-8:]}",
+        "language_code": "uk",
+    }
+    response = requests.delete(
+        f"{base_url}/api/account",
+        headers={
+            "Accept": "application/json",
+            "X-Telegram-Init-Data": make_init_data(user, token),
+        },
+        json={"confirmation": ACCOUNT_DELETE_CONFIRMATION},
+        timeout=timeout,
+    )
+    return response.status_code
+
+
+def main(arguments: Sequence[str] | None = None) -> int:
+    _configure_utf8_console()
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
+    try:
+        user_ids = parse_user_ids(list(arguments if arguments is not None else sys.argv[1:]))
+        base_url = _validate_base_url(os.environ.get("API_BASE_URL", ""))
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        if not token:
+            raise QaConfigError("TELEGRAM_BOT_TOKEN is required")
+        failed = []
+        for user_id in user_ids:
+            try:
+                status = cleanup_account(base_url, token, user_id)
+            except requests.RequestException as exc:
+                print(f"{user_id}: transport failure ({type(exc).__name__})")
+                failed.append(user_id)
+                continue
+            print(f"{user_id}: DELETE /api/account -> {status}")
+            if status not in {200, 404, 410}:
+                failed.append(user_id)
+        return 1 if failed else 0
+    except QaConfigError as exc:
+        print(f"Cleanup configuration error: {exc}")
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
