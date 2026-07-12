@@ -457,6 +457,7 @@ class Database:
                 description TEXT,
                 date DATE NOT NULL,
                 timestamp DATETIME NOT NULL,
+                client_request_id TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -626,6 +627,32 @@ class Database:
                 if 'subcategory' not in cols:
                     cursor.execute("ALTER TABLE transactions ADD COLUMN subcategory TEXT")
                     logger.info(f"Migration {mig}: added transactions.subcategory")
+                mark(mig)
+            except Exception as e:
+                logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
+
+        # 20260712_add_client_request_id
+        #   Mini App writes can be retried after a timeout or a double tap. A
+        #   caller-provided request id makes those retries safe, while scoping
+        #   uniqueness by user keeps tenant data fully independent.
+        mig = '20260712_add_client_request_id'
+        if not applied(mig):
+            try:
+                cursor.execute("PRAGMA table_info(transactions)")
+                cols = {r[1] for r in cursor.fetchall()}
+                if 'client_request_id' not in cols:
+                    cursor.execute(
+                        "ALTER TABLE transactions ADD COLUMN client_request_id TEXT"
+                    )
+                    logger.info(
+                        f"Migration {mig}: added transactions.client_request_id"
+                    )
+                cursor.execute('''
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    idx_transactions_user_client_request
+                    ON transactions(user_id, client_request_id)
+                    WHERE client_request_id IS NOT NULL
+                ''')
                 mark(mig)
             except Exception as e:
                 logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
@@ -842,17 +869,77 @@ class Database:
             self.conn.commit()
 
     async def add_transaction(self, user_id, amount, currency, amount_uah, t_type,
-                             category, description, date, timestamp, subcategory=None):
+                             category, description, date, timestamp, subcategory=None,
+                             client_request_id=None):
         """Add transaction to database"""
         async with db_lock:
             cursor = self.conn.cursor()
+            try:
+                cursor.execute('''
+                    INSERT INTO transactions
+                    (user_id, amount, currency, amount_uah, type, category,
+                     subcategory, description, date, timestamp, client_request_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_id, amount, currency, amount_uah, t_type, category,
+                    subcategory, description, date, timestamp, client_request_id,
+                ))
+                self.conn.commit()
+                return cursor.lastrowid
+            except sqlite3.IntegrityError:
+                self.conn.rollback()
+                raise
+
+    async def get_transaction_by_client_request_id(
+        self, user_id, client_request_id
+    ):
+        """Return one user's transaction for an idempotency key, if present."""
+        async with db_lock:
+            cursor = self.conn.cursor()
             cursor.execute('''
-                INSERT INTO transactions
-                (user_id, amount, currency, amount_uah, type, category, subcategory, description, date, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (user_id, amount, currency, amount_uah, t_type, category, subcategory, description, date, timestamp))
-            self.conn.commit()
-            return cursor.lastrowid
+                SELECT * FROM transactions
+                WHERE user_id = ? AND client_request_id = ?
+                LIMIT 1
+            ''', (str(user_id), client_request_id))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    async def get_quick_templates(self, user_id, limit=5):
+        """Aggregate reusable templates over all of one user's history."""
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT
+                    amount,
+                    currency,
+                    type,
+                    category,
+                    NULLIF(subcategory, '') AS subcategory,
+                    COALESCE(description, '') AS description,
+                    COUNT(*) AS usage_count,
+                    MAX(timestamp) AS last_used_at
+                FROM transactions
+                WHERE user_id = ?
+                GROUP BY
+                    amount,
+                    currency,
+                    type,
+                    category,
+                    NULLIF(subcategory, ''),
+                    COALESCE(description, '')
+                ORDER BY usage_count DESC, last_used_at DESC
+                LIMIT ?
+            ''', (str(user_id), int(limit)))
+            templates = [dict(row) for row in cursor.fetchall()]
+
+            cursor.execute('''
+                SELECT * FROM transactions
+                WHERE user_id = ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+            ''', (str(user_id),))
+            last_row = cursor.fetchone()
+            return templates, (dict(last_row) if last_row else None)
 
     async def add_time_track(self, user_id, minutes, category, description, date, timestamp):
         """Add time track to database"""
@@ -4066,12 +4153,97 @@ async def api_get_transactions(request: web.Request):
     return _json_response(result)
 
 
+def _quick_operation_payload(row: dict):
+    """Expose only date-independent fields that are safe to repeat."""
+    return {
+        'amount': float(row['amount']),
+        'currency': row['currency'],
+        'type': row['type'],
+        'category': row['category'],
+        'subcategory': row.get('subcategory') or None,
+        'comment': row.get('description') or '',
+    }
+
+
+async def api_quick_templates(request: web.Request):
+    """Return frequent operations and the latest operation for quick-add UI."""
+    raw_limit = request.rel_url.query.get('limit')
+    if raw_limit is None:
+        limit = 5
+    else:
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return _json_response(
+                {'detail': 'limit must be an integer between 1 and 10'},
+                status=400,
+            )
+        if not 1 <= limit <= 10:
+            return _json_response(
+                {'detail': 'limit must be between 1 and 10'}, status=400
+            )
+
+    templates, last_operation = await db.get_quick_templates(
+        request['user_id'], limit=limit
+    )
+    result = []
+    for row in templates:
+        item = _quick_operation_payload(row)
+        item['usage_count'] = int(row['usage_count'])
+        result.append(item)
+
+    return _json_response({
+        'templates': result,
+        'last_operation': (
+            _quick_operation_payload(last_operation) if last_operation else None
+        ),
+    })
+
+
 def _looks_like_iso_date(s: str) -> bool:
     try:
         datetime.strptime(s, '%Y-%m-%d')
         return True
     except (TypeError, ValueError):
         return False
+
+
+_CLIENT_REQUEST_ID_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$')
+
+
+def _parse_client_request_id(body: dict):
+    """Validate an optional bounded, log-safe idempotency token."""
+    if 'client_request_id' not in body or body['client_request_id'] is None:
+        return None, None
+    value = body['client_request_id']
+    if not isinstance(value, str) or not _CLIENT_REQUEST_ID_PATTERN.fullmatch(value):
+        return None, _json_response({
+            'detail': (
+                'client_request_id must be a 1-128 character ASCII token '
+                'using letters, digits, dot, underscore, colon, or hyphen'
+            )
+        }, status=400)
+    return value, None
+
+
+def _transaction_write_response(row: dict, *, duplicate: bool):
+    """Stable POST response for both a new write and an idempotent replay."""
+    client_request_id = row.get('client_request_id')
+    return {
+        'id': row['id'],
+        'amount': row['amount'],
+        'currency': row['currency'],
+        'amount_uah': row['amount_uah'],
+        'type': row['type'],
+        'category': row['category'],
+        'subcategory': row.get('subcategory'),
+        'description': row.get('description'),
+        'date': row['date'],
+        'timestamp': row['timestamp'],
+        'client_request_id': client_request_id,
+        'duplicate': duplicate,
+        'idempotent': client_request_id is not None,
+    }
 
 
 async def api_post_transaction(request: web.Request):
@@ -4082,6 +4254,25 @@ async def api_post_transaction(request: web.Request):
         body = await request.json()
     except Exception:
         return _json_response({'detail': 'Invalid JSON'}, status=400)
+    if not isinstance(body, dict):
+        return _json_response({'detail': 'JSON body must be an object'}, status=400)
+
+    client_request_id, err = _parse_client_request_id(body)
+    if err is not None:
+        return err
+    if client_request_id is not None:
+        existing = await db.get_transaction_by_client_request_id(
+            user_id, client_request_id
+        )
+        if existing is not None:
+            await db.upsert_user(_UserObj(tg_user))
+            logger.info(
+                "API POST /api/transactions idempotent replay "
+                f"user={user_id} id={existing['id']}"
+            )
+            return _json_response(
+                _transaction_write_response(existing, duplicate=True)
+            )
 
     t_type = body.get('type')
     if t_type not in ('income', 'expense'):
@@ -4138,16 +4329,36 @@ async def api_post_transaction(request: web.Request):
     date_str = now.strftime('%Y-%m-%d')
     ts_str = now.strftime('%Y-%m-%d %H:%M:%S')
 
-    row_id = await db.add_transaction(
-        user_id, amount, currency, amount_uah,
-        t_type, category, description, date_str, ts_str,
-        subcategory=subcategory,
-    )
+    try:
+        row_id = await db.add_transaction(
+            user_id, amount, currency, amount_uah,
+            t_type, category, description, date_str, ts_str,
+            subcategory=subcategory,
+            client_request_id=client_request_id,
+        )
+    except sqlite3.IntegrityError:
+        # Two concurrent retries can both miss the preflight lookup. The
+        # user-scoped unique index is the final authority; return the winner.
+        if client_request_id is None:
+            raise
+        existing = await db.get_transaction_by_client_request_id(
+            user_id, client_request_id
+        )
+        if existing is None:
+            raise
+        await db.upsert_user(_UserObj(tg_user))
+        logger.info(
+            "API POST /api/transactions concurrent idempotent replay "
+            f"user={user_id} id={existing['id']}"
+        )
+        return _json_response(
+            _transaction_write_response(existing, duplicate=True)
+        )
 
     await db.upsert_user(_UserObj(tg_user))
 
     logger.info(f"API POST /api/transactions user={user_id} id={row_id} {t_type} {amount} {currency}")
-    return _json_response({
+    created = {
         'id': row_id,
         'amount': amount,
         'currency': currency,
@@ -4158,7 +4369,11 @@ async def api_post_transaction(request: web.Request):
         'description': description,
         'date': date_str,
         'timestamp': ts_str,
-    }, status=201)
+        'client_request_id': client_request_id,
+    }
+    return _json_response(
+        _transaction_write_response(created, duplicate=False), status=201
+    )
 
 
 async def api_delete_transaction(request: web.Request):
@@ -5213,6 +5428,7 @@ def build_api_app() -> web.Application:
     app.router.add_route('GET', '/api/exchange-rates', api_exchange_rates)
     app.router.add_route('GET', '/api/balance', api_balance)
     app.router.add_route('GET', '/api/transactions', api_get_transactions)
+    app.router.add_route('GET', '/api/quick-templates', api_quick_templates)
     app.router.add_route('POST', '/api/transactions', api_post_transaction)
     app.router.add_route('DELETE', '/api/transactions/{id}', api_delete_transaction)
     app.router.add_route('GET', '/api/reports/monthly', api_monthly_report)
