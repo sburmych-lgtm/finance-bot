@@ -4,6 +4,11 @@ import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
 import { fmtMoney, fmtAmount, esc, toast, setHTML } from '../ui.js';
 import { normalizeMonthlyReport } from '../report-data.js';
+import {
+  budgetTone,
+  normalizeBudgetResponse,
+  normalizePaymentSourceBreakdown,
+} from '../block2-ui.js';
 
 const SLICE_COLORS = ['#6E0F1F', '#D8B56D', '#9B1B30', '#6FB67E', '#D45A4F', '#7A6E66'];
 
@@ -139,8 +144,10 @@ function openAIModal(prompt) {
 }
 
 // ── Tab renderers ──────────────────────────────────────────────
-function overviewMarkup(report) {
+function overviewMarkup(report, sourceSummary = {}, budgets = []) {
   const { expenseSlices: slices, incomeSlices, totalExpense, totalIncome } = report;
+  const paymentSources = normalizePaymentSourceBreakdown(sourceSummary, 'expense');
+  const paymentSourceTotal = paymentSources.reduce((sum, source) => sum + source.value, 0);
   const legend = slices.map((s, i) => {
     const pct = ((s.value / (totalExpense || 1)) * 100).toFixed(0);
     // Always allow drill-down: historical transactions can retain a
@@ -162,6 +169,24 @@ function overviewMarkup(report) {
       <div class="bar-track"><div class="bar-fill" style="width:${Math.min(100, (v / (totalIncome || 1)) * 100).toFixed(0)}%"></div></div>
     </button>`;
   }).join('');
+  const paymentSourceBars = paymentSources.map(({ label, value }) => `
+    <div class="payment-report-row">
+      <div class="bar-meta"><span>${esc(label)}</span><strong>${esc(fmtAmount(value, 'UAH'))}</strong></div>
+      <div class="bar-track"><div class="bar-fill" style="width:${Math.min(100, value / (paymentSourceTotal || 1) * 100).toFixed(0)}%"></div></div>
+    </div>
+  `).join('');
+  const budgetCards = budgets.map((budget) => `
+    <div class="budget-report-card ${budgetTone(budget)}">
+      <div class="budget-progress-head">
+        <strong>${esc(budget.category)}</strong>
+        <span>${esc(fmtAmount(budget.spent, 'UAH'))} / ${esc(fmtAmount(budget.monthlyLimit, 'UAH'))}</span>
+      </div>
+      <div class="budget-track" role="progressbar" aria-label="${esc(`Бюджет ${budget.category}`)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.min(100, Math.round(budget.progressPercent))}">
+        <span style="width:${Math.min(100, budget.progressPercent).toFixed(1)}%"></span>
+      </div>
+      <div class="budget-report-meta"><span>${budget.progressPercent.toFixed(0)}%</span><span>${budget.isExceeded ? `Перевитрата ${esc(fmtAmount(Math.abs(budget.remaining), 'UAH'))}` : `Залишилось ${esc(fmtAmount(Math.max(0, budget.remaining), 'UAH'))}`}</span></div>
+    </div>
+  `).join('');
   return `
     <div class="balance-card" style="min-height:auto;">
       <div class="balance-label">${esc(monthLabel())}</div>
@@ -184,16 +209,32 @@ function overviewMarkup(report) {
     ${incomeSlices.length ? '<p class="drill-hint">Оберіть джерело, щоб побачити деталі ›</p>' : ''}
     <div class="panel" style="padding: var(--sp-4);">
       ${incomeSlices.length ? `<div class="bars">${incomeBars}</div>` : emptyState('Немає доходів за цей місяць')}
-    </div>`;
+    </div>
+    <div class="section-head"><div class="section-title">Спосіб оплати витрат</div></div>
+    <div class="panel" style="padding: var(--sp-4);">
+      ${paymentSourceBars ? `<div class="bars">${paymentSourceBars}</div>` : emptyState('Немає витрат за цей місяць')}
+    </div>
+    <div class="section-head"><div class="section-title">Бюджети категорій</div></div>
+    ${budgetCards
+      ? `<div class="panel budget-report-list">${budgetCards}</div>`
+      : `<button type="button" class="panel budget-empty-cta" data-go="settings" data-section="budgets"><span class="avatar">◎</span><span><strong>Налаштувати бюджети</strong><small>Ліміти та попередження про перевитрати</small></span><span aria-hidden="true">›</span></button>`}
+    `;
 }
 
 async function renderOverview(container, generation) {
   setHTML(container, loadingSkeleton());
   try {
-    const report = normalizeMonthlyReport(await Api.monthlyReport(state.year, state.month));
+    const [rawReport, rawBudgets] = await Promise.all([
+      Api.monthlyReport(state.year, state.month),
+      Api.budgets(state.year, state.month).catch(() => ({ budgets: [] })),
+    ]);
+    const report = normalizeMonthlyReport(rawReport);
+    const sourceSummary = rawReport;
+    const budgets = normalizeBudgetResponse(rawBudgets);
     if (generation !== renderGeneration) return;
     state.data.overview = report;
-    setHTML(container, overviewMarkup(report));
+    state.data.budgets = budgets;
+    setHTML(container, overviewMarkup(report, sourceSummary, budgets));
     wireDrill(container);
   } catch (e) {
     if (generation !== renderGeneration) return;

@@ -1,5 +1,6 @@
 const MONEY_TYPES = new Set(['income', 'expense']);
 const CURRENCIES = new Set(['UAH', 'USD', 'EUR']);
+const PAYMENT_SOURCES = new Set(['cash', 'card', 'transfer', 'other']);
 
 function cleanOptionalText(value) {
   if (value == null) return null;
@@ -25,6 +26,9 @@ function normalizeTemplate(value) {
     category,
     subcategory: cleanOptionalText(value.subcategory),
     description: cleanOptionalText(value.description ?? value.comment ?? value.note),
+    paymentSource: PAYMENT_SOURCES.has(value.payment_source ?? value.paymentSource)
+      ? (value.payment_source ?? value.paymentSource)
+      : null,
     useCount: Math.max(0, Math.trunc(Number(value.usage_count ?? value.use_count ?? value.count) || 0)),
   };
 }
@@ -59,6 +63,7 @@ export function templateToDraft(template, { categories = [], subcategories = [] 
     category,
     subcategory,
     note: normalized.description || category || '',
+    paymentSource: normalized.paymentSource,
   };
 }
 

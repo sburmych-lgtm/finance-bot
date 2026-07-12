@@ -3,14 +3,15 @@
 import { Store, navigate } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
-import { toast, esc, setHTML } from '../ui.js';
+import { toast, esc, setHTML, fmtAmount } from '../ui.js';
 import {
   ACCOUNT_DELETE_CONFIRMATION,
   isAccountDeleteConfirmation,
 } from '../privacy.js';
+import { budgetTone, normalizeBudgetResponse } from '../block2-ui.js';
 
 const state = {
-  section: 'main',  // main | expense_cats | income_cats | time_cats | employees | tax | privacy
+  section: 'main',  // main | expense_cats | income_cats | time_cats | employees | tax | budgets | privacy
   loading: false,
 };
 
@@ -77,6 +78,15 @@ function renderMain(root) {
       <div class="row-list">
         <button type="button" class="row row-action" data-go="tax"><span class="avatar">%</span>
           <span><span class="row-title">Податковий профіль</span><span class="row-meta">Група, ставки та правила за роками</span></span>
+          <span class="row-chevron">›</span></button>
+      </div>
+    </div>
+
+    <div class="setting-section">
+      <div class="section-head"><div class="section-title">Планування</div></div>
+      <div class="row-list">
+        <button type="button" class="row row-action" data-go="budgets"><span class="avatar">◎</span>
+          <span><span class="row-title">Бюджети категорій</span><span class="row-meta">Ліміти, прогрес і перевитрати</span></span>
           <span class="row-chevron">›</span></button>
       </div>
     </div>
@@ -539,6 +549,165 @@ function captureTaxDraft(root, draft) {
   if (['5_percent', '3_percent_vat'].includes(scheme)) draft.scheme = scheme;
 }
 
+// ── Monthly category budgets ──────────────────────────────────
+async function renderBudgetsSettings(root) {
+  root.innerHTML = backHeader('Бюджети категорій');
+  wireBack(root);
+
+  const body = document.createElement('div');
+  setHTML(body, `<div class="panel" style="padding: var(--sp-4);"><div class="sk" style="height:160px;"></div></div>`);
+  root.appendChild(body);
+
+  const now = new Date();
+  try {
+    const [full, response] = await Promise.all([
+      Api.categoriesFull(),
+      Api.budgets(now.getFullYear(), now.getMonth() + 1),
+    ]);
+    const categoriesByType = {
+      expense: Object.keys(full?.expense || {}),
+      income: Object.keys(full?.income || {}),
+    };
+    const budgets = normalizeBudgetResponse(response);
+    Store.budgets = Array.isArray(response?.budgets) ? response.budgets : [];
+
+    const budgetCards = budgets.map((budget) => {
+      const tone = budgetTone(budget);
+      const status = budget.isExceeded
+        ? `Перевитрата ${fmtAmount(Math.abs(budget.remaining), 'UAH')}`
+        : `Залишилось ${fmtAmount(Math.max(0, budget.remaining), 'UAH')}`;
+      return `
+        <article class="panel budget-settings-card ${tone}">
+          <div class="budget-progress-head">
+            <div><strong>${esc(budget.category)}</strong><small>${budget.type === 'expense' ? 'Витрати' : 'Доходи'}</small></div>
+            <span>${esc(fmtAmount(budget.spent, 'UAH'))} / ${esc(fmtAmount(budget.monthlyLimit, 'UAH'))}</span>
+          </div>
+          <div class="budget-track" role="progressbar" aria-label="${esc(`Бюджет ${budget.category}`)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.min(100, Math.round(budget.progressPercent))}">
+            <span style="width:${Math.min(100, budget.progressPercent).toFixed(1)}%"></span>
+          </div>
+          <div class="budget-card-foot">
+            <span>${esc(status)} · ${budget.progressPercent.toFixed(0)}%</span>
+            <span class="budget-card-actions">
+              <button type="button" class="btn btn-secondary budget-mini-btn" data-budget-edit="${esc(`${budget.type}:${budget.category}`)}">Змінити</button>
+              <button type="button" class="btn btn-ghost budget-mini-btn danger" data-budget-delete="${esc(`${budget.type}:${budget.category}`)}">Видалити</button>
+            </span>
+          </div>
+        </article>`;
+    }).join('');
+
+    setHTML(body, `
+      <div class="panel budget-editor-panel">
+        <div class="eyebrow">Місячний ліміт</div>
+        <h3>Контроль по категоріях</h3>
+        <p>Задайте суму на місяць. Прогрес рахується з усіх операцій у гривневому еквіваленті.</p>
+        <form id="budgetForm" class="budget-form">
+          <label class="field"><span>Тип</span>
+            <select class="input" id="budgetType">
+              <option value="expense">Витрати</option>
+              <option value="income">Доходи</option>
+            </select>
+          </label>
+          <label class="field"><span>Категорія</span><select class="input" id="budgetCategory"></select></label>
+          <label class="field budget-limit-field"><span>Ліміт на місяць, ₴</span>
+            <input class="input" id="budgetLimit" type="number" inputmode="decimal" min="0.01" step="0.01" placeholder="наприклад, 5000" required>
+          </label>
+          <div class="budget-form-status" id="budgetFormStatus" role="status" aria-live="polite"></div>
+          <button class="btn btn-primary" id="budgetSave" type="submit">Зберегти бюджет</button>
+        </form>
+      </div>
+      <div class="section-head"><div class="section-title">Активні бюджети</div><span class="section-link">${budgets.length}</span></div>
+      ${budgetCards || `<div class="empty-state budget-settings-empty"><div class="icon">◎</div><h3>Лімітів ще немає</h3><p>Створіть перший бюджет вище — прогрес одразу з'явиться на Огляді та у Звітах.</p></div>`}
+    `);
+
+    const typeSelect = body.querySelector('#budgetType');
+    const categorySelect = body.querySelector('#budgetCategory');
+    const limitInput = body.querySelector('#budgetLimit');
+    const status = body.querySelector('#budgetFormStatus');
+    const save = body.querySelector('#budgetSave');
+    let busy = false;
+
+    const setCategoryOptions = (type, preferred = null) => {
+      const categories = categoriesByType[type] || [];
+      setHTML(categorySelect, categories.map((category) =>
+        `<option value="${esc(category)}" ${category === preferred ? 'selected' : ''}>${esc(category)}</option>`
+      ).join(''));
+      categorySelect.disabled = categories.length === 0;
+      save.disabled = categories.length === 0;
+    };
+    setCategoryOptions('expense');
+    typeSelect.addEventListener('change', () => setCategoryOptions(typeSelect.value));
+
+    body.querySelectorAll('[data-budget-edit]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const budget = budgets.find((candidate) =>
+          `${candidate.type}:${candidate.category}` === button.dataset.budgetEdit
+        );
+        if (!budget) return;
+        typeSelect.value = budget.type;
+        setCategoryOptions(budget.type, budget.category);
+        limitInput.value = String(budget.monthlyLimit);
+        limitInput.focus();
+        status.textContent = `Редагуємо «${budget.category}»`;
+        Telegram.haptic('selection');
+      });
+    });
+
+    body.querySelector('#budgetForm').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const amount = Number(limitInput.value);
+      if (busy || !Number.isFinite(amount) || amount <= 0 || !categorySelect.value) {
+        status.textContent = 'Вкажіть категорію та суму більше нуля.';
+        status.className = 'budget-form-status error';
+        return;
+      }
+      busy = true;
+      save.disabled = true;
+      save.textContent = 'Зберігаємо…';
+      status.textContent = '';
+      try {
+        await Api.upsertBudget({
+          type: typeSelect.value,
+          category: categorySelect.value,
+          monthly_limit_uah: amount,
+        });
+        Telegram.haptic('success');
+        toast('Бюджет збережено');
+        await renderBudgetsSettings(root);
+      } catch (error) {
+        busy = false;
+        save.disabled = false;
+        save.textContent = 'Спробувати ще раз';
+        status.textContent = error.message || 'Не вдалося зберегти бюджет.';
+        status.className = 'budget-form-status error';
+        Telegram.haptic('error');
+      }
+    });
+
+    body.querySelectorAll('[data-budget-delete]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const budget = budgets.find((candidate) =>
+          `${candidate.type}:${candidate.category}` === button.dataset.budgetDelete
+        );
+        if (!budget || !window.confirm(`Видалити бюджет «${budget.category}»? Операції залишаться.`)) return;
+        button.disabled = true;
+        try {
+          await Api.deleteBudget(budget.type, budget.category);
+          Telegram.haptic('success');
+          toast('Бюджет видалено');
+          await renderBudgetsSettings(root);
+        } catch (error) {
+          button.disabled = false;
+          Telegram.haptic('error');
+          toast(error.message || 'Не вдалося видалити бюджет');
+        }
+      });
+    });
+  } catch (error) {
+    setHTML(body, `<div class="empty-state"><div class="icon">!</div><h3>Не вдалося завантажити бюджети</h3><p>${esc(error.message || 'Спробуйте ще раз.')}</p><button type="button" class="btn btn-secondary" id="budgetRetry">Повторити</button></div>`);
+    body.querySelector('#budgetRetry')?.addEventListener('click', () => renderBudgetsSettings(root));
+  }
+}
+
 function renderTaxFields(group, { scheme, fop1, fop2, esv, militaryFixed, militaryRate, taxYear }) {
   if (group === 'none') {
     return `
@@ -730,7 +899,8 @@ function renderPrivacy(root) {
 }
 
 // ── Main entry ─────────────────────────────────────────────────
-export function renderSettings() {
+export function renderSettings(opts = {}) {
+  if (opts.section === 'budgets') state.section = 'budgets';
   const root = document.getElementById('screen-settings');
   if (!root) return;
   switch (state.section) {
@@ -739,6 +909,7 @@ export function renderSettings() {
     case 'time_cats':    renderTimeCategories(root); break;
     case 'employees':    renderEmployees(root); break;
     case 'tax':          renderTaxSettings(root); break;
+    case 'budgets':      renderBudgetsSettings(root); break;
     case 'privacy':      renderPrivacy(root); break;
     default:             renderMain(root);
   }

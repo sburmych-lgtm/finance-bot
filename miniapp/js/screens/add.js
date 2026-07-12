@@ -10,11 +10,13 @@ import {
   normalizeQuickTemplates,
   templateToDraft,
 } from '../add-flow.js';
+import { paymentSourceLabel, paymentSourceOptions } from '../block2-ui.js';
 
 const state = {
   mode: 'expense',   // expense | income | time
   amount: '0',
   currency: 'UAH',
+  paymentSource: null,
   category: null,
   subcategory: null,  // optional, only when the chosen category has subcategories
   note: '',
@@ -35,6 +37,7 @@ function resetDraftFields(nextMode = 'expense') {
   state.mode = nextMode;
   state.amount = '0';
   state.currency = 'UAH';
+  state.paymentSource = null;
   state.category = null;
   state.subcategory = null;
   state.note = '';
@@ -106,7 +109,7 @@ function quickTemplateButton(item, attrs, { repeat = false } = {}) {
       <span class="quick-template-icon" aria-hidden="true">${repeat ? '↻' : (item.type === 'income' ? '+' : '−')}</span>
       <span class="quick-template-copy">
         <strong>${esc(title)}</strong>
-        <span>${esc(hierarchy)} · ${esc(templateAmountLabel(item))}</span>
+        <span>${esc(hierarchy)} · ${esc(templateAmountLabel(item))} · ${esc(paymentSourceLabel(item.paymentSource))}</span>
       </span>
     </button>`;
 }
@@ -209,6 +212,29 @@ function template() {
         ).join('')}
       </div>
     </div>
+
+    ${!isTime ? `
+      <div class="section-head payment-source-head">
+        <div class="section-title">Джерело коштів</div>
+      </div>
+      <div class="payment-source-grid" role="group" aria-label="Джерело коштів">
+        <button
+          type="button"
+          class="payment-source-chip ${state.paymentSource === null ? 'active' : ''}"
+          data-payment-source=""
+          aria-pressed="${state.paymentSource === null}"
+        ><span aria-hidden="true">∅</span>Не вказано</button>
+        ${paymentSourceOptions().map(({ value, label, icon }) => `
+          <button
+            type="button"
+            class="payment-source-chip ${state.paymentSource === value ? 'active' : ''}"
+            data-payment-source="${value}"
+            aria-pressed="${state.paymentSource === value}"
+          ><span aria-hidden="true">${esc(icon)}</span>${esc(label)}</button>
+        `).join('')}
+      </div>
+      ${state.paymentSource === null ? '<p class="payment-source-hint">Оберіть джерело для точнішого звіту або залиште «Не вказано».</p>' : ''}
+    ` : ''}
 
     <div class="section-head" style="margin-top: var(--sp-4);">
       <div class="section-title">${isTime ? 'Активність' : 'Категорія'}</div>
@@ -357,6 +383,7 @@ function applyQuickTemplate(item) {
   state.mode = draft.mode;
   state.amount = draft.amount;
   state.currency = draft.currency;
+  state.paymentSource = draft.paymentSource;
   state.category = draft.category;
   state.subcategory = draft.subcategory;
   state.note = draft.note;
@@ -430,6 +457,7 @@ async function submitAdd(root) {
         category: state.category,
         subcategory: state.subcategory || undefined,
         description: state.note || state.category,
+        payment_source: state.paymentSource,
         client_request_id: state.clientRequestId,
       });
     } catch (error) {
@@ -469,6 +497,7 @@ function bind(root) {
     state.category = null;
     state.subcategory = null;
     state.amount = '0';
+    state.paymentSource = null;
     clearSubmitFeedback();
     Telegram.haptic('selection');
     rerender();
@@ -476,6 +505,13 @@ function bind(root) {
   root.querySelectorAll('[data-cur]').forEach((button) => button.addEventListener('click', () => {
     if (state.submitting) return;
     state.currency = button.dataset.cur;
+    clearSubmitFeedback();
+    Telegram.haptic('selection');
+    rerender();
+  }));
+  root.querySelectorAll('[data-payment-source]').forEach((button) => button.addEventListener('click', () => {
+    if (state.submitting) return;
+    state.paymentSource = button.dataset.paymentSource || null;
     clearSubmitFeedback();
     Telegram.haptic('selection');
     rerender();
@@ -543,6 +579,9 @@ function bind(root) {
 export function renderAdd(opts = {}) {
   if (opts.kind && ['income', 'expense', 'time'].includes(opts.kind)) {
     clearDraft(opts.kind);
+    if (opts.kind !== 'time' && paymentSourceOptions().some(({ value }) => value === opts.paymentSource)) {
+      state.paymentSource = opts.paymentSource;
+    }
   }
   const root = document.getElementById('screen-add');
   if (!root) return;

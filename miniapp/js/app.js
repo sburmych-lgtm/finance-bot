@@ -26,12 +26,13 @@ export const Store = {
   rates: { USD: 41.5, EUR: 45.2 },
   timeCategories: null,
   employees: [],
+  budgets: [],
   screen: 'home',
 
   async hydrate() {
     const now = new Date();
     try {
-      const [me, balance, txs, cats, catsFull, rates, tCats, emps] = await Promise.all([
+      const [me, balance, txs, cats, catsFull, rates, tCats, emps, budgetResponse] = await Promise.all([
         Api.me().catch(() => null),
         Api.getBalance(now.getFullYear(), now.getMonth() + 1).catch(() => null),
         Api.listTransactions(15).catch(() => []),
@@ -40,6 +41,7 @@ export const Store = {
         Api.exchangeRates().catch(() => null),
         Api.timeCategories().catch(() => null),
         Api.employees().catch(() => []),
+        Api.budgets(now.getFullYear(), now.getMonth() + 1).catch(() => ({ budgets: [] })),
       ]);
       this.user = me;
       this.balance = balance;
@@ -49,6 +51,7 @@ export const Store = {
       if (rates) Object.assign(this.rates, rates);
       this.timeCategories = tCats;
       this.employees = emps || [];
+      this.budgets = Array.isArray(budgetResponse?.budgets) ? budgetResponse.budgets : [];
     } catch (e) {
       console.warn('hydrate failed', e);
     }
@@ -106,6 +109,8 @@ document.addEventListener('click', (e) => {
     e.preventDefault();
     const opts = {};
     if (goBtn.dataset.kind) opts.kind = goBtn.dataset.kind;
+    if (goBtn.dataset.paymentSource) opts.paymentSource = goBtn.dataset.paymentSource;
+    if (goBtn.dataset.section) opts.section = goBtn.dataset.section;
     navigate(goBtn.dataset.go, opts);
   }
 });

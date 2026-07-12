@@ -13,6 +13,7 @@
   <link rel="stylesheet" href="./css/components.css" />
   <link rel="stylesheet" href="./css/screens.css" />
   <link rel="stylesheet" href="./css/add-enhancements.css" />
+  <link rel="stylesheet" href="./css/block2.css" />
 </head>
 <body>
   <main id="root">
@@ -39,12 +40,15 @@
             <div class="metric"><span>Витрати</span><strong class="sk" style="height:20px;">&nbsp;</strong></div>
           </div>
         </div>
-        <div class="quick-actions">
+        <div class="quick-actions quick-actions-four">
           <button class="quick-action" data-go="add" data-kind="expense">
             <span class="icon">−</span><span class="label">Витрата</span><span class="sub">додати</span>
           </button>
           <button class="quick-action" data-go="add" data-kind="income">
             <span class="icon">+</span><span class="label">Дохід</span><span class="sub">додати</span>
+          </button>
+          <button class="quick-action quick-action-cash" data-go="add" data-kind="expense" data-payment-source="cash">
+            <span class="icon">₴</span><span class="label">Готівка</span><span class="sub">витрата</span>
           </button>
           <button class="quick-action" data-go="reports">
             <span class="icon">R</span><span class="label">Звіт</span><span class="sub">за місяць</span>

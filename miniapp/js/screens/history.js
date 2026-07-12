@@ -4,6 +4,7 @@ import { Store } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
 import { fmtMoney, fmtAmount, fmtDate, esc, toast } from '../ui.js';
+import { paymentSourceLabel, paymentSourceOptions } from '../block2-ui.js';
 
 const CATEGORY_LETTER = {
   'Продукти':'П','Кафе':'К','Транспорт':'Т','Розваги':'Р','Здоров\'я':'Z',
@@ -145,7 +146,7 @@ function rowsList() {
   }
   if (!state.rows.length) {
     return `<div class="empty-state">
-      <div class="icon">≡</div>
+      <div class="icon">∅</div>
       <h3>Нічого не знайдено</h3>
       <p>За цей фільтр немає жодної операції.</p>
     </div>`;
@@ -168,6 +169,15 @@ function rowsList() {
           <div>
             <div class="row-title">${esc(t.category || 'Інше')}</div>
             <div class="row-meta">${esc(String(t.description || '').slice(0, 40))}</div>
+            <label class="source-edit-label">
+              <span class="sr-only">Джерело коштів</span>
+              <select class="source-select" data-source-edit="${esc(String(t.id))}" aria-label="Джерело коштів для операції ${esc(t.category || 'Інше')}">
+                <option value="" ${t.payment_source == null ? 'selected' : ''}>${esc(paymentSourceLabel(null))}</option>
+                ${paymentSourceOptions().map(({ value, label }) =>
+                  `<option value="${value}" ${t.payment_source === value ? 'selected' : ''}>${esc(label)}</option>`
+                ).join('')}
+              </select>
+            </label>
           </div>
           <div class="amount ${t.type === 'expense' ? 'expense' : 'income'}">${esc(fmtMoney(
             t.type === 'expense' ? -(t.amount_uah || t.amount) : (t.amount_uah || t.amount),
@@ -233,6 +243,34 @@ function doRender() {
       } catch (err) {
         Telegram.haptic('error');
         toast(err.message || 'Помилка');
+      }
+    });
+  });
+
+  root.querySelectorAll('[data-source-edit]').forEach((select) => {
+    select.addEventListener('click', (event) => event.stopPropagation());
+    select.addEventListener('change', async (event) => {
+      event.stopPropagation();
+      const id = select.dataset.sourceEdit;
+      const previous = (state.rows || []).find((row) => String(row.id) === id)?.payment_source ?? null;
+      const next = select.value || null;
+      select.disabled = true;
+      try {
+        const updated = await Api.patchTransaction(id, { payment_source: next });
+        state.rows = (state.rows || []).map((row) =>
+          String(row.id) === id ? { ...row, payment_source: updated?.payment_source ?? next } : row
+        );
+        Store.transactions = (Store.transactions || []).map((row) =>
+          String(row.id) === id ? { ...row, payment_source: updated?.payment_source ?? next } : row
+        );
+        Telegram.haptic('success');
+        toast(`Джерело: ${paymentSourceLabel(updated?.payment_source ?? next)}`);
+      } catch (error) {
+        select.value = previous || '';
+        Telegram.haptic('error');
+        toast(error.message || 'Не вдалося оновити джерело');
+      } finally {
+        select.disabled = false;
       }
     });
   });

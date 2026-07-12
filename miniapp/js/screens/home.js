@@ -3,7 +3,8 @@
 import { Store } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
-import { fmtMoney, fmtAmount, fmtDate, esc, toast } from '../ui.js';
+import { fmtMoney, fmtAmount, fmtDate, esc, toast, setHTML } from '../ui.js';
+import { normalizeBudgetResponse, paymentSourceLabel, budgetTone } from '../block2-ui.js';
 
 const CATEGORY_LETTER = {
   'Продукти':'П','Кафе':'К','Транспорт':'Т','Розваги':'Р','Здоров\'я':'Z',
@@ -34,6 +35,7 @@ export function renderHome() {
   // Inject «Відмінити останню» quick-action card if there's something to undo
   const txs = (Store.transactions || []).slice(0, 8);
   injectUndoCard(txs[0]);
+  injectBudgetOverview();
 
   const list = document.getElementById('recent-list');
   if (!list) return;
@@ -52,7 +54,7 @@ export function renderHome() {
       <div class="avatar">${esc(letter(t.category))}</div>
       <div>
         <div class="row-title">${esc(t.category || 'Інше')}</div>
-        <div class="row-meta">${esc(fmtDate(t.date))} · ${esc(String(t.description || '').slice(0, 32))}</div>
+        <div class="row-meta">${esc(fmtDate(t.date))} · ${esc(paymentSourceLabel(t.payment_source))} · ${esc(String(t.description || '').slice(0, 32))}</div>
       </div>
       <div class="amount ${t.type === 'expense' ? 'expense' : 'income'}">${esc(fmtMoney(
         t.type === 'expense' ? -(t.amount_uah || t.amount) : (t.amount_uah || t.amount),
@@ -60,6 +62,44 @@ export function renderHome() {
       ))}</div>
     </div>
   `).join('');
+}
+
+function injectBudgetOverview() {
+  document.getElementById('home-budget-overview')?.remove();
+  const sectionHead = document.querySelector('#screen-home .section-head');
+  if (!sectionHead) return;
+  const budgets = normalizeBudgetResponse({ budgets: Store.budgets });
+  const wrapper = document.createElement('section');
+  wrapper.id = 'home-budget-overview';
+  wrapper.className = 'home-budget-overview';
+  setHTML(wrapper, `
+    <div class="section-head">
+      <div class="section-title">Бюджети</div>
+      <button class="section-link" data-go="settings" data-section="budgets">Керувати →</button>
+    </div>
+    ${budgets.length ? `
+      <div class="panel budget-compact-list">
+        ${budgets.slice(0, 3).map((budget) => `
+          <div class="budget-compact ${budgetTone(budget)}">
+            <div class="budget-progress-head">
+              <strong>${esc(budget.category)}</strong>
+              <span>${esc(fmtAmount(budget.spent, 'UAH'))} / ${esc(fmtAmount(budget.monthlyLimit, 'UAH'))}</span>
+            </div>
+            <div class="budget-track" role="progressbar" aria-label="${esc(`Бюджет ${budget.category}`)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.min(100, Math.round(budget.progressPercent))}">
+              <span style="width:${Math.min(100, budget.progressPercent).toFixed(1)}%"></span>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+    ` : `
+      <button type="button" class="panel budget-empty-cta" data-go="settings" data-section="budgets">
+        <span class="avatar">◎</span>
+        <span><strong>Встановити перший ліміт</strong><small>Контролюйте витрати по категоріях</small></span>
+        <span aria-hidden="true">›</span>
+      </button>
+    `}
+  `);
+  sectionHead.parentNode.insertBefore(wrapper, sectionHead);
 }
 
 

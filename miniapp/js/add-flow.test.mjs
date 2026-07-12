@@ -73,7 +73,7 @@ test('template prefill remains editable and drops stale category hierarchy', () 
   });
   assert.deepEqual(valid, {
     mode: 'expense', amount: '25.5', currency: 'EUR', category: 'Кафе',
-    subcategory: 'Обіди', note: 'Кава з клієнтом',
+    subcategory: 'Обіди', note: 'Кава з клієнтом', paymentSource: null,
   });
 
   const stale = templateToDraft({

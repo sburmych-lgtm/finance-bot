@@ -45,6 +45,7 @@ export const Api = {
   listTransactions:(limit = 15)          => request(`/api/transactions?limit=${limit}`),
   quickTemplates:  ()                    => request('/api/quick-templates'),
   addTransaction:  (payload)             => request('/api/transactions',           { method: 'POST', body: payload }),
+  patchTransaction:(id, payload)         => request(`/api/transactions/${id}`,     { method: 'PATCH', body: payload }),
   deleteTransaction:(id)                 => request(`/api/transactions/${id}`,     { method: 'DELETE' }),
 
   // Reports
@@ -53,6 +54,12 @@ export const Api = {
   taxReport:       (year, month)         => request(`/api/reports/tax?year=${year}&month=${month}`),
   accountingReport:(year, month)         => request(`/api/reports/accounting?year=${year}&month=${month}`),
   timeReport:      (year, month)         => request(`/api/reports/time?year=${year}&month=${month}`),
+  paymentSourcesReport:(year, month)     => request(`/api/reports/payment-sources?year=${year}&month=${month}`),
+
+  // Monthly category budgets
+  budgets:         (year, month)         => request(`/api/budgets?year=${year}&month=${month}`),
+  upsertBudget:    (payload)             => request('/api/budgets',                 { method: 'PUT', body: payload }),
+  deleteBudget:    (type, category)      => request(`/api/budgets/${type}/${encodeURIComponent(category)}`, { method: 'DELETE' }),
 
   // Categories
   categories:      ()                    => request('/api/categories'),
