@@ -281,6 +281,8 @@ def build_financial_insights(
                 row.get("amount_uah")
             )
     for budget in budgets:
+        if budget.get("type", "expense") != "expense":
+            continue
         category = str(budget.get("category") or "")
         limit = _money(
             budget.get("monthly_limit_uah", budget.get("limit_uah", 0))

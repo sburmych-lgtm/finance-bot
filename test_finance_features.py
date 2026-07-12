@@ -201,6 +201,21 @@ def test_insights_omit_division_by_zero_and_low_signal_results():
     assert build_financial_insights(rows, budgets=[], today=date(2026, 7, 12)) == ()
 
 
+def test_income_targets_never_generate_expense_budget_warnings():
+    rows = [tx(date(2026, 7, 8), amount="900", category="Продажі")]
+    budgets = [
+        {
+            "type": "income",
+            "category": "Продажі",
+            "monthly_limit_uah": "1000",
+        }
+    ]
+
+    insights = build_financial_insights(rows, budgets=budgets, today=date(2026, 7, 12))
+
+    assert all(item["kind"] != "budget_warning" for item in insights)
+
+
 def test_forecast_is_explicit_month_result_not_invented_account_balance():
     current = [
         tx(date(2026, 7, 1), tx_type="income", amount="10000"),
