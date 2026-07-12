@@ -3,7 +3,12 @@
 import { Store, navigate } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
-import { toast, esc } from '../ui.js';
+import { toast, esc, setHTML } from '../ui.js';
+import {
+  ensureClientRequestId,
+  normalizeQuickTemplates,
+  templateToDraft,
+} from '../add-flow.js';
 
 const state = {
   mode: 'expense',   // expense | income | time
@@ -13,7 +18,40 @@ const state = {
   subcategory: null,  // optional, only when the chosen category has subcategories
   note: '',
   empOpen: false,  // employees-submenu collapse state
+  submitting: false,
+  submitError: '',
+  submitSuccess: '',
+  clientRequestId: null,
+  quick: {
+    status: 'idle', // idle | loading | ready | error
+    templates: [],
+    repeatLast: null,
+    error: '',
+  },
 };
+
+function resetDraftFields(nextMode = 'expense') {
+  state.mode = nextMode;
+  state.amount = '0';
+  state.currency = 'UAH';
+  state.category = null;
+  state.subcategory = null;
+  state.note = '';
+  state.empOpen = false;
+}
+
+function clearDraft(nextMode = 'expense') {
+  resetDraftFields(nextMode);
+  state.submitting = false;
+  state.submitError = '';
+  state.submitSuccess = '';
+  state.clientRequestId = null;
+}
+
+function clearSubmitFeedback() {
+  state.submitError = '';
+  state.submitSuccess = '';
+}
 
 function symbolFor(cur) {
   return cur === 'UAH' ? '₴' : cur === 'USD' ? '$' : cur === 'EUR' ? '€' : esc(cur);
@@ -54,12 +92,90 @@ function emojiFor(mode, cat) {
   return null;
 }
 
+function templateAmountLabel(item) {
+  const amount = Number(item.amount).toLocaleString('uk-UA', { maximumFractionDigits: 2 });
+  return `${amount} ${item.currency}`;
+}
+
+function quickTemplateButton(item, attrs, { repeat = false } = {}) {
+  const title = repeat ? 'Повторити останню' : (item.label || item.category);
+  const hierarchy = item.subcategory ? `${item.category} · ${item.subcategory}` : item.category;
+  return `
+    <button class="quick-template-card ${repeat ? 'repeat' : ''}" type="button" ${attrs}>
+      <span class="quick-template-icon" aria-hidden="true">${repeat ? '↻' : (item.type === 'income' ? '+' : '−')}</span>
+      <span class="quick-template-copy">
+        <strong>${esc(title)}</strong>
+        <span>${esc(hierarchy)} · ${esc(templateAmountLabel(item))}</span>
+      </span>
+    </button>`;
+}
+
+function quickTemplatesMarkup() {
+  const { status, templates, repeatLast, error } = state.quick;
+  if (status === 'loading' || status === 'idle') {
+    return `
+      <div class="quick-template-panel" aria-busy="true">
+        <div class="quick-template-head"><strong>Швидке додавання</strong></div>
+        <div class="quick-template-loading"><span class="add-spinner" aria-hidden="true"></span> Завантажуємо шаблони…</div>
+      </div>`;
+  }
+  if (status === 'error') {
+    return `
+      <div class="quick-template-panel">
+        <div class="quick-template-head"><strong>Швидке додавання</strong></div>
+        <div class="quick-template-error" role="status">${esc(error || 'Не вдалося завантажити шаблони.')}</div>
+        <button class="quick-template-retry" type="button" data-quick-retry>Спробувати ще раз</button>
+      </div>`;
+  }
+
+  const cards = [
+    repeatLast ? quickTemplateButton(repeatLast, 'data-repeat-last', { repeat: true }) : '',
+    ...templates.slice(0, 4).map((item, index) =>
+      quickTemplateButton(item, `data-template-index="${index}"`)),
+  ].filter(Boolean).join('');
+
+  return `
+    <div class="quick-template-panel">
+      <div class="quick-template-head">
+        <strong>Швидке додавання</strong>
+        <span>заповнює форму, не зберігає автоматично</span>
+      </div>
+      ${cards
+        ? `<div class="quick-template-strip">${cards}</div>`
+        : '<div class="quick-template-empty">Шаблони з’являться після кількох операцій.</div>'}
+    </div>`;
+}
+
+function submitDockMarkup(isTime) {
+  const statusText = state.submitError || state.submitSuccess || (state.submitting ? 'Зберігаємо…' : '');
+  const statusKind = state.submitError ? 'error' : (state.submitSuccess ? 'success' : '');
+  const buttonText = state.submitSuccess
+    ? 'Збережено'
+    : state.submitting
+      ? 'Зберігаємо…'
+      : state.submitError
+        ? 'Спробувати ще раз'
+        : isTime
+          ? 'Зберегти запис часу'
+          : 'Зберегти операцію';
+  return `
+    <div class="add-submit-dock">
+      <div class="add-submit-status ${statusKind}" id="addSubmitStatus" role="status" aria-live="polite">${esc(statusText)}</div>
+      <button class="btn btn-primary add-save-btn" id="saveBtn" aria-busy="${state.submitting ? 'true' : 'false'}" ${state.submitting || state.submitSuccess ? 'disabled' : ''}>
+        ${state.submitting ? '<span class="add-spinner" aria-hidden="true"></span>' : ''}
+        <span>${esc(buttonText)}</span>
+      </button>
+    </div>`;
+}
+
 function template() {
   const isTime = state.mode === 'time';
   const display = state.amount === '0' ? '0' : state.amount;
   const cats = categoriesFor(state.mode);
 
   return `
+    <div id="quickTemplatesSlot">${quickTemplatesMarkup()}</div>
+    <div class="add-editor">
     <div class="kind-pills" style="grid-template-columns: 1fr 1fr 1fr;">
       <button class="kind-pill expense ${state.mode === 'expense' ? 'active' : ''}" data-mode="expense">− Витрата</button>
       <button class="kind-pill income  ${state.mode === 'income'  ? 'active' : ''}" data-mode="income">+ Дохід</button>
@@ -149,115 +265,285 @@ function template() {
       <input class="input" id="noteInput" placeholder="${isTime ? 'напр. підготовка позову' : 'напр. кава з клієнтом'}" value="${esc(state.note)}">
     </div>
 
-    <button class="btn btn-primary" id="saveBtn" style="margin-top: var(--sp-4);">
-      ${isTime ? 'Зберегти запис часу' : 'Зберегти операцію'}
-    </button>
+    </div>
+    ${submitDockMarkup(isTime)}
   `;
 }
 
-function bind(root) {
-  root.querySelectorAll('[data-mode]').forEach((b) => b.addEventListener('click', () => {
-    state.mode = b.dataset.mode;
-    state.category = null;
-    state.subcategory = null;
-    state.amount = '0';
-    Telegram.haptic('selection');
-    renderAdd();
-  }));
-  root.querySelectorAll('[data-cur]').forEach((b) => b.addEventListener('click', () => {
-    state.currency = b.dataset.cur;
-    Telegram.haptic('selection');
-    renderAdd();
-  }));
-  root.querySelectorAll('[data-quick]').forEach((b) => b.addEventListener('click', () => {
-    state.amount = b.dataset.quick;
-    Telegram.haptic('light');
-    renderAdd();
-  }));
-  root.querySelectorAll('[data-cat]').forEach((b) => b.addEventListener('click', () => {
-    state.category = b.dataset.cat;
-    state.subcategory = null;  // reset — different category has different subcategories
-    Telegram.haptic('selection');
-    renderAdd();
-  }));
-  root.querySelectorAll('[data-sub]').forEach((b) => b.addEventListener('click', () => {
-    // Toggle: tapping the active subcategory clears it (it's optional)
-    state.subcategory = state.subcategory === b.dataset.sub ? null : b.dataset.sub;
-    Telegram.haptic('selection');
-    renderAdd();
-  }));
-  root.querySelector('#empToggle')?.addEventListener('click', () => {
-    state.empOpen = !state.empOpen;
-    Telegram.haptic('selection');
-    renderAdd();
+function rerender() {
+  renderAdd({ preserve: true });
+}
+
+function syncSubmitDock(root) {
+  const status = root.querySelector('#addSubmitStatus');
+  const button = root.querySelector('#saveBtn');
+  const message = state.submitError || state.submitSuccess || (state.submitting ? 'Зберігаємо…' : '');
+  if (status) {
+    status.textContent = message;
+    status.className = `add-submit-status ${state.submitError ? 'error' : (state.submitSuccess ? 'success' : '')}`;
+  }
+  if (button) {
+    const buttonText = state.submitSuccess
+      ? 'Збережено'
+      : state.submitting
+        ? 'Зберігаємо…'
+        : state.submitError
+          ? 'Спробувати ще раз'
+          : state.mode === 'time'
+            ? 'Зберегти запис часу'
+            : 'Зберегти операцію';
+    button.disabled = state.submitting || Boolean(state.submitSuccess);
+    button.setAttribute('aria-busy', state.submitting ? 'true' : 'false');
+    setHTML(button, `${state.submitting ? '<span class="add-spinner" aria-hidden="true"></span>' : ''}<span>${esc(buttonText)}</span>`);
+  }
+  root.querySelectorAll('.add-editor button, .add-editor input').forEach((control) => {
+    control.disabled = state.submitting;
   });
-  root.querySelectorAll('[data-key]').forEach((b) => b.addEventListener('click', () => {
-    const k = b.dataset.key;
-    Telegram.haptic('light');
-    if (k === '⌫') {
-      state.amount = state.amount.length > 1 ? state.amount.slice(0, -1) : '0';
-    } else if (k === '.') {
-      if (state.mode !== 'time' && !state.amount.includes('.')) state.amount = state.amount + '.';
-    } else {
-      state.amount = state.amount === '0' ? k : (state.amount + k);
-    }
-    const display = document.getElementById('amountDisplay');
-    if (display) {
-      display.textContent = state.amount;
-      const cur = document.createElement('span');
-      cur.className = 'currency';
-      cur.textContent = state.mode === 'time' ? 'хв' : symbolFor(state.currency);
-      display.appendChild(cur);
-      display.classList.toggle('dim', state.amount === '0');
-    }
-  }));
-  root.querySelector('#noteInput')?.addEventListener('input', (e) => {
-    state.note = e.target.value;
+}
+
+function bindQuickTemplateActions(root) {
+  root.querySelector('[data-quick-retry]')?.addEventListener('click', () => {
+    loadQuickTemplates(root, { force: true });
   });
-  root.querySelector('#saveBtn').addEventListener('click', async () => {
-    if (state.mode === 'time') {
-      const minutes = parseInt(state.amount, 10);
-      if (!minutes || minutes <= 0) { toast('Введіть тривалість у хвилинах'); return; }
-      if (!state.category) { toast('Оберіть активність'); return; }
-      try {
-        await Api.addTimeTrack({ minutes, category: state.category, description: state.note || state.category });
-        Telegram.haptic('success');
-        toast('Записано');
-        state.amount = '0'; state.category = null; state.note = '';
-        await Store.hydrate();
-        navigate('home');
-      } catch (e) { Telegram.haptic('error'); toast(e.message || 'Помилка'); }
+  root.querySelector('[data-repeat-last]')?.addEventListener('click', () => {
+    applyQuickTemplate(state.quick.repeatLast);
+  });
+  root.querySelectorAll('[data-template-index]').forEach((button) => {
+    button.addEventListener('click', () => {
+      applyQuickTemplate(state.quick.templates[Number(button.dataset.templateIndex)]);
+    });
+  });
+}
+
+function renderQuickTemplatesSlot(root) {
+  const slot = root.querySelector('#quickTemplatesSlot');
+  if (!slot) return;
+  setHTML(slot, quickTemplatesMarkup());
+  bindQuickTemplateActions(root);
+}
+
+async function loadQuickTemplates(root, { force = false } = {}) {
+  if (!force && ['loading', 'ready'].includes(state.quick.status)) return;
+  state.quick.status = 'loading';
+  state.quick.error = '';
+  renderQuickTemplatesSlot(root);
+  try {
+    const normalized = normalizeQuickTemplates(await Api.quickTemplates());
+    state.quick.templates = normalized.templates;
+    state.quick.repeatLast = normalized.repeatLast;
+    state.quick.status = 'ready';
+  } catch (error) {
+    state.quick.status = 'error';
+    state.quick.error = error?.message || 'Не вдалося завантажити шаблони.';
+  }
+  renderQuickTemplatesSlot(root);
+}
+
+function applyQuickTemplate(item) {
+  if (!item || state.submitting) return;
+  const availableCategories = categoriesFor(item.type);
+  const availableSubcategories = Store.subcategoriesFor(item.type, item.category);
+  const draft = templateToDraft(item, {
+    categories: availableCategories,
+    subcategories: availableSubcategories,
+  });
+  if (!draft) {
+    Telegram.haptic('error');
+    toast('Цей шаблон більше не доступний');
+    return;
+  }
+
+  state.mode = draft.mode;
+  state.amount = draft.amount;
+  state.currency = draft.currency;
+  state.category = draft.category;
+  state.subcategory = draft.subcategory;
+  state.note = draft.note;
+  state.empOpen = Boolean(draft.category?.startsWith(_empPrefix(draft.mode)));
+  clearSubmitFeedback();
+  Telegram.haptic('selection');
+  toast(draft.category
+    ? 'Шаблон заповнено — перевірте та збережіть'
+    : 'Суму заповнено — оберіть актуальну категорію');
+  rerender();
+}
+
+function showSubmitError(root, message) {
+  state.submitting = false;
+  state.submitSuccess = '';
+  state.submitError = message;
+  syncSubmitDock(root);
+  Telegram.haptic('error');
+  toast(message);
+}
+
+async function submitAdd(root) {
+  if (state.submitting || state.submitSuccess) return;
+
+  let response;
+  const completedMode = state.mode;
+  if (state.mode === 'time') {
+    const minutes = Number.parseInt(state.amount, 10);
+    if (!minutes || minutes <= 0) {
+      showSubmitError(root, 'Введіть тривалість у хвилинах');
       return;
     }
-    const amount = parseFloat(state.amount);
-    if (!amount || amount <= 0) { toast('Введіть суму'); return; }
-    if (!state.category) { toast('Оберіть категорію'); return; }
+    if (!state.category) {
+      showSubmitError(root, 'Оберіть активність');
+      return;
+    }
+    state.submitting = true;
+    clearSubmitFeedback();
+    syncSubmitDock(root);
     try {
-      await Api.addTransaction({
+      response = await Api.addTimeTrack({
+        minutes,
+        category: state.category,
+        description: state.note || state.category,
+      });
+    } catch (error) {
+      showSubmitError(root, error?.message || 'Не вдалося зберегти запис часу');
+      return;
+    }
+  } else {
+    const amount = Number.parseFloat(state.amount);
+    if (!amount || amount <= 0) {
+      showSubmitError(root, 'Введіть суму');
+      return;
+    }
+    if (!state.category) {
+      showSubmitError(root, 'Оберіть категорію');
+      return;
+    }
+    state.clientRequestId = ensureClientRequestId(state.clientRequestId);
+    state.submitting = true;
+    clearSubmitFeedback();
+    syncSubmitDock(root);
+    try {
+      response = await Api.addTransaction({
         type: state.mode,
         amount,
         currency: state.currency,
         category: state.category,
         subcategory: state.subcategory || undefined,
         description: state.note || state.category,
+        client_request_id: state.clientRequestId,
       });
-      Telegram.haptic('success');
-      toast('Операцію збережено');
-      state.amount = '0'; state.category = null; state.subcategory = null; state.note = '';
-      await Store.hydrate();
-      navigate('home');
-    } catch (e) { Telegram.haptic('error'); toast(e.message || 'Помилка'); }
+    } catch (error) {
+      // Retain clientRequestId: a retry is safe even if the first response was lost.
+      showSubmitError(root, error?.message || 'Не вдалося зберегти операцію');
+      return;
+    }
+  }
+
+  const duplicate = Boolean(response?.duplicate);
+  state.submitSuccess = duplicate ? 'Операцію вже було збережено' : 'Успішно збережено';
+  state.submitError = '';
+  state.submitting = true;
+  resetDraftFields(completedMode);
+  state.clientRequestId = null;
+  state.quick.status = 'idle';
+  syncSubmitDock(root);
+  Telegram.haptic('success');
+  toast(duplicate
+    ? 'Операцію вже було збережено'
+    : completedMode === 'time' ? 'Записано' : 'Операцію збережено');
+
+  try {
+    await Store.hydrate();
+  } catch {
+    toast('Дані збережено. Огляд оновиться при наступному відкритті.');
+  }
+  clearDraft(completedMode);
+  navigate('home');
+}
+
+function bind(root) {
+  bindQuickTemplateActions(root);
+  root.querySelectorAll('[data-mode]').forEach((button) => button.addEventListener('click', () => {
+    if (state.submitting) return;
+    state.mode = button.dataset.mode;
+    state.category = null;
+    state.subcategory = null;
+    state.amount = '0';
+    clearSubmitFeedback();
+    Telegram.haptic('selection');
+    rerender();
+  }));
+  root.querySelectorAll('[data-cur]').forEach((button) => button.addEventListener('click', () => {
+    if (state.submitting) return;
+    state.currency = button.dataset.cur;
+    clearSubmitFeedback();
+    Telegram.haptic('selection');
+    rerender();
+  }));
+  root.querySelectorAll('[data-quick]').forEach((button) => button.addEventListener('click', () => {
+    if (state.submitting) return;
+    state.amount = button.dataset.quick;
+    clearSubmitFeedback();
+    Telegram.haptic('light');
+    rerender();
+  }));
+  root.querySelectorAll('[data-cat]').forEach((button) => button.addEventListener('click', () => {
+    if (state.submitting) return;
+    state.category = button.dataset.cat;
+    state.subcategory = null;
+    clearSubmitFeedback();
+    Telegram.haptic('selection');
+    rerender();
+  }));
+  root.querySelectorAll('[data-sub]').forEach((button) => button.addEventListener('click', () => {
+    if (state.submitting) return;
+    state.subcategory = state.subcategory === button.dataset.sub ? null : button.dataset.sub;
+    clearSubmitFeedback();
+    Telegram.haptic('selection');
+    rerender();
+  }));
+  root.querySelector('#empToggle')?.addEventListener('click', () => {
+    if (state.submitting) return;
+    state.empOpen = !state.empOpen;
+    Telegram.haptic('selection');
+    rerender();
   });
+  root.querySelectorAll('[data-key]').forEach((button) => button.addEventListener('click', () => {
+    if (state.submitting) return;
+    const key = button.dataset.key;
+    Telegram.haptic('light');
+    clearSubmitFeedback();
+    if (key === '⌫') {
+      state.amount = state.amount.length > 1 ? state.amount.slice(0, -1) : '0';
+    } else if (key === '.') {
+      if (state.mode !== 'time' && !state.amount.includes('.')) state.amount += '.';
+    } else {
+      state.amount = state.amount === '0' ? key : state.amount + key;
+    }
+    const display = root.querySelector('#amountDisplay');
+    if (display) {
+      display.textContent = state.amount;
+      const currency = document.createElement('span');
+      currency.className = 'currency';
+      currency.textContent = state.mode === 'time' ? 'хв' : symbolFor(state.currency);
+      display.appendChild(currency);
+      display.classList.toggle('dim', state.amount === '0');
+    }
+    syncSubmitDock(root);
+  }));
+  root.querySelector('#noteInput')?.addEventListener('input', (event) => {
+    state.note = event.target.value;
+    clearSubmitFeedback();
+    syncSubmitDock(root);
+  });
+  root.querySelector('#saveBtn')?.addEventListener('click', () => submitAdd(root));
+  syncSubmitDock(root);
 }
 
 export function renderAdd(opts = {}) {
   if (opts.kind && ['income', 'expense', 'time'].includes(opts.kind)) {
-    state.mode = opts.kind;
-    state.category = null;
-    state.amount = '0';
+    clearDraft(opts.kind);
   }
   const root = document.getElementById('screen-add');
   if (!root) return;
-  root.innerHTML = template();
+  setHTML(root, template());
   bind(root);
+  if (state.quick.status === 'idle') loadQuickTemplates(root);
 }

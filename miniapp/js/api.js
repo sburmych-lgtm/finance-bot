@@ -43,6 +43,7 @@ export const Api = {
   // Balance + transactions
   getBalance:      (year, month)         => request(`/api/balance?year=${year}&month=${month}`),
   listTransactions:(limit = 15)          => request(`/api/transactions?limit=${limit}`),
+  quickTemplates:  ()                    => request('/api/quick-templates'),
   addTransaction:  (payload)             => request('/api/transactions',           { method: 'POST', body: payload }),
   deleteTransaction:(id)                 => request(`/api/transactions/${id}`,     { method: 'DELETE' }),
 
