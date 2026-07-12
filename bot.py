@@ -729,6 +729,19 @@ async def save_user_settings(user_id, settings):
     await db.save_user_settings(user_id, settings)
 
 
+_user_settings_locks = defaultdict(asyncio.Lock)
+
+
+async def update_user_settings(user_id, mutator):
+    """Atomically apply a synchronous mutation to one user's settings."""
+    lock = _user_settings_locks[str(user_id)]
+    async with lock:
+        settings = await user_settings_for(user_id)
+        result = mutator(settings)
+        await save_user_settings(user_id, settings)
+        return settings if result is None else result
+
+
 # ========== EXCHANGE RATES ==========
 async def update_exchange_rates():
     """Update exchange rates from NBU API"""
@@ -776,7 +789,7 @@ def convert_to_uah(amount, currency, rate):
 
 
 # ========== UTILITY FUNCTIONS ==========
-def parse_transaction(text):
+def parse_transaction(text, categories_by_type=None):
     """Parse transaction from text"""
     text_lower = text.lower().strip()
 
@@ -804,7 +817,7 @@ def parse_transaction(text):
         currency = 'EUR'
 
     category = 'Інше'
-    for cat_name, cat_data in CATEGORIES[trans_type].items():
+    for cat_name, cat_data in (categories_by_type or CATEGORIES)[trans_type].items():
         if any(kw in text_lower for kw in cat_data['keywords']):
             category = cat_name
             break
@@ -873,13 +886,13 @@ def get_transaction_type_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_time_category_keyboard():
+def get_time_category_keyboard(time_categories=None):
     """Create time category selection keyboard"""
     keyboard = []
     
     # Group in rows of 2
     row = []
-    for cat_name, cat_data in TIME_CATEGORIES.items():
+    for cat_name, cat_data in (time_categories or TIME_CATEGORIES).items():
         emoji = cat_data['emoji']
         button = InlineKeyboardButton(
             f"{emoji} {cat_name}",
@@ -910,10 +923,10 @@ def get_currency_keyboard(trans_type, category):
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_category_keyboard(trans_type):
+def get_category_keyboard(trans_type, categories_by_type=None):
     """Create category selection keyboard"""
     keyboard = []
-    categories = CATEGORIES[trans_type]
+    categories = (categories_by_type or CATEGORIES)[trans_type]
 
     if trans_type == 'expense':
         salary_cats = [k for k in categories.keys() if k.startswith('ЗП ')]
@@ -966,10 +979,10 @@ def get_category_keyboard(trans_type):
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_salary_submenu_keyboard():
+def get_salary_submenu_keyboard(employees=None):
     """Create salary payment submenu"""
     keyboard = []
-    for emp in EMPLOYEES:
+    for emp in (employees if employees is not None else EMPLOYEES):
         keyboard.append([InlineKeyboardButton(
             f"💼 {emp}",
             callback_data=f"cat:expense:ЗП {emp}"
@@ -978,10 +991,10 @@ def get_salary_submenu_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_employee_income_submenu_keyboard():
+def get_employee_income_submenu_keyboard(employees=None):
     """Create employee income submenu"""
     keyboard = []
-    for emp in EMPLOYEES:
+    for emp in (employees if employees is not None else EMPLOYEES):
         keyboard.append([InlineKeyboardButton(
             f"👤 {emp}",
             callback_data=f"cat:income:Від {emp}"
@@ -1003,11 +1016,11 @@ def get_settings_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_time_category_list_keyboard():
+def get_time_category_list_keyboard(time_categories=None):
     """Create time category list keyboard for settings"""
     keyboard = []
     
-    for cat_name, cat_data in TIME_CATEGORIES.items():
+    for cat_name, cat_data in (time_categories or TIME_CATEGORIES).items():
         emoji = cat_data['emoji']
         keyboard.append([
             InlineKeyboardButton(f"{emoji} {cat_name}", callback_data=f"timecatview:{cat_name}"),
@@ -1019,10 +1032,10 @@ def get_time_category_list_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_employee_list_keyboard():
+def get_employee_list_keyboard(employees=None):
     """Create employee list keyboard"""
     keyboard = []
-    for emp in EMPLOYEES:
+    for emp in (employees if employees is not None else EMPLOYEES):
         keyboard.append([
             InlineKeyboardButton(f"👤 {emp}", callback_data=f"emp_view:{emp}"),
             InlineKeyboardButton("❌", callback_data=f"emp_del:{emp}")
@@ -1032,10 +1045,10 @@ def get_employee_list_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-def get_category_list_keyboard(cat_type):
+def get_category_list_keyboard(cat_type, categories_by_type=None):
     """Create category list keyboard"""
     keyboard = []
-    categories = CATEGORIES[cat_type]
+    categories = (categories_by_type or CATEGORIES)[cat_type]
 
     # Filter out employee categories
     if cat_type == 'expense':
@@ -1179,7 +1192,7 @@ def get_numpad_keyboard(current_amount, trans_type, category, currency):
     return InlineKeyboardMarkup(keyboard)
 
 
-def generate_text_chart(data_dict, total, title):
+def generate_text_chart(data_dict, total, title, categories_by_type=None):
     """Generate text-based chart"""
     if not data_dict or total == 0:
         return "Немає даних"
@@ -1192,8 +1205,9 @@ def generate_text_chart(data_dict, total, title):
         percentage = (amount / total) * 100
         emoji = '📦'
         for cat_type in ['income', 'expense']:
-            if category in CATEGORIES[cat_type]:
-                emoji = CATEGORIES[cat_type][category]['emoji']
+            categories = categories_by_type or CATEGORIES
+            if category in categories[cat_type]:
+                emoji = categories[cat_type][category]['emoji']
                 break
 
         bar_length = int((amount / total) * 30)
@@ -1279,6 +1293,7 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def undo_last_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Undo last transaction"""
     user_id = str(update.effective_user.id)
+    settings = await user_settings_for(user_id)
 
     transactions = await db.get_transactions(user_id, limit=1)
 
@@ -1292,7 +1307,7 @@ async def undo_last_transaction(update: Update, context: ContextTypes.DEFAULT_TY
     last = transactions[0]
 
     emoji = "💸" if last['type'] == 'expense' else "💰"
-    cat_emoji = CATEGORIES[last['type']].get(last['category'], {}).get('emoji', '📦')
+    cat_emoji = settings['categories'][last['type']].get(last['category'], {}).get('emoji', '📦')
 
     keyboard = [
         [InlineKeyboardButton("✅ Так, видалити", callback_data=f"undo_confirm:{last['id']}")],
@@ -1372,6 +1387,7 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show last 15 transactions"""
     user_id = str(update.effective_user.id)
+    settings = await user_settings_for(user_id)
     transactions = await db.get_transactions(user_id, limit=15)
 
     if not transactions:
@@ -1384,7 +1400,7 @@ async def show_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📜 **Останні транзакції:**\n\n"
     for t in transactions:
         emoji = "💸" if t['type'] == 'expense' else "💰"
-        cat_emoji = CATEGORIES[t['type']].get(t['category'], {}).get('emoji', '📦')
+        cat_emoji = settings['categories'][t['type']].get(t['category'], {}).get('emoji', '📦')
 
         amount_display = f"{t['amount']:.2f} {t['currency']}"
         if t['currency'] != 'UAH':
@@ -1417,6 +1433,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data_parts = query.data.split(':')
     action = data_parts[0]
+    user_id = str(query.from_user.id)
+    user_settings = await user_settings_for(user_id)
+    user_categories = user_settings['categories']
+    user_employees = user_settings['employees']
+    user_time_categories = user_settings['time_categories']
+    user_tax_config = user_settings['tax_config']
 
     if action == "cancel":
         await query.edit_message_text("❌ Скасовано")
@@ -1427,7 +1449,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data_parts[1] == "select":
             await query.edit_message_text(
                 "⏱️ **ЗАТРАЧЕНИЙ ЧАС**\n\nОберіть категорію:",
-                reply_markup=get_time_category_keyboard(),
+                reply_markup=get_time_category_keyboard(user_time_categories),
                 parse_mode='Markdown'
             )
         return
@@ -1437,7 +1459,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         category = ':'.join(data_parts[1:])
         context.user_data['waiting_for'] = f'time_minutes:{category}'
         
-        cat_emoji = TIME_CATEGORIES.get(category, {}).get('emoji', '⏱️')
+        cat_emoji = user_time_categories.get(category, {}).get('emoji', '⏱️')
         
         await query.edit_message_text(
             f"{cat_emoji} **{category}**\n\n"
@@ -1463,7 +1485,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             last = transactions[0]
 
             emoji = "💸" if last['type'] == 'expense' else "💰"
-            cat_emoji = CATEGORIES[last['type']].get(last['category'], {}).get('emoji', '📦')
+            cat_emoji = user_categories[last['type']].get(last['category'], {}).get('emoji', '📦')
 
             keyboard = [
                 [InlineKeyboardButton("✅ Так, видалити", callback_data=f"undo_confirm:{last['id']}")],
@@ -1487,7 +1509,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "undo_confirm":
         transaction_id = int(data_parts[1])
-        deleted = await db.delete_transaction(transaction_id)
+        deleted = await db.delete_transaction(transaction_id, user_id=user_id)
 
         if deleted:
             await query.edit_message_text("✅ Транзакцію видалено!")
@@ -1511,14 +1533,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "timecatdel":
         cat_name = ':'.join(data_parts[1:])
         
-        if cat_name in TIME_CATEGORIES and cat_name != 'Інше':
-            del TIME_CATEGORIES[cat_name]
-            SETTINGS['time_categories'] = TIME_CATEGORIES
-            save_settings(SETTINGS)
+        if cat_name in user_time_categories and cat_name != 'Інше':
+            await update_user_settings(
+                user_id, lambda s: s['time_categories'].pop(cat_name, None))
             
             await query.edit_message_text(
                 f"✅ Категорію \"{cat_name}\" видалено!",
-                reply_markup=get_time_category_list_keyboard()
+                reply_markup=get_time_category_list_keyboard(
+                    (await user_settings_for(user_id))['time_categories'])
             )
         return
 
@@ -1533,15 +1555,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "emp_del":
         emp_name = ':'.join(data_parts[1:])
-        if emp_name in EMPLOYEES:
-            EMPLOYEES.remove(emp_name)
-            SETTINGS['employees'] = EMPLOYEES
-            save_settings(SETTINGS)
-            rebuild_employee_categories()
+        if emp_name in user_employees:
+            await update_user_settings(
+                user_id, lambda s: s['employees'].remove(emp_name)
+                if emp_name in s['employees'] else None)
 
             await query.edit_message_text(
                 f"✅ Працівника \"{emp_name}\" видалено!",
-                reply_markup=get_employee_list_keyboard()
+                reply_markup=get_employee_list_keyboard(
+                    (await user_settings_for(user_id))['employees'])
             )
         return
 
@@ -1560,15 +1582,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cat_type = data_parts[1]
         cat_name = ':'.join(data_parts[2:])
 
-        if cat_name in CATEGORIES[cat_type] and cat_name != 'Інше':
-            del CATEGORIES[cat_type][cat_name]
-            SETTINGS['categories'] = CATEGORIES
-            save_settings(SETTINGS)
+        if cat_name in user_categories[cat_type] and cat_name != 'Інше':
+            await update_user_settings(
+                user_id, lambda s: s['categories'][cat_type].pop(cat_name, None))
 
             cat_type_name = "витрат" if cat_type == "expense" else "доходів"
             await query.edit_message_text(
                 f"✅ Категорію \"{cat_name}\" видалено!",
-                reply_markup=get_category_list_keyboard(cat_type)
+                reply_markup=get_category_list_keyboard(
+                    cat_type, (await user_settings_for(user_id))['categories'])
             )
         return
 
@@ -1577,7 +1599,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['waiting_for'] = f'tax_value:{tax_type}'
 
         if tax_type == "single_tax":
-            current = TAX_CONFIG['single_tax_rate'] * 100
+            current = user_tax_config['single_tax_rate'] * 100
             await query.edit_message_text(
                 f"📝 **Зміна ставки єдиного податку**\n\n"
                 f"Поточна ставка: {current:.0f}%\n\n"
@@ -1585,7 +1607,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown'
             )
         elif tax_type == "esv":
-            current = TAX_CONFIG['esv_fixed']
+            current = user_tax_config['esv_fixed']
             await query.edit_message_text(
                 f"📝 **Зміна фіксованого ЄСВ**\n\n"
                 f"Поточна сума: {current:.0f} грн\n\n"
@@ -1599,7 +1621,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         type_name = "💰 Прибутки" if trans_type == "income" else "💸 Витрати"
         await query.edit_message_text(
             f"{type_name}\n\nОберіть категорію:",
-            reply_markup=get_category_keyboard(trans_type)
+            reply_markup=get_category_keyboard(trans_type, user_categories)
         )
 
     elif action == "submenu":
@@ -1607,12 +1629,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if submenu_type == "salary":
             await query.edit_message_text(
                 "💼 ЗП працівникам\n\nОберіть працівника:",
-                reply_markup=get_salary_submenu_keyboard()
+                reply_markup=get_salary_submenu_keyboard(user_employees)
             )
         elif submenu_type == "employees":
             await query.edit_message_text(
                 "👥 Від працівників\n\nОберіть працівника:",
-                reply_markup=get_employee_income_submenu_keyboard()
+                reply_markup=get_employee_income_submenu_keyboard(user_employees)
             )
 
     elif action == "cat":
@@ -1623,7 +1645,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['trans_type'] = trans_type
         context.user_data['category'] = category
 
-        cat_data = CATEGORIES[trans_type].get(category, {'emoji': '📦'})
+        cat_data = user_categories[trans_type].get(category, {'emoji': '📦'})
         emoji = cat_data['emoji']
 
         await query.edit_message_text(
@@ -1641,7 +1663,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['currency'] = currency
         context.user_data['amount'] = ""
 
-        cat_data = CATEGORIES[trans_type].get(category, {'emoji': '📦'})
+        cat_data = user_categories[trans_type].get(category, {'emoji': '📦'})
         emoji = cat_data['emoji']
 
         currency_symbol = {'UAH': '₴', 'USD': '$', 'EUR': '€'}.get(currency, '')
@@ -1675,6 +1697,11 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
     """Handle settings menu callbacks"""
     query = update.callback_query
     setting_type = query.data.split(':')[1]
+    settings = await user_settings_for(query.from_user.id)
+    employees = settings['employees']
+    categories = settings['categories']
+    time_categories = settings['time_categories']
+    tax_config = settings['tax_config']
 
     if setting_type == "main":
         await query.edit_message_text(
@@ -1686,13 +1713,13 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
     elif setting_type == "employees":
         text = "👥 **ПРАЦІВНИКИ**\n\n"
         text += "Поточний список:\n"
-        for i, emp in enumerate(EMPLOYEES, 1):
+        for i, emp in enumerate(employees, 1):
             text += f"{i}. {emp}\n"
         text += "\nНатисніть ❌ щоб видалити або ➕ щоб додати"
 
         await query.edit_message_text(
             text,
-            reply_markup=get_employee_list_keyboard(),
+            reply_markup=get_employee_list_keyboard(employees),
             parse_mode='Markdown'
         )
 
@@ -1702,7 +1729,7 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
 
         await query.edit_message_text(
             text,
-            reply_markup=get_category_list_keyboard('expense'),
+            reply_markup=get_category_list_keyboard('expense', categories),
             parse_mode='Markdown'
         )
 
@@ -1712,7 +1739,7 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
 
         await query.edit_message_text(
             text,
-            reply_markup=get_category_list_keyboard('income'),
+            reply_markup=get_category_list_keyboard('income', categories),
             parse_mode='Markdown'
         )
 
@@ -1722,15 +1749,15 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
 
         await query.edit_message_text(
             text,
-            reply_markup=get_time_category_list_keyboard(),
+            reply_markup=get_time_category_list_keyboard(time_categories),
             parse_mode='Markdown'
         )
 
     elif setting_type == "tax":
         text = f"📊 **ПОДАТКОВІ НАЛАШТУВАННЯ**\n\n"
-        text += f"Єдиний податок: {TAX_CONFIG['single_tax_rate']*100:.0f}%\n"
-        text += f"ЄСВ (фіксований): {TAX_CONFIG['esv_fixed']:.0f} грн\n\n"
-        text += f"💡 {TAX_CONFIG['note']}\n\n"
+        text += f"Єдиний податок: {tax_config['single_tax_rate']*100:.0f}%\n"
+        text += f"ЄСВ (фіксований): {tax_config['esv_fixed']:.0f} грн\n\n"
+        text += f"💡 {tax_config['note']}\n\n"
         text += "Натисніть кнопку для зміни"
 
         await query.edit_message_text(
@@ -1743,6 +1770,7 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
 async def handle_numpad(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle numpad button presses"""
     query = update.callback_query
+    settings = await user_settings_for(query.from_user.id)
 
     parts = query.data.split(':')
     trans_type = parts[1]
@@ -1770,7 +1798,7 @@ async def handle_numpad(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['amount'] = current_amount
 
     display_amount = current_amount if current_amount else "0"
-    cat_data = CATEGORIES[trans_type].get(category, {'emoji': '📦'})
+    cat_data = settings['categories'][trans_type].get(category, {'emoji': '📦'})
     emoji = cat_data['emoji']
 
     currency_symbol = {'UAH': '₴', 'USD': '$', 'EUR': '€'}.get(currency, '')
@@ -1785,6 +1813,7 @@ async def save_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     """Save transaction to database"""
     query = update.callback_query
     user_id = str(update.effective_user.id)
+    settings = await user_settings_for(user_id)
 
     try:
         amount = float(amount_str)
@@ -1811,7 +1840,7 @@ async def save_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
     emoji = "💸" if trans_type == "expense" else "💰"
     type_name = "Витрата" if trans_type == "expense" else "Дохід"
-    cat_data = CATEGORIES[trans_type].get(category, {'emoji': '📦'})
+    cat_data = settings['categories'][trans_type].get(category, {'emoji': '📦'})
     cat_emoji = cat_data['emoji']
 
     currency_symbol = {'UAH': '₴', 'USD': '$', 'EUR': '€'}.get(currency, '')
@@ -1838,6 +1867,11 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
     """Handle text messages"""
     # Check if waiting for specific input
     waiting_for = context.user_data.get('waiting_for')
+    user_id = str(update.effective_user.id)
+    user_settings = await user_settings_for(user_id)
+    user_categories = user_settings['categories']
+    user_employees = user_settings['employees']
+    user_time_categories = user_settings['time_categories']
 
     # Handle time input
     if waiting_for and waiting_for.startswith('time_minutes:'):
@@ -1868,7 +1902,7 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
             timestamp=now.strftime('%Y-%m-%d %H:%M:%S')
         )
         
-        cat_emoji = TIME_CATEGORIES.get(category, {}).get('emoji', '⏱️')
+        cat_emoji = user_time_categories.get(category, {}).get('emoji', '⏱️')
         hours = minutes / 60
         
         response_text = (
@@ -1899,7 +1933,7 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("❌ Назва занадто коротка. Спробуйте ще раз.")
             return
         
-        if cat_name in TIME_CATEGORIES:
+        if cat_name in user_time_categories:
             await update.message.reply_text(f"⚠️ Категорія \"{cat_name}\" вже існує!")
             return
         
@@ -1924,9 +1958,8 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
         new_cat = context.user_data['new_time_category']
         cat_name = new_cat['name']
         
-        TIME_CATEGORIES[cat_name] = {'emoji': emoji}
-        SETTINGS['time_categories'] = TIME_CATEGORIES
-        save_settings(SETTINGS)
+        await update_user_settings(
+            user_id, lambda s: s['time_categories'].update({cat_name: {'emoji': emoji}}))
         
         context.user_data['waiting_for'] = None
         context.user_data['new_time_category'] = None
@@ -1944,14 +1977,11 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("❌ Ім'я занадто коротке. Спробуйте ще раз.")
             return
 
-        if emp_name in EMPLOYEES:
+        if emp_name in user_employees:
             await update.message.reply_text(f"⚠️ Працівник \"{emp_name}\" вже існує!")
             return
 
-        EMPLOYEES.append(emp_name)
-        SETTINGS['employees'] = EMPLOYEES
-        save_settings(SETTINGS)
-        rebuild_employee_categories()
+        await update_user_settings(user_id, lambda s: s['employees'].append(emp_name))
 
         context.user_data['waiting_for'] = None
 
@@ -1969,7 +1999,7 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("❌ Назва занадто коротка. Спробуйте ще раз.")
             return
 
-        if cat_name in CATEGORIES[cat_type]:
+        if cat_name in user_categories[cat_type]:
             await update.message.reply_text(f"⚠️ Категорія \"{cat_name}\" вже існує!")
             return
 
@@ -2009,12 +2039,11 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
         cat_name = new_cat['name']
         emoji = new_cat['emoji']
 
-        CATEGORIES[cat_type][cat_name] = {
-            'emoji': emoji,
-            'keywords': keywords
-        }
-        SETTINGS['categories'] = CATEGORIES
-        save_settings(SETTINGS)
+        await update_user_settings(
+            user_id,
+            lambda s: s['categories'][cat_type].update({cat_name: {
+                'emoji': emoji, 'keywords': keywords, 'subcategories': []}}),
+        )
 
         context.user_data['waiting_for'] = None
         context.user_data['new_category'] = None
@@ -2040,9 +2069,8 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
                 await update.message.reply_text("❌ Ставка має бути від 1% до 20%")
                 return
 
-            TAX_CONFIG['single_tax_rate'] = value / 100
-            SETTINGS['tax_config'] = TAX_CONFIG
-            save_settings(SETTINGS)
+            await update_user_settings(
+                user_id, lambda s: s['tax_config'].update({'single_tax_rate': value / 100}))
 
             await update.message.reply_text(
                 f"✅ Ставку єдиного податку змінено на {value:.0f}%",
@@ -2054,9 +2082,8 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
                 await update.message.reply_text("❌ Сума має бути від 500 до 10000 грн")
                 return
 
-            TAX_CONFIG['esv_fixed'] = value
-            SETTINGS['tax_config'] = TAX_CONFIG
-            save_settings(SETTINGS)
+            await update_user_settings(
+                user_id, lambda s: s['tax_config'].update({'esv_fixed': value}))
 
             await update.message.reply_text(
                 f"✅ Фіксований ЄСВ змінено на {value:.0f} грн",
@@ -2068,11 +2095,9 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
 
     # Try to parse as transaction
     text = update.message.text
-    transaction = parse_transaction(text)
+    transaction = parse_transaction(text, user_categories)
 
     if transaction:
-        user_id = str(update.effective_user.id)
-
         rate = await get_exchange_rate(transaction['currency'])
         amount_uah = convert_to_uah(transaction['amount'], transaction['currency'], rate)
 
@@ -2090,7 +2115,8 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
 
         emoji = "💸" if transaction['type'] == 'expense' else "💰"
         type_name = "Витрата" if transaction['type'] == 'expense' else "Дохід"
-        cat_data = CATEGORIES[transaction['type']].get(transaction['category'], {'emoji': '📦'})
+        cat_data = user_categories[transaction['type']].get(
+            transaction['category'], {'emoji': '📦'})
         cat_emoji = cat_data['emoji']
 
         currency_symbol = {'UAH': '₴', 'USD': '$', 'EUR': '€'}.get(transaction['currency'], '')
@@ -2199,6 +2225,7 @@ async def show_time_monthly_report(update: Update, context: ContextTypes.DEFAULT
     """Show monthly time report"""
     query = update.callback_query
     user_id = str(update.effective_user.id)
+    settings = await user_settings_for(user_id)
 
     time_tracks = await db.get_time_tracks(user_id, year, month)
 
@@ -2239,7 +2266,7 @@ async def show_time_monthly_report(update: Update, context: ContextTypes.DEFAULT
     for i, (cat, minutes) in enumerate(sorted_cats[:10], 1):
         hours = minutes / 60
         percentage = (minutes / total_minutes * 100) if total_minutes > 0 else 0
-        emoji = TIME_CATEGORIES.get(cat, {}).get('emoji', '⏱️')
+        emoji = settings['time_categories'].get(cat, {}).get('emoji', '⏱️')
         
         text += f"{i}. {emoji} {cat}: {minutes:,} хв ({hours:.1f} год) - {percentage:.1f}%\n"
 
@@ -2273,6 +2300,7 @@ async def show_monthly_report(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Show monthly report"""
     query = update.callback_query
     user_id = str(update.effective_user.id)
+    settings = await user_settings_for(user_id)
 
     transactions = await db.get_transactions(user_id, year, month)
 
@@ -2298,14 +2326,14 @@ async def show_monthly_report(update: Update, context: ContextTypes.DEFAULT_TYPE
     if income_by_cat:
         text += "💰 **Доходи:**\n"
         for cat in sorted(income_by_cat.items(), key=lambda x: x[1], reverse=True):
-            emoji = CATEGORIES['income'].get(cat[0], {}).get('emoji', '📦')
+            emoji = settings['categories']['income'].get(cat[0], {}).get('emoji', '📦')
             text += f"  {emoji} {cat[0]}: {cat[1]:.2f} грн\n"
         text += f"  💰 Разом: {total_income:.2f} грн\n\n"
 
     if expenses_by_cat:
         text += "💸 **Витрати:**\n"
         for cat in sorted(expenses_by_cat.items(), key=lambda x: x[1], reverse=True):
-            emoji = CATEGORIES['expense'].get(cat[0], {}).get('emoji', '📦')
+            emoji = settings['categories']['expense'].get(cat[0], {}).get('emoji', '📦')
             text += f"  {emoji} {cat[0]}: {cat[1]:.2f} грн\n"
         text += f"  💸 Разом: {total_expense:.2f} грн\n\n"
 
@@ -2373,6 +2401,7 @@ async def show_employee_report(update: Update, context: ContextTypes.DEFAULT_TYP
     """Show employee report"""
     query = update.callback_query
     user_id = str(update.effective_user.id)
+    settings = await user_settings_for(user_id)
 
     current_date = datetime.now(KYIV_TZ)
     transactions = await db.get_transactions(user_id, current_date.year, current_date.month)
@@ -2383,7 +2412,7 @@ async def show_employee_report(update: Update, context: ContextTypes.DEFAULT_TYP
 
     text = f"👥 **ЗВІТ ПО ПРАЦІВНИКАХ**\n{MONTH_NAMES[current_date.month]} {current_date.year}\n\n"
 
-    for emp in EMPLOYEES:
+    for emp in settings['employees']:
         income_cat = f'Від {emp}'
         salary_cat = f'ЗП {emp}'
 
@@ -2406,6 +2435,7 @@ async def show_tax_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show tax report"""
     query = update.callback_query
     user_id = str(update.effective_user.id)
+    settings = await user_settings_for(user_id)
 
     current_date = datetime.now(KYIV_TZ)
     transactions = await db.get_transactions(user_id, current_date.year, current_date.month)
@@ -2418,8 +2448,8 @@ async def show_tax_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_expense = sum(t['amount_uah'] for t in transactions if t['type'] == 'expense')
     profit = total_income - total_expense
 
-    single_tax_rate = TAX_CONFIG['single_tax_rate']
-    esv_fixed = TAX_CONFIG['esv_fixed']
+    single_tax_rate = settings['tax_config']['single_tax_rate']
+    esv_fixed = settings['tax_config']['esv_fixed']
 
     single_tax = total_income * single_tax_rate
     total_tax = single_tax + esv_fixed
@@ -2496,6 +2526,7 @@ async def show_ai_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate AI report"""
     query = update.callback_query
     user_id = str(update.effective_user.id)
+    settings = await user_settings_for(user_id)
 
     current_date = datetime.now(KYIV_TZ)
     transactions = await db.get_transactions(user_id, current_date.year, current_date.month)
@@ -2518,7 +2549,7 @@ async def show_ai_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance = total_income - total_expense
 
     employees_roi = []
-    for emp in EMPLOYEES:
+    for emp in settings['employees']:
         income = income_by_cat.get(f'Від {emp}', 0)
         salary = expense_by_cat.get(f'ЗП {emp}', 0)
 
@@ -2897,6 +2928,14 @@ async def init_data_middleware(request: web.Request, handler):
         await db.upsert_user(_UserObj(tg_user))
     except Exception as e:
         logger.warning(f'upsert_user via middleware failed: {e}')
+    settings_write = (
+        request.method in {'POST', 'PATCH', 'DELETE'}
+        and request.path.startswith(('/api/categories', '/api/employees',
+                                     '/api/time-categories', '/api/settings'))
+    )
+    if settings_write:
+        async with _user_settings_locks[request['user_id']]:
+            return await handler(request)
     return await handler(request)
 
 

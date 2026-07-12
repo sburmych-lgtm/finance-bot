@@ -111,3 +111,41 @@ def test_category_create_cleans_and_limits_input(monkeypatch, tmp_path):
     assert too_long.status == 400
     assert bad_subs.status == 201
     assert payload(bad_subs)["subcategories"] == ["A"]
+
+
+def test_atomic_settings_updates_do_not_lose_parallel_changes(monkeypatch, tmp_path):
+    use_database(monkeypatch, tmp_path)
+
+    async def update_both():
+        await asyncio.gather(
+            bot.update_user_settings("user-1", lambda s: s["employees"].append("Alice")),
+            bot.update_user_settings(
+                "user-1", lambda s: s["time_categories"].update({"Focus": {"emoji": "F"}})),
+        )
+        return (
+            await bot.user_settings_for("user-1"),
+            await bot.user_settings_for("user-2"),
+        )
+
+    settings, other_settings = run(update_both())
+    assert settings["employees"] == ["Alice"]
+    assert "Focus" in settings["time_categories"]
+    assert other_settings["employees"] == []
+    assert "Focus" not in other_settings["time_categories"]
+
+
+def test_owner_scoped_delete_cannot_remove_another_users_transaction(monkeypatch, tmp_path):
+    database = use_database(monkeypatch, tmp_path)
+
+    async def exercise():
+        tx_id = await database.add_transaction(
+            "owner", 10, "UAH", 10, "expense", "Інше", "",
+            "2026-07-10", "2026-07-10 10:00:00",
+        )
+        deleted = await database.delete_transaction(tx_id, user_id="attacker")
+        remaining = await database.get_transactions("owner")
+        return deleted, remaining
+
+    deleted, remaining = run(exercise())
+    assert not deleted
+    assert len(remaining) == 1
