@@ -311,6 +311,7 @@ def test_quick_templates_use_all_history_and_are_fully_user_isolated(
         "category": "Кафе",
         "subcategory": "Напої",
         "comment": "Ранкова кава",
+        "payment_source": None,
         "usage_count": 16,
     }
     assert result["last_operation"] == {
@@ -320,6 +321,7 @@ def test_quick_templates_use_all_history_and_are_fully_user_isolated(
         "category": "Транспорт",
         "subcategory": None,
         "comment": "Поїздка 14",
+        "payment_source": None,
     }
     serialized = json.dumps(result, ensure_ascii=False)
     assert "SECRET-OTHER-USER" not in serialized

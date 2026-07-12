@@ -23,6 +23,7 @@ CONFIRMATION = "ВИДАЛИТИ"
 USER_OWNED_TABLES = {
     "transactions",
     "time_tracks",
+    "budgets",
     "subscriptions",
     "users",
     "user_settings",
@@ -89,6 +90,12 @@ def seed_two_users(database):
         conn.execute(
             "INSERT INTO subscriptions (user_id, plan) VALUES (?, 'vip')",
             (user_id,),
+        )
+        conn.execute(
+            """INSERT INTO budgets
+               (user_id, type, category, monthly_limit_uah)
+               VALUES (?, 'expense', 'Інше', ?)""",
+            (user_id, 1000 + index),
         )
         conn.execute(
             """INSERT INTO users
@@ -235,4 +242,3 @@ def test_delete_account_uses_authenticated_owner_and_ignores_spoofed_user_id(
     assert body["ok"] is True
     assert all(count == 0 for count in user_row_counts(database, "delete-me").values())
     assert all(count == 1 for count in user_row_counts(database, "keep-me").values())
-
