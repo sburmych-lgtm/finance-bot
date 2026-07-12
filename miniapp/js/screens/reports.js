@@ -4,6 +4,7 @@ import { Store } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
 import { fmtMoney, fmtAmount, esc, toast, setHTML } from '../ui.js';
+import { normalizeMonthlyReport } from '../report-data.js';
 
 const SLICE_COLORS = ['#6E0F1F', '#D8B56D', '#9B1B30', '#6FB67E', '#D45A4F', '#7A6E66'];
 
@@ -26,6 +27,7 @@ const state = {
   data: {},  // cached per-tab
   drill: null,  // {type, category} when drilled into one category's subcategories
 };
+let renderGeneration = 0;
 
 // ── Helpers ─────────────────────────────────────────────────────
 function donutGradient(slices) {
@@ -59,16 +61,9 @@ function loadingSkeleton() {
 }
 
 // ── AI prompt builder + modal (kept from prior version) ────────
-function buildAIPrompt(monthTxs, label) {
-  const income = {}, expense = {};
-  let totalIncome = 0, totalExpense = 0;
-  for (const t of monthTxs) {
-    const v = t.amount_uah || t.amount || 0;
-    if (t.type === 'income') { totalIncome += v; income[t.category] = (income[t.category] || 0) + v; }
-    else                     { totalExpense += v; expense[t.category] = (expense[t.category] || 0) + v; }
-  }
+function buildAIPrompt(report, label) {
+  const { incomeSlices, expenseSlices, totalIncome, totalExpense } = report;
   const balance = totalIncome - totalExpense;
-  const sortDesc = (obj) => Object.entries(obj).sort((a, b) => b[1] - a[1]);
   let r = `🤖 АНАЛІЗ ФІНАНСІВ ДЛЯ AI
 
 Ти фінансовий аналітик. Проаналізуй мої фінанси за ${label}.
@@ -80,12 +75,12 @@ function buildAIPrompt(monthTxs, label) {
 
 ━━━ ДОХОДИ ━━━
 `;
-  sortDesc(income).forEach(([cat, v], i) => {
+  incomeSlices.forEach(({ name: cat, value: v }, i) => {
     const pct = totalIncome > 0 ? (v / totalIncome * 100).toFixed(1) : '0.0';
     r += `${i + 1}. ${cat}: ${v.toFixed(2)} UAH (${pct}%)\n`;
   });
   r += `\n━━━ ВИТРАТИ ━━━\n`;
-  sortDesc(expense).forEach(([cat, v], i) => {
+  expenseSlices.forEach(({ name: cat, value: v }, i) => {
     const pct = totalExpense > 0 ? (v / totalExpense * 100).toFixed(1) : '0.0';
     r += `${i + 1}. ${cat}: ${v.toFixed(2)} UAH (${pct}%)\n`;
   });
@@ -146,23 +141,8 @@ function openAIModal(prompt) {
 }
 
 // ── Tab renderers ──────────────────────────────────────────────
-function renderOverview() {
-  const txs = Store.transactions || [];
-  const monthTxs = txs.filter((t) => {
-    const d = new Date(t.date);
-    return d.getMonth() + 1 === state.month && d.getFullYear() === state.year;
-  });
-
-  const expenseByCat = {};
-  const incomeByCat = {};
-  let totalExpense = 0, totalIncome = 0;
-  for (const t of monthTxs) {
-    const v = t.amount_uah || t.amount || 0;
-    if (t.type === 'expense') { totalExpense += v; expenseByCat[t.category] = (expenseByCat[t.category] || 0) + v; }
-    else                      { totalIncome  += v; incomeByCat[t.category]  = (incomeByCat[t.category]  || 0) + v; }
-  }
-  const slices = Object.entries(expenseByCat).map(([k, v]) => ({ name: k, value: v }))
-    .sort((a, b) => b.value - a.value).slice(0, 6);
+function overviewMarkup(report) {
+  const { expenseSlices: slices, incomeSlices, totalExpense, totalIncome } = report;
   const legend = slices.map((s, i) => {
     const pct = ((s.value / (totalExpense || 1)) * 100).toFixed(0);
     const hasSub = Store.subcategoriesFor('expense', s.name).length > 0;
@@ -174,7 +154,7 @@ function renderOverview() {
         <strong>${esc(fmtAmount(s.value, 'UAH'))} <span class="legend-pct">(${pct}%)</span></strong>
       </div>`;
   }).join('');
-  const incomeBars = Object.entries(incomeByCat).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => {
+  const incomeBars = incomeSlices.map(({ name: k, value: v }) => {
     const hasSub = Store.subcategoriesFor('income', k).length > 0;
     const drillAttr = hasSub ? ` data-drill="income" data-drill-cat="${esc(k)}"` : '';
     return `
@@ -202,8 +182,22 @@ function renderOverview() {
     </div>
     <div class="section-head"><div class="section-title">Доходи по джерелах</div></div>
     <div class="panel" style="padding: var(--sp-4);">
-      ${Object.keys(incomeByCat).length ? `<div class="bars">${incomeBars}</div>` : emptyState('Немає доходів за цей місяць')}
+      ${incomeSlices.length ? `<div class="bars">${incomeBars}</div>` : emptyState('Немає доходів за цей місяць')}
     </div>`;
+}
+
+async function renderOverview(container, generation) {
+  setHTML(container, loadingSkeleton());
+  try {
+    const report = normalizeMonthlyReport(await Api.monthlyReport(state.year, state.month));
+    if (generation !== renderGeneration) return;
+    state.data.overview = report;
+    setHTML(container, overviewMarkup(report));
+    wireDrill(container);
+  } catch (e) {
+    if (generation !== renderGeneration) return;
+    setHTML(container, emptyState('Помилка: ' + (e.message || 'не вдалось завантажити')));
+  }
 }
 
 async function renderEmployees(container) {
@@ -413,13 +407,12 @@ async function renderTime(container) {
   }
 }
 
-function renderAI(container) {
-  const txs = Store.transactions || [];
-  const monthTxs = txs.filter((t) => {
-    const d = new Date(t.date);
-    return d.getMonth() + 1 === state.month && d.getFullYear() === state.year;
-  });
-  container.innerHTML = `
+async function renderAI(container, generation) {
+  setHTML(container, loadingSkeleton());
+  try {
+    const report = normalizeMonthlyReport(await Api.monthlyReport(state.year, state.month));
+    if (generation !== renderGeneration) return;
+    setHTML(container, `
     <div class="panel ai-card">
       <div class="ai-card-row">
         <div class="ai-card-icon">🤖</div>
@@ -440,11 +433,15 @@ function renderAI(container) {
           <div class="ai-card-sub">Промпт генерується тут, не передається на жодний AI-сервіс автоматично. Ви самі вирішуєте, куди вставляти.</div>
         </div>
       </div>
-    </div>`;
+    </div>`);
   container.querySelector('#genAIBtn').addEventListener('click', () => {
     Telegram.haptic('medium');
-    openAIModal(buildAIPrompt(monthTxs, monthLabel()));
+    openAIModal(buildAIPrompt(report, monthLabel()));
   });
+  } catch (e) {
+    if (generation !== renderGeneration) return;
+    setHTML(container, emptyState('Помилка: ' + (e.message || 'не вдалось завантажити')));
+  }
 }
 
 // Drill into one category → donut by subcategory
@@ -497,6 +494,7 @@ async function renderCategoryDrill(container, drill) {
 
 // ── Main entry ─────────────────────────────────────────────────
 export function renderReports() {
+  const generation = ++renderGeneration;
   const root = document.getElementById('screen-reports');
   if (!root) return;
 
@@ -548,15 +546,14 @@ export function renderReports() {
       if (state.drill) {
         renderCategoryDrill(content, state.drill);
       } else {
-        setHTML(content, renderOverview());
-        wireDrill(content);
+        renderOverview(content, generation);
       }
       break;
     case 'employees':  renderEmployees(content); break;
     case 'tax':        renderTax(content); break;
     case 'accounting': renderAccounting(content); break;
     case 'time':       renderTime(content); break;
-    case 'ai':         renderAI(content); break;
+    case 'ai':         renderAI(content, generation); break;
   }
 }
 
