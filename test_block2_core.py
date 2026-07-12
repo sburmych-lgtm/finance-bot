@@ -542,3 +542,140 @@ def test_block2_routes_are_registered():
     assert ("GET", "/api/budgets") in routes
     assert ("PUT", "/api/budgets") in routes
     assert ("DELETE", "/api/budgets/{type}/{category}") in routes
+
+
+def test_idempotency_fingerprint_survives_source_and_category_corrections(
+    monkeypatch, tmp_path
+):
+    database = use_database(monkeypatch, tmp_path)
+    run(database.save_user_settings("user-1", user_settings(expense=("Old",))))
+    monkeypatch.setattr(
+        bot, "get_exchange_rate", lambda _currency: asyncio.sleep(0, result=1.0)
+    )
+    original = transaction_body(
+        category="Old",
+        payment_source="cash",
+        client_request_id="immutable-request-1",
+    )
+    created = payload(run(bot.api_post_transaction(Request(body=original))))
+    run(
+        bot.api_patch_transaction(
+            Request(
+                body={"payment_source": "card"},
+                match_info={"id": str(created["id"])},
+                method="PATCH",
+            )
+        )
+    )
+    run(
+        bot.api_categories_update(
+            Request(
+                body={"new_name": "New"},
+                match_info={"type": "expense", "name": "Old"},
+                method="PATCH",
+            )
+        )
+    )
+
+    original_replay = run(bot.api_post_transaction(Request(body=original)))
+    mutated_replay = run(
+        bot.api_post_transaction(
+            Request(body={**original, "category": "New", "payment_source": "card"})
+        )
+    )
+
+    assert original_replay.status == 200
+    assert payload(original_replay)["duplicate"] is True
+    assert payload(original_replay)["category"] == "New"
+    assert payload(original_replay)["payment_source"] == "card"
+    assert mutated_replay.status == 409
+    assert len(run(database.get_transactions("user-1"))) == 1
+
+
+def test_concurrent_category_renames_do_not_lose_settings(monkeypatch, tmp_path):
+    database = use_database(monkeypatch, tmp_path)
+    run(database.save_user_settings("user-1", user_settings(expense=("A", "B"))))
+    original_settings_for = bot.user_settings_for
+    active_reads = 0
+    max_active_reads = 0
+
+    async def delayed_settings_for(user_id):
+        nonlocal active_reads, max_active_reads
+        active_reads += 1
+        max_active_reads = max(max_active_reads, active_reads)
+        try:
+            await asyncio.sleep(0.02)
+            return await original_settings_for(user_id)
+        finally:
+            active_reads -= 1
+
+    monkeypatch.setattr(bot, "user_settings_for", delayed_settings_for)
+
+    async def rename(old, new):
+        return await bot.api_categories_update(
+            Request(
+                body={"new_name": new},
+                match_info={"type": "expense", "name": old},
+                method="PATCH",
+            )
+        )
+
+    async def exercise():
+        return await asyncio.gather(rename("A", "A1"), rename("B", "B1"))
+
+    responses = run(exercise())
+    saved = run(database.get_user_settings("user-1"))
+
+    assert [response.status for response in responses] == [200, 200]
+    assert set(saved["categories"]["expense"]) == {"A1", "B1"}
+    assert max_active_reads == 1
+
+
+def test_settings_reset_atomically_removes_custom_budgets(monkeypatch, tmp_path):
+    database = use_database(monkeypatch, tmp_path)
+    run(database.save_user_settings("user-1", user_settings(expense=("Custom",))))
+    database.conn.execute(
+        "INSERT INTO budgets (user_id, type, category, monthly_limit_uah) "
+        "VALUES ('user-1', 'expense', 'Custom', 100)"
+    )
+    database.conn.commit()
+
+    response = run(bot.api_settings_reset(Request(method="DELETE")))
+
+    assert response.status == 200
+    assert database.conn.execute(
+        "SELECT COUNT(*) FROM budgets WHERE user_id='user-1'"
+    ).fetchone()[0] == 0
+    assert run(database.get_user_settings("user-1")) is None
+
+
+def test_budget_progress_quantizes_sqlite_real_before_comparison(
+    monkeypatch, tmp_path
+):
+    database = use_database(monkeypatch, tmp_path)
+    run(database.save_user_settings("user-1", user_settings(expense=("Food",))))
+    database.conn.execute(
+        "INSERT INTO budgets (user_id, type, category, monthly_limit_uah) "
+        "VALUES ('user-1', 'expense', 'Food', 0.30)"
+    )
+    database.conn.commit()
+    for amount in (0.1, 0.2):
+        run(
+            database.add_transaction(
+                "user-1", amount, "UAH", amount, "expense", "Food", "",
+                "2026-07-01", "2026-07-01 10:00:00",
+            )
+        )
+
+    result = payload(
+        run(
+            bot.api_budgets_get(
+                Request(query={"year": "2026", "month": "7"})
+            )
+        )
+    )["budgets"][0]
+
+    assert result["spent_uah"] == 0.30
+    assert result["remaining_uah"] == 0.0
+    assert result["progress_percent"] == 100.0
+    assert result["is_exceeded"] is False

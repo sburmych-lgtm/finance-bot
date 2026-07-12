@@ -6,6 +6,7 @@ import hmac
 import hashlib
 import math
 import secrets
+from functools import wraps
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
@@ -483,6 +484,7 @@ class Database:
                 timestamp DATETIME NOT NULL,
                 client_request_id TEXT,
                 payment_source TEXT,
+                request_fingerprint TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -737,6 +739,19 @@ class Database:
             except Exception as e:
                 logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
 
+        mig = '20260712_add_request_fingerprint'
+        if not applied(mig):
+            try:
+                cursor.execute("PRAGMA table_info(transactions)")
+                cols = {row[1] for row in cursor.fetchall()}
+                if 'request_fingerprint' not in cols:
+                    cursor.execute(
+                        "ALTER TABLE transactions ADD COLUMN request_fingerprint TEXT"
+                    )
+                mark(mig)
+            except Exception as e:
+                logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
+
         self.conn.commit()
 
     async def get_user_settings(self, user_id):
@@ -775,6 +790,28 @@ class Database:
             cursor.execute("DELETE FROM user_settings WHERE user_id = ?", (str(user_id),))
             self.conn.commit()
             return cursor.rowcount > 0
+
+    async def reset_user_settings(self, user_id):
+        """Atomically reset settings and category-dependent budget config."""
+        owner = str(user_id)
+        async with db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                cursor.execute("DELETE FROM budgets WHERE user_id = ?", (owner,))
+                deleted_budgets = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM user_settings WHERE user_id = ?", (owner,)
+                )
+                deleted_settings = cursor.rowcount
+                self.conn.commit()
+                return {
+                    'budgets': deleted_budgets,
+                    'user_settings': deleted_settings,
+                }
+            except Exception:
+                self.conn.rollback()
+                raise
 
     async def delete_user_account(self, user_id):
         """Irreversibly delete every row owned by one Telegram user.
@@ -951,7 +988,8 @@ class Database:
 
     async def add_transaction(self, user_id, amount, currency, amount_uah, t_type,
                              category, description, date, timestamp, subcategory=None,
-                             client_request_id=None, payment_source=None):
+                             client_request_id=None, payment_source=None,
+                             request_fingerprint=None):
         """Add transaction to database"""
         async with db_lock:
             cursor = self.conn.cursor()
@@ -960,12 +998,12 @@ class Database:
                     INSERT INTO transactions
                     (user_id, amount, currency, amount_uah, type, category,
                      subcategory, description, date, timestamp, client_request_id,
-                     payment_source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     payment_source, request_fingerprint)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     user_id, amount, currency, amount_uah, t_type, category,
                     subcategory, description, date, timestamp, client_request_id,
-                    payment_source,
+                    payment_source, request_fingerprint,
                 ))
                 self.conn.commit()
                 return cursor.lastrowid
@@ -1613,6 +1651,26 @@ async def save_user_settings(user_id, settings):
 
 
 _user_settings_locks = defaultdict(asyncio.Lock)
+
+
+def serialized_user_settings_write(handler):
+    """Serialize read/modify/write handlers, including direct test calls.
+
+    The middleware marks requests for which it already owns the same lock, so
+    the decorator is non-reentrant and cannot deadlock in normal API traffic.
+    """
+    @wraps(handler)
+    async def wrapped(request):
+        if request.get('_settings_lock_held'):
+            return await handler(request)
+        lock = _user_settings_locks[str(request['user_id'])]
+        async with lock:
+            request['_settings_lock_held'] = True
+            try:
+                return await handler(request)
+            finally:
+                request.pop('_settings_lock_held', None)
+    return wrapped
 
 
 async def update_user_settings(user_id, mutator):
@@ -4197,7 +4255,11 @@ async def user_context_middleware(request: web.Request, handler):
     )
     if settings_write:
         async with _user_settings_locks[request['user_id']]:
-            return await handler(request)
+            request['_settings_lock_held'] = True
+            try:
+                return await handler(request)
+            finally:
+                request.pop('_settings_lock_held', None)
     return await handler(request)
 
 
@@ -4517,6 +4579,28 @@ def _parse_payment_source(body: dict, *, required=False):
     return value, None
 
 
+def _transaction_request_fingerprint(
+    *, amount, currency, t_type, category, subcategory, payment_source,
+    description,
+):
+    """Hash the immutable normalized create request, not mutable row fields."""
+    normalized_amount = format(Decimal(str(amount)).normalize(), 'f')
+    canonical = json.dumps(
+        [
+            normalized_amount,
+            currency,
+            t_type,
+            category,
+            subcategory,
+            payment_source,
+            description,
+        ],
+        ensure_ascii=False,
+        separators=(',', ':'),
+    ).encode('utf-8')
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _transaction_write_response(row: dict, *, duplicate: bool):
     """Stable POST response for both a new write and an idempotent replay."""
     client_request_id = row.get('client_request_id')
@@ -4541,6 +4625,7 @@ def _transaction_write_response(row: dict, *, duplicate: bool):
 def _idempotency_payload_matches(
     row: dict,
     *,
+    request_fingerprint: str,
     amount: float,
     currency: str,
     t_type: str,
@@ -4549,6 +4634,10 @@ def _idempotency_payload_matches(
     payment_source: str | None,
     description: str,
 ) -> bool:
+    stored_fingerprint = row.get('request_fingerprint')
+    if stored_fingerprint:
+        return hmac.compare_digest(stored_fingerprint, request_fingerprint)
+    # Compatibility for rows written before request fingerprints existed.
     return (
         math.isclose(float(row['amount']), amount, rel_tol=0, abs_tol=1e-9)
         and row['currency'] == currency
@@ -4614,6 +4703,15 @@ async def api_post_transaction(request: web.Request):
     description = _clean_text(body.get('description'), max_len=200, default='')
     # Optional subcategory (hierarchical categories). None when absent/empty.
     subcategory = _clean_text(body.get('subcategory'), max_len=80, default='') or None
+    request_fingerprint = _transaction_request_fingerprint(
+        amount=amount,
+        currency=currency,
+        t_type=t_type,
+        category=category,
+        subcategory=subcategory,
+        payment_source=payment_source,
+        description=description,
+    )
 
     if client_request_id is not None:
         existing = await db.get_transaction_by_client_request_id(
@@ -4622,6 +4720,7 @@ async def api_post_transaction(request: web.Request):
         if existing is not None:
             if not _idempotency_payload_matches(
                 existing,
+                request_fingerprint=request_fingerprint,
                 amount=amount,
                 currency=currency,
                 t_type=t_type,
@@ -4671,6 +4770,7 @@ async def api_post_transaction(request: web.Request):
             subcategory=subcategory,
             client_request_id=client_request_id,
             payment_source=payment_source,
+            request_fingerprint=request_fingerprint,
         )
     except sqlite3.IntegrityError:
         # Two concurrent retries can both miss the preflight lookup. The
@@ -4684,6 +4784,7 @@ async def api_post_transaction(request: web.Request):
             raise
         if not _idempotency_payload_matches(
             existing,
+            request_fingerprint=request_fingerprint,
             amount=amount,
             currency=currency,
             t_type=t_type,
@@ -4885,13 +4986,14 @@ async def api_settings(request: web.Request):
     })
 
 
+@serialized_user_settings_write
 async def api_settings_reset(request: web.Request):
     """Wipe this user's settings row → next request rebuilds it from
     DEFAULT_SETTINGS. Used by the «Reset to defaults» button in the
     Mini App, and as the recovery path for users who imported legacy
     employees/categories they didn't actually have."""
     user_id = request['user_id']
-    await db.delete_user_settings(user_id)
+    await db.reset_user_settings(user_id)
     logger.info(f"API DELETE /api/settings user={user_id} (reset to defaults)")
     fresh = await user_settings_for(user_id)
     return _json_response(fresh)
@@ -5039,8 +5141,12 @@ async def api_budgets_get(request: web.Request):
     rows = await db.get_budget_progress(request['user_id'], start, end)
     budgets = []
     for row in rows:
-        limit_value = Decimal(str(row['monthly_limit_uah']))
-        spent = Decimal(str(row['spent_uah']))
+        limit_value = Decimal(str(row['monthly_limit_uah'])).quantize(
+            Decimal('0.01'), rounding=ROUND_HALF_UP
+        )
+        spent = Decimal(str(row['spent_uah'])).quantize(
+            Decimal('0.01'), rounding=ROUND_HALF_UP
+        )
         remaining = limit_value - spent
         progress = (spent * Decimal('100') / limit_value).quantize(
             Decimal('0.01'), rounding=ROUND_HALF_UP
@@ -5328,6 +5434,7 @@ async def api_categories_create(request: web.Request):
     return _json_response({'type': cat_type, 'name': name, **entry}, status=201)
 
 
+@serialized_user_settings_write
 async def api_categories_update(request: web.Request):
     user_id = request['user_id']
     cat_type = request.match_info.get('type')
@@ -5396,6 +5503,7 @@ async def api_categories_update(request: web.Request):
     return _json_response({'type': cat_type, 'name': new_name, **new_entry})
 
 
+@serialized_user_settings_write
 async def api_categories_delete(request: web.Request):
     user_id = request['user_id']
     cat_type = request.match_info.get('type')
