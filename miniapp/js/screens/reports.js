@@ -257,19 +257,20 @@ async function renderTax(container) {
       metricRow = `<div class="metric" style="grid-column: 1 / -1;"><span>Без нарахувань</span><strong>Фізособа — податки не нараховуємо</strong></div>`;
     } else {
       const singleLabel = d.group === 'fop3'
-        ? `Єдиний податок (${(d.single_tax_rate * 100).toFixed(0)}%)`
+        ? `Єдиний податок (${d.scheme_label || `${(d.single_tax_rate * 100).toFixed(0)}%`})`
         : 'Єдиний податок (фіксований)';
       metricRow = `
         <div class="metric"><span>${esc(singleLabel)}</span><strong>${esc(fmtAmount(d.single_tax, 'UAH'))}</strong></div>
         <div class="metric"><span>ЄСВ (фіксований)</span><strong>${esc(fmtAmount(d.esv_fixed, 'UAH'))}</strong></div>
+        <div class="metric" style="grid-column: 1 / -1;"><span>Військовий збір</span><strong>${esc(fmtAmount(d.military_levy, 'UAH'))}</strong></div>
       `;
     }
 
     const hintText = isNotFop
-      ? 'Як фізособа ви не сплачуєте єдиний податок та ЄСВ. Якщо ви ФОП — змініть групу у Меню → Налаштування → Податки.'
+      ? 'Як фізособа ви не сплачуєте єдиний податок, ЄСВ і військовий збір у межах цього ФОП-розрахунку. Якщо ви ФОП — змініть групу у Меню → Налаштування → Податки.'
       : d.group === 'fop3'
-        ? `${(d.single_tax_rate * 100).toFixed(0)}% єдиного податку від доходу + фіксований ЄСВ ${fmtAmount(d.esv_fixed, 'UAH')}. Змініть у Меню → Налаштування → Податки.`
-        : `Фіксований єдиний податок ${fmtAmount(d.single_tax, 'UAH')} + ЄСВ ${fmtAmount(d.esv_fixed, 'UAH')}. Змініть у Меню → Налаштування → Податки.`;
+        ? `${d.scheme_label || `${(d.single_tax_rate * 100).toFixed(0)}%`} єдиного податку + ЄСВ ${fmtAmount(d.esv_fixed, 'UAH')} + 1% військового збору від доходу.${d.vat_registered ? ' ПДВ у підсумок не включено.' : ''}`
+        : `Фіксований єдиний податок ${fmtAmount(d.single_tax, 'UAH')} + ЄСВ ${fmtAmount(d.esv_fixed, 'UAH')} + військовий збір ${fmtAmount(d.military_levy, 'UAH')}.`;
 
     container.innerHTML = `
       <div class="balance-card" style="min-height:auto;">
@@ -278,7 +279,7 @@ async function renderTax(container) {
         <div class="metric-row">${metricRow}</div>
       </div>
 
-      <div class="section-head"><div class="section-title">Звіт у податкову</div></div>
+      <div class="section-head"><div class="section-title">Орієнтовний розрахунок</div></div>
       <div class="panel" style="padding: var(--sp-4);">
         <div class="row-list">
           <div class="kv"><span>Період</span><strong>${esc(d.period_from)} — ${esc(d.period_to)}</strong></div>
@@ -294,10 +295,11 @@ async function renderTax(container) {
           <div class="ai-card-icon">📋</div>
           <div class="ai-card-text">
             <div class="ai-card-title">${esc(groupLabel)}</div>
-            <div class="ai-card-sub">${esc(hintText)}</div>
+            <div class="ai-card-sub">${esc(hintText)} Змініть параметри у Меню → Налаштування → Податки.</div>
           </div>
         </div>
-      </div>`;
+      </div>
+      <p class="row-meta" style="margin: var(--sp-3) var(--sp-2) 0; line-height:1.5;">${esc(d.disclaimer || 'Розрахунок інформаційний і не є податковою консультацією.')}</p>`;
   } catch (e) {
     container.innerHTML = emptyState('Помилка: ' + (e.message || 'не вдалось завантажити'));
   }

@@ -393,9 +393,9 @@ async function renderEmployees(root) {
 
 // ── Tax settings ───────────────────────────────────────────────
 const TAX_GROUPS = [
-  { id: 'fop1', label: 'ФОП 1 група',     hint: 'Фіксований податок ~10% прожиткового мінімуму + ЄСВ' },
-  { id: 'fop2', label: 'ФОП 2 група',     hint: 'Фіксований податок ~20% мінімалки + ЄСВ' },
-  { id: 'fop3', label: 'ФОП 3 група',     hint: '% від доходу + ЄСВ. Найпоширеніше для самозайнятих' },
+  { id: 'fop1', label: 'ФОП 1 група',     hint: 'Фіксований єдиний податок, ЄСВ і військовий збір' },
+  { id: 'fop2', label: 'ФОП 2 група',     hint: 'Фіксований єдиний податок, ЄСВ і військовий збір' },
+  { id: 'fop3', label: 'ФОП 3 група',     hint: '5% без ПДВ або 3% + ПДВ, ЄСВ і 1% військового збору' },
   { id: 'none', label: 'Я не ФОП',        hint: 'Фізособа — нічого не нараховуємо' },
 ];
 
@@ -409,12 +409,16 @@ async function renderTaxSettings(root) {
   try {
     const s = await Api.settings();
     const tax = s?.tax_config || {};
-    const group = tax.group || 'fop3';
-    const rate = (tax.single_tax_rate ?? 0.05) * 100;
-    const fop1 = tax.fop1_fixed ?? 303;
-    const fop2 = tax.fop2_fixed ?? 1600;
-    const esv = tax.esv_fixed ?? 1760;
-    const draft = { rate, fop1, fop2, esv };
+    const taxYear = Number(s?.tax_year || new Date().getFullYear());
+    const profile = s?.tax_profile || tax?.profiles_by_year?.[String(taxYear)] || tax;
+    const group = profile.group || 'fop3';
+    const scheme = profile.scheme || '5_percent';
+    const fop1 = profile.fop1_fixed ?? 332.80;
+    const fop2 = profile.fop2_fixed ?? 1729.40;
+    const esv = profile.esv_fixed ?? 1902.34;
+    const militaryFixed = profile.military_fixed ?? 864.70;
+    const militaryRate = profile.military_rate ?? 0.01;
+    const draft = { scheme, fop1, fop2, esv, militaryFixed, militaryRate };
 
     const groupCards = TAX_GROUPS.map((g) => `
       <button class="tax-group-card ${group === g.id ? 'active' : ''}" data-group="${esc(g.id)}">
@@ -425,12 +429,12 @@ async function renderTaxSettings(root) {
 
     body.innerHTML = `
       <div class="panel" style="padding: var(--sp-4);">
-        <label style="font-size:10px; letter-spacing:.14em; text-transform:uppercase; font-weight:800; color: var(--ruby-gold); display:block; margin-bottom: var(--sp-2);">Оберіть групу</label>
+        <label style="font-size:10px; letter-spacing:.14em; text-transform:uppercase; font-weight:800; color: var(--ruby-gold); display:block; margin-bottom: var(--sp-2);">Оберіть групу · правила ${esc(String(taxYear))}</label>
         <div class="tax-group-grid">${groupCards}</div>
       </div>
 
       <div class="panel" style="padding: var(--sp-4); margin-top: var(--sp-3);" id="taxFieldsPanel">
-        ${renderTaxFields(group, { rate, fop1, fop2, esv })}
+        ${renderTaxFields(group, draft)}
       </div>
 
       <button class="btn btn-primary" id="saveTaxBtn" style="margin-top: var(--sp-3);">Зберегти</button>
@@ -440,7 +444,7 @@ async function renderTaxSettings(root) {
           <div class="ai-card-icon">📋</div>
           <div class="ai-card-text">
             <div class="ai-card-title">Як це впливає на звіти</div>
-            <div class="ai-card-sub">Обрана група визначає формулу в «Звіти → Податки». Цифри 2026 — приблизні, перевірте на сайті ДПС перед поданням декларації.</div>
+            <div class="ai-card-sub">Обрана група визначає формулу в «Звіти → Податки». Розрахунок інформаційний, не є податковою консультацією та не враховує спеціальні пільги. Для схеми 3% + ПДВ сума ПДВ не розраховується.</div>
           </div>
         </div>
       </div>
@@ -460,13 +464,13 @@ async function renderTaxSettings(root) {
 
     body.querySelector('#saveTaxBtn').addEventListener('click', async () => {
       const activeGroup = body.querySelector('[data-group].active')?.dataset.group || 'fop3';
-      const payload = { group: activeGroup };
+      const payload = { year: taxYear, group: activeGroup };
       captureTaxDraft(body, draft);
 
       if (activeGroup === 'fop3') {
-        const r = parseFloat(body.querySelector('#taxRate')?.value);
-        if (!isFinite(r) || r < 1 || r > 25) { toast('Ставка має бути 1–25%'); return; }
-        payload.single_tax_rate = r / 100;
+        const schemeValue = body.querySelector('#taxScheme')?.value;
+        if (!['5_percent', '3_percent_vat'].includes(schemeValue)) { toast('Оберіть податкову схему'); return; }
+        payload.scheme = schemeValue;
       }
       if (activeGroup === 'fop1') {
         const v = parseFloat(body.querySelector('#taxFop1')?.value);
@@ -497,7 +501,6 @@ async function renderTaxSettings(root) {
 
 function captureTaxDraft(root, draft) {
   const fields = [
-    ['taxRate', 'rate'],
     ['taxFop1', 'fop1'],
     ['taxFop2', 'fop2'],
     ['taxEsv', 'esv'],
@@ -508,9 +511,11 @@ function captureTaxDraft(root, draft) {
     const value = parseFloat(input.value);
     if (Number.isFinite(value)) draft[key] = value;
   });
+  const scheme = root.querySelector('#taxScheme')?.value;
+  if (['5_percent', '3_percent_vat'].includes(scheme)) draft.scheme = scheme;
 }
 
-function renderTaxFields(group, { rate, fop1, fop2, esv }) {
+function renderTaxFields(group, { scheme, fop1, fop2, esv, militaryFixed, militaryRate }) {
   if (group === 'none') {
     return `
       <div class="empty-state" style="padding: var(--sp-4);">
@@ -526,28 +531,37 @@ function renderTaxFields(group, { rate, fop1, fop2, esv }) {
       <div class="field">
         <label>Єдиний податок (₴/міс)</label>
         <input class="input" id="taxFop1" type="number" step="1" min="0" max="10000" value="${esc(String(fop1))}">
-        <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">10% прожиткового мінімуму. На 2026 ≈ 303 ₴.</p>
+        <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">До 10% прожиткового мінімуму. Максимум у 2026 році — 332,80 ₴; місцева ставка може бути нижчою.</p>
       </div>`;
   } else if (group === 'fop2') {
     html += `
       <div class="field">
         <label>Єдиний податок (₴/міс)</label>
         <input class="input" id="taxFop2" type="number" step="1" min="0" max="20000" value="${esc(String(fop2))}">
-        <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">20% мінімалки. На 2026 = 1 600 ₴.</p>
+        <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">До 20% мінімальної зарплати. Максимум у 2026 році — 1 729,40 ₴; місцева ставка може бути нижчою.</p>
       </div>`;
   } else {  // fop3
     html += `
       <div class="field">
-        <label>Ставка єдиного податку (%)</label>
-        <input class="input" id="taxRate" type="number" step="0.1" min="1" max="25" value="${esc(rate.toFixed(1))}">
-        <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">5% — неплатники ПДВ. 3% — платники ПДВ.</p>
+        <label>Схема єдиного податку</label>
+        <select class="input" id="taxScheme">
+          <option value="5_percent" ${scheme === '5_percent' ? 'selected' : ''}>5% без ПДВ</option>
+          <option value="3_percent_vat" ${scheme === '3_percent_vat' ? 'selected' : ''}>3% + ПДВ</option>
+        </select>
+        <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">Для 3% + ПДВ звіт рахує єдиний податок, але не суму ПДВ.</p>
       </div>`;
   }
   html += `
     <div class="field">
       <label>Фіксований ЄСВ (₴/міс)</label>
       <input class="input" id="taxEsv" type="number" step="1" min="0" max="50000" value="${esc(String(esv))}">
-      <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">22% × мінімалка. На 2026 = 1 760 ₴.</p>
+      <p style="color:var(--ruby-muted); font-size:11px; margin: 4px 0 0;">22% × мінімальна зарплата. Мінімальний платіж у 2026 році — 1 902,34 ₴.</p>
+    </div>
+    <div class="field">
+      <label>Військовий збір</label>
+      <div class="input" style="display:flex; align-items:center; opacity:.86;">
+        ${group === 'fop3' ? `${esc(String(militaryRate * 100))}% від доходу` : `${esc(String(militaryFixed.toFixed(2)))} ₴/міс`}
+      </div>
     </div>`;
   return html;
 }

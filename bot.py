@@ -15,6 +15,7 @@ from telegram.ext import (
     filters
 )
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 import re
 from collections import defaultdict
@@ -118,6 +119,37 @@ exchange_rates_cache = {
     'last_update': None
 }
 
+# Official standard tax rules, versioned by report year. Fixed-tax values for
+# groups 1/2 are the statutory maximums; users may override their local council
+# rate in a year-specific profile. Special exemptions are intentionally not
+# inferred automatically.
+TAX_RULES_BY_YEAR = {
+    2025: {
+        'minimum_wage': 8000.0,
+        'living_minimum': 3028.0,
+        'fop1_fixed': 302.80,
+        'fop2_fixed': 1600.0,
+        'esv_fixed': 1760.0,
+        'military_fixed': 800.0,
+        'military_rate': 0.01,
+    },
+    2026: {
+        'minimum_wage': 8647.0,
+        'living_minimum': 3328.0,
+        'fop1_fixed': 332.80,
+        'fop2_fixed': 1729.40,
+        'esv_fixed': 1902.34,
+        'military_fixed': 864.70,
+        'military_rate': 0.01,
+    },
+}
+CURRENT_TAX_RULES_YEAR = max(TAX_RULES_BY_YEAR)
+TAX_DISCLAIMER = (
+    'Розрахунок інформаційний і не є податковою консультацією. '
+    'ПДВ та спеціальні пільги автоматично не розраховуються.'
+)
+
+
 # Default settings
 DEFAULT_SETTINGS = {
     # Universal neutral defaults — no personal/professional bias.
@@ -125,17 +157,18 @@ DEFAULT_SETTINGS = {
     # and any niche expense/income categories via Settings → Категорії.
     'employees': [],
     'tax_config': {
-        # Податкова група. Один з: 'fop1', 'fop2', 'fop3', 'none'.
+        # Top-level values are compatibility fallbacks. Actual editable tax
+        # profiles are stored by year so a future rules update cannot rewrite
+        # a historical report.
         'group': 'fop3',
-        # ФОП 3 група: відсоток єдиного податку від доходу (для неплатників ПДВ — 5%)
-        'single_tax_rate': 0.05,
-        # ФОП 1 група: фіксований єдиний податок (≈10% прожиткового мінімуму) на 2026 ≈ 303 ₴
-        'fop1_fixed': 303,
-        # ФОП 2 група: фіксований єдиний податок (≈20% мінімалки) на 2026 = 1 600 ₴
-        'fop2_fixed': 1600,
-        # ЄСВ — фіксований внесок на 2026 = 1 760 ₴ (22% × мінімалка). Сплачують усі групи ФОП.
-        'esv_fixed': 1760,
-        'note': 'Оберіть свою групу у Налаштування → Податки. Не ФОП — 0.'
+        'scheme': '5_percent',
+        'profiles_by_year': {
+            str(CURRENT_TAX_RULES_YEAR): {
+                'group': 'fop3',
+                'scheme': '5_percent',
+            },
+        },
+        'note': TAX_DISCLAIMER,
     },
     'categories': {
         'expense': {
@@ -776,6 +809,141 @@ db = Database()
 import copy as _copy
 
 
+_TAX_GROUPS = {'fop1', 'fop2', 'fop3', 'none'}
+_TAX_SCHEMES = {'5_percent', '3_percent_vat'}
+_LEGACY_TAX_DEFAULTS = {
+    'fop1_fixed': 303.0,
+    'fop2_fixed': 1600.0,
+    'esv_fixed': 1760.0,
+}
+
+
+def _scheme_from_rate(value) -> str:
+    try:
+        return '3_percent_vat' if float(value) == 0.03 else '5_percent'
+    except (TypeError, ValueError):
+        return '5_percent'
+
+
+def _tax_rules_for_year(year: int) -> dict:
+    try:
+        normalized_year = int(year)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('invalid tax rules year') from exc
+    rules = TAX_RULES_BY_YEAR.get(normalized_year)
+    if rules is None:
+        supported = ', '.join(str(y) for y in sorted(TAX_RULES_BY_YEAR))
+        raise ValueError(f'tax rules unavailable for {normalized_year}; supported: {supported}')
+    return rules
+
+
+def tax_profile_for_year(tax_config: dict | None, year: int) -> dict:
+    """Resolve one report-year profile over versioned official defaults."""
+    normalized_year = int(year)
+    rules = _tax_rules_for_year(normalized_year)
+    config = tax_config if isinstance(tax_config, dict) else {}
+    profiles = config.get('profiles_by_year')
+    profile = {}
+    if isinstance(profiles, dict):
+        candidate = profiles.get(str(normalized_year), {})
+        if isinstance(candidate, dict):
+            profile = candidate
+
+    group = profile.get('group', config.get('group', 'fop3'))
+    if group not in _TAX_GROUPS:
+        group = 'fop3'
+
+    scheme = profile.get('scheme', config.get('scheme'))
+    if scheme not in _TAX_SCHEMES:
+        rate_hint = profile.get('single_tax_rate', config.get('single_tax_rate', 0.05))
+        scheme = _scheme_from_rate(rate_hint)
+
+    def configured_amount(field):
+        value = profile.get(field, config.get(field, rules[field]))
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return float(rules[field])
+        return number if number >= 0 else float(rules[field])
+
+    return {
+        'year': normalized_year,
+        'group': group,
+        'scheme': scheme,
+        'single_tax_rate': 0.03 if scheme == '3_percent_vat' else 0.05,
+        'fop1_fixed': configured_amount('fop1_fixed'),
+        'fop2_fixed': configured_amount('fop2_fixed'),
+        'esv_fixed': configured_amount('esv_fixed'),
+        'military_fixed': float(rules['military_fixed']),
+        'military_rate': float(rules['military_rate']),
+    }
+
+
+def normalize_tax_config(settings: dict) -> dict:
+    """Migrate a user's legacy flat tax settings in memory, idempotently."""
+    raw = settings.get('tax_config')
+    config = raw if isinstance(raw, dict) else {}
+    profiles = config.get('profiles_by_year')
+    if not isinstance(profiles, dict):
+        profiles = {}
+
+    legacy_group = config.get('group', 'fop3')
+    if legacy_group not in _TAX_GROUPS:
+        legacy_group = 'fop3'
+    legacy_scheme = config.get('scheme')
+    if legacy_scheme not in _TAX_SCHEMES:
+        legacy_scheme = _scheme_from_rate(config.get('single_tax_rate', 0.05))
+
+    # Snapshot group/scheme for each supported year so future edits cannot
+    # silently rewrite an older report.
+    for rules_year in TAX_RULES_BY_YEAR:
+        candidate = profiles.get(str(rules_year))
+        profile = candidate if isinstance(candidate, dict) else {}
+        profile.setdefault('group', legacy_group)
+        profile.setdefault('scheme', legacy_scheme)
+        profiles[str(rules_year)] = profile
+
+    # Preserve customized legacy values for the current year, while replacing
+    # the old shipped 2025 defaults with official 2026 values.
+    current_profile = profiles[str(CURRENT_TAX_RULES_YEAR)]
+    for field, old_default in _LEGACY_TAX_DEFAULTS.items():
+        if field not in config:
+            continue
+        try:
+            value = float(config[field])
+        except (TypeError, ValueError):
+            continue
+        if value != old_default:
+            current_profile.setdefault(field, value)
+
+    config['profiles_by_year'] = profiles
+    config['group'] = current_profile['group']
+    config['scheme'] = current_profile['scheme']
+    config['note'] = TAX_DISCLAIMER
+    for field in ('single_tax_rate', 'fop1_fixed', 'fop2_fixed', 'esv_fixed'):
+        config.pop(field, None)
+    settings['tax_config'] = config
+    return config
+
+
+def update_tax_profile(settings: dict, year: int, changes: dict) -> dict:
+    """Apply validated changes only to the selected report year."""
+    normalized_year = int(year)
+    _tax_rules_for_year(normalized_year)
+    config = normalize_tax_config(settings)
+    profile = tax_profile_for_year(config, normalized_year)
+    stored = {
+        key: profile[key]
+        for key in ('group', 'scheme', 'fop1_fixed', 'fop2_fixed', 'esv_fixed')
+    }
+    stored.update(changes)
+    config['profiles_by_year'][str(normalized_year)] = stored
+    if normalized_year == CURRENT_TAX_RULES_YEAR:
+        config['group'] = stored['group']
+        config['scheme'] = stored['scheme']
+    return tax_profile_for_year(config, normalized_year)
+
+
 def _employee_categories_dict(employees):
     income_emp = {}
     expense_emp = {}
@@ -817,6 +985,7 @@ async def user_settings_for(user_id):
         for key, default_value in DEFAULT_SETTINGS.items():
             if key not in existing:
                 existing[key] = _copy.deepcopy(default_value)
+    normalize_tax_config(existing)
     rebuild_user_categories(existing)
     return existing
 
@@ -824,6 +993,7 @@ async def user_settings_for(user_id):
 async def save_user_settings(user_id, settings):
     """Persist the user's settings dict. Also rebuilds employee categories
     so the on-disk copy stays consistent."""
+    normalize_tax_config(settings)
     rebuild_user_categories(settings)
     await db.save_user_settings(user_id, settings)
 
@@ -1537,7 +1707,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_categories = user_settings['categories']
     user_employees = user_settings['employees']
     user_time_categories = user_settings['time_categories']
-    user_tax_config = user_settings['tax_config']
+    user_tax_config = tax_profile_for_year(
+        user_settings['tax_config'], CURRENT_TAX_RULES_YEAR)
 
     if action == "cancel":
         await query.edit_message_text("❌ Скасовано")
@@ -1702,7 +1873,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"📝 **Зміна ставки єдиного податку**\n\n"
                 f"Поточна ставка: {current:.0f}%\n\n"
-                f"Надішліть нову ставку (наприклад: 3 для 3%)",
+                f"Надішліть 5 (без ПДВ) або 3 (платник ПДВ)",
                 parse_mode='Markdown'
             )
         elif tax_type == "esv":
@@ -1801,6 +1972,7 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
     categories = settings['categories']
     time_categories = settings['time_categories']
     tax_config = settings['tax_config']
+    tax_profile = tax_profile_for_year(tax_config, CURRENT_TAX_RULES_YEAR)
 
     if setting_type == "main":
         await query.edit_message_text(
@@ -1854,9 +2026,10 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
 
     elif setting_type == "tax":
         text = f"📊 **ПОДАТКОВІ НАЛАШТУВАННЯ**\n\n"
-        text += f"Єдиний податок: {tax_config['single_tax_rate']*100:.0f}%\n"
-        text += f"ЄСВ (фіксований): {tax_config['esv_fixed']:.0f} грн\n\n"
-        text += f"💡 {tax_config['note']}\n\n"
+        text += f"Рік правил: {CURRENT_TAX_RULES_YEAR}\n"
+        text += f"Єдиний податок: {tax_profile['single_tax_rate']*100:.0f}%\n"
+        text += f"ЄСВ (фіксований): {tax_profile['esv_fixed']:.2f} грн\n\n"
+        text += f"💡 {TAX_DISCLAIMER}\n\n"
         text += "Натисніть кнопку для зміни"
 
         await query.edit_message_text(
@@ -2164,12 +2337,18 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
             return
 
         if tax_type == "single_tax":
-            if value < 1 or value > 20:
-                await update.message.reply_text("❌ Ставка має бути від 1% до 20%")
+            if value not in (3, 5):
+                await update.message.reply_text("❌ Введіть 5 (без ПДВ) або 3 (з ПДВ)")
                 return
 
             await update_user_settings(
-                user_id, lambda s: s['tax_config'].update({'single_tax_rate': value / 100}))
+                user_id,
+                lambda s: update_tax_profile(
+                    s,
+                    CURRENT_TAX_RULES_YEAR,
+                    {'scheme': '3_percent_vat' if value == 3 else '5_percent'},
+                ),
+            )
 
             await update.message.reply_text(
                 f"✅ Ставку єдиного податку змінено на {value:.0f}%",
@@ -2182,7 +2361,10 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
                 return
 
             await update_user_settings(
-                user_id, lambda s: s['tax_config'].update({'esv_fixed': value}))
+                user_id,
+                lambda s: update_tax_profile(
+                    s, CURRENT_TAX_RULES_YEAR, {'esv_fixed': value}),
+            )
 
             await update.message.reply_text(
                 f"✅ Фіксований ЄСВ змінено на {value:.0f} грн",
@@ -2530,24 +2712,63 @@ async def show_employee_report(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(text, parse_mode='Markdown')
 
 
-def calculate_tax_group(total_income, tax_config):
-    """Return normalized tax figures for every supported FOP group."""
-    group = tax_config.get('group', 'fop3')
-    if group not in ('fop1', 'fop2', 'fop3', 'none'):
-        group = 'fop3'
-    rate = float(tax_config.get('single_tax_rate', 0.05))
-    esv_fixed = float(tax_config.get('esv_fixed', 1760))
+def calculate_tax_group(total_income, tax_config, year=CURRENT_TAX_RULES_YEAR):
+    """Return standard monthly FOP taxes for the selected report year.
+
+    VAT itself is never inferred from cash-flow transactions. For the
+    ``3_percent_vat`` scheme the result therefore exposes metadata saying VAT
+    is registered but not included in ``total_tax``.
+    """
+    profile = tax_profile_for_year(tax_config, year)
+    group = profile['group']
+    scheme = profile['scheme']
+    rate = Decimal(str(profile['single_tax_rate']))
+
+    def money(value, fallback='0'):
+        try:
+            amount = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            amount = Decimal(fallback)
+        if not amount.is_finite():
+            amount = Decimal(fallback)
+        return amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    income = max(money(total_income), Decimal('0.00'))
+    esv = money(profile['esv_fixed'])
+    military = money(profile['military_fixed'])
+
     if group == 'none':
-        single_tax, esv, label = 0.0, 0.0, 'Не ФОП (фізособа)'
+        single_tax = esv = military = Decimal('0.00')
+        label = 'Не ФОП (фізособа)'
     elif group == 'fop1':
-        single_tax, esv, label = float(tax_config.get('fop1_fixed', 303)), esv_fixed, 'ФОП 1 група'
+        single_tax = money(profile['fop1_fixed'])
+        label = 'ФОП 1 група'
     elif group == 'fop2':
-        single_tax, esv, label = float(tax_config.get('fop2_fixed', 1600)), esv_fixed, 'ФОП 2 група'
+        single_tax = money(profile['fop2_fixed'])
+        label = 'ФОП 2 група'
     else:
-        single_tax, esv, label = total_income * rate, esv_fixed, 'ФОП 3 група'
+        single_tax = (income * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        military = (
+            income * Decimal(str(profile['military_rate']))
+        ).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        label = 'ФОП 3 група'
+
+    total_tax = single_tax + esv + military
+    vat_registered = group == 'fop3' and scheme == '3_percent_vat'
     return {
-        'group': group, 'group_label': label, 'single_tax_rate': rate,
-        'single_tax': single_tax, 'esv': esv, 'total_tax': single_tax + esv,
+        'group': group,
+        'group_label': label,
+        'scheme': scheme,
+        'scheme_label': '3% + ПДВ' if vat_registered else '5% без ПДВ',
+        'single_tax_rate': float(rate),
+        'single_tax': float(single_tax),
+        'esv': float(esv),
+        'military_levy': float(military),
+        'total_tax': float(total_tax),
+        'vat_registered': vat_registered,
+        'vat_included': False,
+        'rules_year': int(year),
+        'disclaimer': TAX_DISCLAIMER,
     }
 
 
@@ -2560,17 +2781,14 @@ async def show_tax_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_date = datetime.now(KYIV_TZ)
     transactions = await db.get_transactions(user_id, current_date.year, current_date.month)
 
-    if not transactions:
-        await query.edit_message_text("📭 Немає даних.")
-        return
-
     total_income = sum(t['amount_uah'] for t in transactions if t['type'] == 'income')
     total_expense = sum(t['amount_uah'] for t in transactions if t['type'] == 'expense')
     profit = total_income - total_expense
 
-    tax = calculate_tax_group(total_income, settings['tax_config'])
+    tax = calculate_tax_group(
+        total_income, settings['tax_config'], year=current_date.year)
     single_tax_label = (
-        f"Єдиний ({tax['single_tax_rate'] * 100:.0f}%)"
+        f"Єдиний ({tax['scheme_label']})"
         if tax['group'] == 'fop3' else 'Єдиний (фіксований)'
     )
 
@@ -2589,9 +2807,13 @@ async def show_tax_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"━━━ ПОДАТКИ · {tax['group_label']} ━━━\n"
     text += f"{single_tax_label}: {tax['single_tax']:.2f} грн\n"
     text += f"ЄСВ: {tax['esv']:.2f} грн\n"
+    text += f"Військовий збір: {tax['military_levy']:.2f} грн\n"
     text += f"━━━━━━━━━━━━━━━━\n"
     text += f"До сплати: {tax['total_tax']:.2f} грн\n\n"
-    text += f"💰 Після податків: {profit - tax['total_tax']:.2f} грн"
+    text += f"💰 Після податків: {profit - tax['total_tax']:.2f} грн\n\n"
+    if tax['vat_registered']:
+        text += "ПДВ у суму «До сплати» не включено.\n"
+    text += f"ℹ️ {tax['disclaimer']}"
 
     await query.edit_message_text(text, parse_mode='Markdown')
 
@@ -3379,6 +3601,10 @@ async def api_settings(request: web.Request):
     return _json_response({
         'employees': s.get('employees', []),
         'tax_config': s.get('tax_config', {}),
+        'tax_year': CURRENT_TAX_RULES_YEAR,
+        'tax_profile': tax_profile_for_year(
+            s.get('tax_config', {}), CURRENT_TAX_RULES_YEAR),
+        'supported_tax_years': sorted(TAX_RULES_BY_YEAR),
     })
 
 
@@ -3479,7 +3705,7 @@ async def api_report_employees(request: web.Request):
 
 
 async def api_report_tax(request: web.Request):
-    """Mirror show_tax_report: ФОП-3 single tax + fixed ЄСВ."""
+    """Return year-versioned standard FOP tax estimates for one month."""
     user_id = request['user_id']
     year, month, err = _parse_year_month(request)
     if err is not None:
@@ -3492,7 +3718,10 @@ async def api_report_tax(request: web.Request):
 
     user_settings = await user_settings_for(user_id)
     user_tax = user_settings.get('tax_config', DEFAULT_SETTINGS['tax_config'])
-    tax = calculate_tax_group(total_income, user_tax)
+    try:
+        tax = calculate_tax_group(total_income, user_tax, year=year)
+    except ValueError as exc:
+        return _json_response({'detail': str(exc)}, status=422)
 
     import calendar
     last_day = calendar.monthrange(year, month)[1]
@@ -3505,14 +3734,21 @@ async def api_report_tax(request: web.Request):
         'month_name': MONTH_NAMES[month],
         'group': tax['group'],
         'group_label': tax['group_label'],
+        'scheme': tax['scheme'],
+        'scheme_label': tax['scheme_label'],
         'total_income': round(total_income, 2),
         'total_expense': round(total_expense, 2),
         'profit': round(profit, 2),
         'single_tax_rate': tax['single_tax_rate'],
         'esv_fixed': round(tax['esv'], 2),
         'single_tax': round(tax['single_tax'], 2),
+        'military_levy': round(tax['military_levy'], 2),
         'total_tax': round(tax['total_tax'], 2),
         'after_tax': round(profit - tax['total_tax'], 2),
+        'vat_registered': tax['vat_registered'],
+        'vat_included': tax['vat_included'],
+        'rules_year': tax['rules_year'],
+        'disclaimer': tax['disclaimer'],
         'period_from': period_from,
         'period_to': period_to,
     })
@@ -4072,7 +4308,11 @@ async def api_settings_tax_update(request: web.Request):
         return _json_response({'detail': 'Invalid JSON'}, status=400)
 
     settings = await user_settings_for(user_id)
-    tax_cfg = settings.setdefault('tax_config', _copy.deepcopy(DEFAULT_SETTINGS['tax_config']))
+    try:
+        rules_year = int(body.get('year', CURRENT_TAX_RULES_YEAR))
+        _tax_rules_for_year(rules_year)
+    except (TypeError, ValueError) as exc:
+        return _json_response({'detail': str(exc)}, status=400)
 
     def finite_number(value, field):
         import math
@@ -4084,21 +4324,32 @@ async def api_settings_tax_update(request: web.Request):
             return None, _json_response({'detail': f'{field} must be finite'}, status=400)
         return number, None
 
+    changes = {}
     if 'group' in body:
         group = str(body['group']).strip().lower()
-        if group not in ('fop1', 'fop2', 'fop3', 'none'):
+        if group not in _TAX_GROUPS:
             return _json_response(
                 {'detail': 'group must be one of: fop1, fop2, fop3, none'}, status=400)
-        tax_cfg['group'] = group
+        changes['group'] = group
+
+    if 'scheme' in body:
+        scheme = str(body['scheme']).strip().lower()
+        if scheme not in _TAX_SCHEMES:
+            return _json_response(
+                {'detail': 'scheme must be one of: 5_percent, 3_percent_vat'}, status=400)
+        changes['scheme'] = scheme
 
     if 'single_tax_rate' in body:
         rate, err = finite_number(body['single_tax_rate'], 'single_tax_rate')
         if err is not None:
             return err
-        if rate < 0.01 or rate > 0.25:
+        if rate not in (0.03, 0.05):
             return _json_response(
-                {'detail': 'single_tax_rate must be between 0.01 (1%) and 0.25 (25%)'}, status=400)
-        tax_cfg['single_tax_rate'] = rate
+                {'detail': 'single_tax_rate must be 0.05 or 0.03'}, status=400)
+        rate_scheme = '3_percent_vat' if rate == 0.03 else '5_percent'
+        if 'scheme' in changes and changes['scheme'] != rate_scheme:
+            return _json_response({'detail': 'scheme conflicts with single_tax_rate'}, status=400)
+        changes['scheme'] = rate_scheme
 
     if 'fop1_fixed' in body:
         v, err = finite_number(body['fop1_fixed'], 'fop1_fixed')
@@ -4106,7 +4357,7 @@ async def api_settings_tax_update(request: web.Request):
             return err
         if v < 0 or v > 10000:
             return _json_response({'detail': 'fop1_fixed must be between 0 and 10000'}, status=400)
-        tax_cfg['fop1_fixed'] = v
+        changes['fop1_fixed'] = v
 
     if 'fop2_fixed' in body:
         v, err = finite_number(body['fop2_fixed'], 'fop2_fixed')
@@ -4114,7 +4365,7 @@ async def api_settings_tax_update(request: web.Request):
             return err
         if v < 0 or v > 20000:
             return _json_response({'detail': 'fop2_fixed must be between 0 and 20000'}, status=400)
-        tax_cfg['fop2_fixed'] = v
+        changes['fop2_fixed'] = v
 
     if 'esv_fixed' in body:
         esv, err = finite_number(body['esv_fixed'], 'esv_fixed')
@@ -4123,10 +4374,11 @@ async def api_settings_tax_update(request: web.Request):
         if esv < 0 or esv > 50000:
             return _json_response(
                 {'detail': 'esv_fixed must be between 0 and 50000 UAH'}, status=400)
-        tax_cfg['esv_fixed'] = esv
+        changes['esv_fixed'] = esv
 
+    profile = update_tax_profile(settings, rules_year, changes)
     await save_user_settings(user_id, settings)
-    return _json_response(tax_cfg)
+    return _json_response(profile)
 
 
 async def api_admin_broadcast(request: web.Request):
