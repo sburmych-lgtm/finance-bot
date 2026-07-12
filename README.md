@@ -16,11 +16,15 @@ Telegram-бот і Mini App для персонального та ФОП-обл
 | Змінна | Сервіс | Призначення |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | worker | Токен від BotFather. Обов’язковий. |
+| `TELEGRAM_BOT_HANDLE` | worker | Публічний username бота з `@`; `BOT_HANDLE` підтримується як legacy fallback. |
 | `ADMIN_IDS` | worker | Telegram ID адмінів через кому. |
 | `DATA_DIR` | worker | Каталог постійного сховища; на Railway — mount Volume. |
 | `DB_FILE` | worker | Необов’язковий override шляху SQLite. |
 | `SETTINGS_FILE` | worker | Необов’язковий override шляху settings JSON. |
 | `API_BASE_URL` | Mini App | HTTPS URL worker-сервісу без кінцевого `/`. |
+| `MINIAPP_PUBLIC_URL` | обидва | Публічний origin Mini App; автоматично входить до CORS allowlist. |
+| `CORS_ALLOWED_ORIGINS` | worker | Необов’язкові додаткові browser origins через кому. |
+| `ENABLE_SCHEDULED_JOBS` | worker | `true` для основного worker; `false` для redirect/static процесу, щоб не дублювати scheduled jobs. |
 | `BUILD_ID` | Mini App | Необов’язковий cache-busting ID. |
 | `PORT` | обидва | Локальний override; Railway встановлює автоматично. |
 | `BACKUP_S3_BUCKET` | worker | Вмикає off-site backup до S3-compatible bucket. |
@@ -69,3 +73,9 @@ CI виконує ці перевірки на push у `main` і для pull req
 Токени ротуються через BotFather і оновлюються лише в Railway Variables та локальному `.env`, ніколи в коді.
 
 Backup створюється SQLite Backup API, проходить `PRAGMA integrity_check` і SHA-256 verification. При налаштованому S3-compatible storage об’єкт після upload завантажується назад і повторно перевіряється.
+
+## Семантика облікового звіту
+
+Розділ «Облік» є спрощеним звітом руху коштів, а не повним бухгалтерським обліком. Готівка відображається через рахунок 301, картка та переказ — через 311; `other` і некласифіковані операції позначаються явно. Проводки та податкові рішення слід перевіряти з бухгалтером.
+
+Списки API завжди обмежені: до 5000 операцій і до 500 записів часу за один запит. Якщо NBU тимчасово недоступний, сервіс використовує останній повний перевірений snapshot; без нього валютні записи повертають контрольовану тимчасову помилку замість умовного курсу.
