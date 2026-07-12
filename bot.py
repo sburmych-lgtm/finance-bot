@@ -281,6 +281,35 @@ class Database:
             )
         ''')
 
+        # Broadcast audit trail: one row per broadcast batch, plus one receipt
+        # row per recipient with the Telegram message_id (proof of delivery).
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS broadcasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                sent INTEGER DEFAULT 0,
+                failed INTEGER DEFAULT 0,
+                skipped INTEGER DEFAULT 0,
+                total INTEGER DEFAULT 0,
+                created_at DATETIME NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS broadcast_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                broadcast_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                status TEXT NOT NULL,          -- sent | failed | skipped
+                message_id INTEGER,            -- Telegram message_id when sent
+                reason TEXT,                   -- failure reason when failed
+                created_at DATETIME NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_receipts_broadcast
+            ON broadcast_receipts(broadcast_id)
+        ''')
+
         self.conn.commit()
 
         # ── One-time migrations ────────────────────────────────────────
@@ -418,6 +447,66 @@ class Database:
                 "FROM users ORDER BY first_seen"
             )
             return [dict(r) for r in cursor.fetchall()]
+
+    # ---- broadcast audit ----
+    async def create_broadcast(self, text, created_at):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "INSERT INTO broadcasts (text, created_at) VALUES (?, ?)",
+                (text, created_at),
+            )
+            self.conn.commit()
+            return cursor.lastrowid
+
+    async def save_broadcast_receipts(self, broadcast_id, receipts, created_at,
+                                      sent, failed, skipped, total):
+        """receipts: list of (user_id, status, message_id, reason)."""
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.executemany(
+                "INSERT INTO broadcast_receipts "
+                "(broadcast_id, user_id, status, message_id, reason, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(broadcast_id, str(u), s, m, r, created_at) for (u, s, m, r) in receipts],
+            )
+            cursor.execute(
+                "UPDATE broadcasts SET sent=?, failed=?, skipped=?, total=? WHERE id=?",
+                (sent, failed, skipped, total, broadcast_id),
+            )
+            self.conn.commit()
+
+    async def list_broadcasts(self, limit=20):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT id, text, sent, failed, skipped, total, created_at "
+                "FROM broadcasts ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            )
+            rows = [dict(r) for r in cursor.fetchall()]
+            for row in rows:
+                row['text_preview'] = (row.pop('text', '') or '')[:80]
+            return rows
+
+    async def get_broadcast_receipts(self, broadcast_id):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT id, text, sent, failed, skipped, total, created_at "
+                "FROM broadcasts WHERE id=?",
+                (int(broadcast_id),),
+            )
+            b = cursor.fetchone()
+            if not b:
+                return None
+            cursor.execute(
+                "SELECT user_id, status, message_id, reason, created_at "
+                "FROM broadcast_receipts WHERE broadcast_id=? ORDER BY id",
+                (int(broadcast_id),),
+            )
+            receipts = [dict(r) for r in cursor.fetchall()]
+            return {'broadcast': dict(b), 'receipts': receipts}
 
     async def get_subscription(self, user_id):
         async with db_lock:
@@ -4063,7 +4152,11 @@ async def api_admin_broadcast(request: web.Request):
     if not token:
         return _json_response({'detail': 'bot token unavailable'}, status=500)
 
+    now_str = datetime.now(KYIV_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    broadcast_id = await db.create_broadcast(text, now_str)
+
     sent_ids, failed_ids, skipped_ids = [], [], []
+    receipts = []  # (user_id, status, message_id, reason)
     url = f'https://api.telegram.org/bot{token}/sendMessage'
     async with aiohttp.ClientSession() as session:
         for uid in user_ids:
@@ -4071,29 +4164,65 @@ async def api_admin_broadcast(request: web.Request):
             # correspond to a real Telegram chat.
             if str(uid).startswith('999000'):
                 skipped_ids.append(str(uid))
+                receipts.append((uid, 'skipped', None, 'synthetic test id'))
                 continue
             try:
                 async with session.post(url, json={'chat_id': int(uid), 'text': text}) as resp:
-                    if resp.status == 200:
+                    payload = {}
+                    try:
+                        payload = await resp.json()
+                    except Exception:
+                        pass
+                    if resp.status == 200 and payload.get('ok'):
+                        mid = (payload.get('result') or {}).get('message_id')
                         sent_ids.append(str(uid))
+                        receipts.append((uid, 'sent', mid, None))
                     else:
-                        detail = ''
-                        try:
-                            detail = (await resp.json()).get('description', '')
-                        except Exception:
-                            pass
-                        failed_ids.append({'id': str(uid), 'reason': detail or f'HTTP {resp.status}'})
+                        reason = payload.get('description', '') or f'HTTP {resp.status}'
+                        failed_ids.append({'id': str(uid), 'reason': reason})
+                        receipts.append((uid, 'failed', None, reason))
             except Exception as e:
                 failed_ids.append({'id': str(uid), 'reason': str(e)})
+                receipts.append((uid, 'failed', None, str(e)))
                 logger.warning(f'admin broadcast to {uid} failed: {e}')
             await asyncio.sleep(0.05)  # stay well under Telegram rate limits
 
-    logger.info(f"API admin broadcast: sent={len(sent_ids)} failed={len(failed_ids)} skipped={len(skipped_ids)}")
+    await db.save_broadcast_receipts(
+        broadcast_id, receipts, now_str,
+        sent=len(sent_ids), failed=len(failed_ids),
+        skipped=len(skipped_ids), total=len(user_ids),
+    )
+
+    logger.info(f"API admin broadcast #{broadcast_id}: sent={len(sent_ids)} "
+                f"failed={len(failed_ids)} skipped={len(skipped_ids)}")
     return _json_response({
+        'broadcast_id': broadcast_id,
         'sent': len(sent_ids), 'failed': len(failed_ids), 'skipped': len(skipped_ids),
         'total_users': len(user_ids),
         'sent_ids': sent_ids, 'failed_ids': failed_ids, 'skipped_ids': skipped_ids,
     })
+
+
+async def api_admin_broadcasts_list(request: web.Request):
+    """GET /api/admin/broadcasts — history of all broadcasts (admin only)."""
+    if not is_admin(request['user_id']):
+        return _json_response({'detail': 'admin only'}, status=403)
+    rows = await db.list_broadcasts(limit=50)
+    return _json_response({'broadcasts': rows})
+
+
+async def api_admin_broadcast_detail(request: web.Request):
+    """GET /api/admin/broadcasts/{id} — per-recipient receipts with message_id."""
+    if not is_admin(request['user_id']):
+        return _json_response({'detail': 'admin only'}, status=403)
+    try:
+        bid = int(request.match_info['id'])
+    except (KeyError, ValueError):
+        return _json_response({'detail': 'invalid id'}, status=400)
+    data = await db.get_broadcast_receipts(bid)
+    if not data:
+        return _json_response({'detail': 'broadcast not found'}, status=404)
+    return _json_response(data)
 
 
 async def api_admin_users(request: web.Request):
@@ -4161,6 +4290,8 @@ def build_api_app() -> web.Application:
     app.router.add_route('DELETE', '/api/settings', api_settings_reset)
     # admin
     app.router.add_route('POST', '/api/admin/broadcast', api_admin_broadcast)
+    app.router.add_route('GET', '/api/admin/broadcasts', api_admin_broadcasts_list)
+    app.router.add_route('GET', '/api/admin/broadcasts/{id}', api_admin_broadcast_detail)
     app.router.add_route('GET', '/api/admin/users', api_admin_users)
 
     # Catch-all OPTIONS for CORS preflight on any path
