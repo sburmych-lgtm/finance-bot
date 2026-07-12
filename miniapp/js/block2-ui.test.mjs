@@ -101,3 +101,15 @@ test('budget editor creates expense limits only', () => {
   assert.match(source, /type:\s*'expense'/);
   assert.doesNotMatch(source, /id="budgetType"/);
 });
+
+test('employee report renders undefined ROI without numeric formatting', () => {
+  const source = fs.readFileSync(new URL('./screens/reports.js', import.meta.url), 'utf8');
+  assert.match(source, /e\.roi == null\s*\? 'ROI —'/);
+  assert.doesNotMatch(source, /e\.roi\.toFixed/);
+});
+
+test('accounting report exposes source labels and its simplified-model disclaimer', () => {
+  const source = fs.readFileSync(new URL('./screens/reports.js', import.meta.url), 'utf8');
+  assert.match(source, /e\.source_label \|\| 'Не класифіковано'/);
+  assert.match(source, /d\.disclaimer \|\| ''/);
+});

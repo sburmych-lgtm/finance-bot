@@ -249,10 +249,13 @@ def test_employee_accounting_and_time_reports_are_complete_and_tenant_isolated(
     assert accounting["total_income"] == 500.0
     assert accounting["total_expense"] == 200.0
     assert accounting["closing_balance"] == 400.0
+    assert accounting["model"] == "simplified_cash_movement"
+    assert accounting["disclaimer"]
     assert [(entry["debit"], entry["credit"], entry["amount"]) for entry in accounting["entries"]] == [
-        ("301", "701", 500.0),
-        ("901", "301", 200.0),
+        ("—", "701", 500.0),
+        ("901", "—", 200.0),
     ]
+    assert all(entry["source_class"] == "unclassified" for entry in accounting["entries"])
     assert time_report["total_minutes"] == 120
     assert time_report["by_category"][0]["name"] == "Робота"
     assert time_report["by_category"][0]["percentage"] == 100.0

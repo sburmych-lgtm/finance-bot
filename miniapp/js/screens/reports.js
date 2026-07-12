@@ -288,14 +288,16 @@ async function renderEmployees(container) {
       <div class="row-list">
         ${data.map((e) => {
           const profitColor = e.profit > 0 ? 'income' : (e.profit < 0 ? 'expense' : '');
-          const roiSign = e.roi >= 0 ? '+' : '';
+          const roiLabel = e.roi == null
+            ? 'ROI —'
+            : `ROI ${e.roi >= 0 ? '+' : ''}${Number(e.roi).toFixed(1)}%`;
           return `
             <div class="panel" style="padding: var(--sp-4); margin-bottom: var(--sp-2);">
               <div class="row" style="border: 0; background: transparent; padding: 0;">
                 <div class="avatar">${esc((e.name?.[0] || '?').toUpperCase())}</div>
                 <div>
                   <div class="row-title">${esc(e.name)}</div>
-                  <div class="row-meta">ROI ${roiSign}${e.roi.toFixed(1)}%</div>
+                  <div class="row-meta">${roiLabel}</div>
                 </div>
                 <div class="amount ${profitColor}">${esc(fmtMoney(e.profit, 'UAH'))}</div>
               </div>
@@ -397,14 +399,15 @@ async function renderAccounting(container) {
       <div class="row-list">
         ${d.entries.map((e) => `
           <div class="row">
-            <div class="avatar">${esc(e.debit.split(' ')[1] || '?')}</div>
+            <div class="avatar">${esc(e.debit || '?')}</div>
             <div>
               <div class="row-title">${esc(e.label)}</div>
-              <div class="row-meta">${esc(e.debit)} → ${esc(e.credit)}</div>
+              <div class="row-meta">Дт ${esc(e.debit)} → Кт ${esc(e.credit)} · ${esc(e.source_label || 'Не класифіковано')}</div>
             </div>
             <div class="amount">${esc(fmtMoney(e.amount, 'UAH'))}</div>
           </div>`).join('')}
       </div>
+      <p class="row-meta" style="margin: var(--sp-3) var(--sp-2) 0; line-height:1.5;">${esc(d.disclaimer || '')}</p>
 
       <div class="section-head"><div class="section-title">Результат</div></div>
       <div class="panel" style="padding: var(--sp-4);">

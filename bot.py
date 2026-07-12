@@ -9,7 +9,7 @@ import secrets
 import weakref
 from functools import wraps
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote
+from urllib.parse import parse_qsl, unquote, urlsplit
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -93,6 +93,26 @@ def sanitize_sentry_event(event, hint):
         if str(key).lower() in {'request_body', 'body', 'payload', 'init_data'}:
             extra.pop(key, None)
     sanitized['extra'] = extra
+    breadcrumbs = dict(sanitized.get('breadcrumbs') or {})
+    values = []
+    for raw_crumb in breadcrumbs.get('values') or []:
+        crumb = dict(raw_crumb or {})
+        data = dict(crumb.get('data') or {})
+        for key in tuple(data):
+            if str(key).lower() in {
+                'authorization', 'cookie', 'set-cookie',
+                'x-telegram-init-data', 'request_body', 'body', 'payload',
+                'init_data',
+            }:
+                data.pop(key, None)
+        crumb['data'] = data
+        values.append(crumb)
+    breadcrumbs['values'] = values
+    sanitized['breadcrumbs'] = breadcrumbs
+    logentry = dict(sanitized.get('logentry') or {})
+    logentry.pop('formatted', None)
+    logentry.pop('params', None)
+    sanitized['logentry'] = logentry
     return sanitized
 
 
@@ -196,6 +216,16 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.environ.get('DB_FILE', os.path.join(DATA_DIR, 'finance.db'))
 SETTINGS_FILE = os.environ.get('SETTINGS_FILE', os.path.join(DATA_DIR, 'settings.json'))
 ADMIN_IDS = {x.strip() for x in os.environ.get('ADMIN_IDS', '').split(',') if x.strip()}
+
+
+def _bot_handle():
+    raw = (
+        os.getenv('TELEGRAM_BOT_HANDLE')
+        or os.getenv('BOT_HANDLE')
+        or '@ruby_finance_bot'
+    ).strip()
+    handle = raw if raw.startswith('@') else f'@{raw}'
+    return handle if re.fullmatch(r'@[A-Za-z0-9_]{5,32}', handle) else '@ruby_finance_bot'
 
 
 def _positive_env_int(name, default):
@@ -331,10 +361,14 @@ async def has_access(user_id) -> bool:
 
 # Exchange rate cache
 exchange_rates_cache = {
-    'USD': 41.5,
-    'EUR': 45.2,
+    'USD': None,
+    'EUR': None,
     'last_update': None
 }
+
+
+class ExchangeRateUnavailableError(RuntimeError):
+    """Raised when no verified NBU rate or last-good value is available."""
 
 backup_status = {
     'last_success': None,
@@ -1671,7 +1705,8 @@ class Database:
             self.conn.commit()
 
     async def save_category_rename(
-        self, user_id, category_type, old_name, new_name, settings
+        self, user_id, category_type, old_name, new_name, settings,
+        *, removed_subcategories=(),
     ):
         """Atomically relabel every registered dependency and settings."""
         owner = str(user_id)
@@ -1685,6 +1720,16 @@ class Database:
                         statement, (new_name, owner, category_type, old_name)
                     )
                     changed[dependency] = cursor.rowcount
+                removed = tuple(dict.fromkeys(removed_subcategories))
+                if removed:
+                    placeholders = ','.join('?' for _ in removed)
+                    cursor.execute(f'''
+                        UPDATE recurring_operations
+                        SET active = 0, updated_at = CURRENT_TIMESTAMP
+                        WHERE user_id = ? AND type = ? AND category = ?
+                          AND subcategory IN ({placeholders}) AND active = 1
+                    ''', (owner, category_type, new_name, *removed))
+                    changed['recurring_subcategories_paused'] = cursor.rowcount
                 cursor.execute('''
                     INSERT INTO user_settings
                         (user_id, settings_json, updated_at)
@@ -1695,6 +1740,36 @@ class Database:
                 ''', (owner, json.dumps(settings, ensure_ascii=False)))
                 self.conn.commit()
                 return changed
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    async def save_subcategory_delete(
+        self, user_id, category_type, category, subcategory, settings
+    ):
+        """Atomically persist settings and pause templates using the removed subcategory."""
+        owner = str(user_id)
+        async with db_lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                cursor.execute('''
+                    UPDATE recurring_operations
+                    SET active = 0, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ? AND type = ? AND category = ?
+                      AND subcategory = ? AND active = 1
+                ''', (owner, category_type, category, subcategory))
+                paused = cursor.rowcount
+                cursor.execute('''
+                    INSERT INTO user_settings
+                        (user_id, settings_json, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        settings_json = excluded.settings_json,
+                        updated_at = CURRENT_TIMESTAMP
+                ''', (owner, json.dumps(settings, ensure_ascii=False)))
+                self.conn.commit()
+                return {'recurring_subcategories_paused': paused}
             except Exception:
                 self.conn.rollback()
                 raise
@@ -2135,6 +2210,7 @@ async def save_user_settings(user_id, settings):
 
 
 _user_settings_locks = _LoopLocalLockMap()
+_account_request_locks = _LoopLocalLockMap()
 
 
 def serialized_user_settings_write(handler):
@@ -2226,7 +2302,7 @@ async def reset_user_configuration(user_id):
 
 # ========== EXCHANGE RATES ==========
 async def update_exchange_rates():
-    """Update exchange rates from NBU API"""
+    """Atomically replace the cache only with a complete verified NBU snapshot."""
     global exchange_rates_cache
 
     try:
@@ -2234,33 +2310,49 @@ async def update_exchange_rates():
             url = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?json"
 
             async with session.get(url, timeout=5) as response:
-                if response.status == 200:
-                    data = await response.json()
-
-                    for item in data:
-                        if item['cc'] == 'USD':
-                            exchange_rates_cache['USD'] = float(item['rate'])
-                        elif item['cc'] == 'EUR':
-                            exchange_rates_cache['EUR'] = float(item['rate'])
-
-                    exchange_rates_cache['last_update'] = datetime.now(KYIV_TZ)
-                    logger.info(f"Exchange rates updated: USD={exchange_rates_cache['USD']}, EUR={exchange_rates_cache['EUR']}")
-    except Exception as e:
-        logger.error(f"Error updating exchange rates: {e}")
+                if response.status != 200:
+                    raise ExchangeRateUnavailableError('NBU returned non-success status')
+                data = await response.json()
+        candidates = {}
+        for item in data if isinstance(data, list) else ():
+            currency = item.get('cc') if isinstance(item, dict) else None
+            if currency not in {'USD', 'EUR'}:
+                continue
+            value = float(item.get('rate'))
+            if not math.isfinite(value) or value <= 0:
+                raise ExchangeRateUnavailableError('NBU returned an invalid rate')
+            candidates[currency] = value
+        if set(candidates) != {'USD', 'EUR'}:
+            raise ExchangeRateUnavailableError('NBU response is incomplete')
+        exchange_rates_cache = {
+            'USD': candidates['USD'],
+            'EUR': candidates['EUR'],
+            'last_update': datetime.now(KYIV_TZ),
+        }
+        logger.info('Exchange rates updated from NBU')
+        return True
+    except Exception as exc:
+        logger.warning('Exchange rate refresh failed: %s', type(exc).__name__)
+        return False
 
 
 async def get_exchange_rate(currency):
-    """Get exchange rate for currency"""
+    """Return a verified current or stale last-good rate."""
     global exchange_rates_cache
 
     if currency == 'UAH':
         return 1.0
 
     last_update = exchange_rates_cache.get('last_update')
-    if not last_update or (datetime.now(KYIV_TZ) - last_update).seconds > 1800:
+    if not last_update or (datetime.now(KYIV_TZ) - last_update).total_seconds() > 1800:
         await update_exchange_rates()
 
-    return exchange_rates_cache.get(currency, 1.0)
+    rate = exchange_rates_cache.get(currency)
+    if not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0:
+        raise ExchangeRateUnavailableError(
+            f'No verified exchange rate is available for {currency}'
+        )
+    return float(rate)
 
 
 def convert_to_uah(amount, currency, rate):
@@ -2758,7 +2850,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
     await db.upsert_user(update.effective_user)
     await update.message.reply_text(
-        "👋 Привіт! Я бот для обліку фінансів та часу @Olesia_money_bot\n\n"
+        f"👋 Привіт! Я бот для обліку фінансів та часу {_bot_handle()}\n\n"
         "📝 Ви можете:\n"
         "• Використовувати кнопки меню внизу\n"
         "• Писати текстом: `100 кава`, `зарплата 30000`\n"
@@ -2777,7 +2869,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show info"""
     await update.message.reply_text(
-        "ℹ️ **Фінансовий бот + Трекінг часу @Olesia_money_bot**\n\n"
+        f"ℹ️ **Фінансовий бот + Трекінг часу {_bot_handle()}**\n\n"
         "💰 **ФІНАНСИ:**\n"
         "📱 Швидкий ввід текстом: `100 кава`, `зарплата 30000`\n"
         "💱 Валюти: `+50 USD`, `100 EUR`\n"
@@ -3143,7 +3235,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(data_parts) < 2 or data_parts[1] != 'confirm':
             await query.edit_message_text('❌ Невірне підтвердження.')
             return
-        await db.delete_user_account(user_id)
+        async with _account_request_locks[user_id]:
+            await db.delete_user_account(user_id)
         await query.edit_message_text(
             '✅ Ваш обліковий запис і всі пов’язані фінансові дані видалено.'
         )
@@ -3562,7 +3655,14 @@ async def save_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         await query.answer("❌ Невірна сума!", show_alert=True)
         return
 
-    rate = await get_exchange_rate(currency)
+    try:
+        rate = await get_exchange_rate(currency)
+    except ExchangeRateUnavailableError:
+        await query.answer(
+            "⚠️ Курс валют тимчасово недоступний. Спробуйте пізніше.",
+            show_alert=True,
+        )
+        return
     amount_uah = round(convert_to_uah(amount, currency, rate), 2)
     if not math.isfinite(amount_uah) or amount_uah < 0.01:
         await query.answer("❌ Сума надто мала або некоректна!", show_alert=True)
@@ -3863,7 +3963,13 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
     transaction = parse_transaction(text, user_categories)
 
     if transaction:
-        rate = await get_exchange_rate(transaction['currency'])
+        try:
+            rate = await get_exchange_rate(transaction['currency'])
+        except ExchangeRateUnavailableError:
+            await update.message.reply_text(
+                "⚠️ Курс валют тимчасово недоступний. Спробуйте пізніше."
+            )
+            return
         amount_uah = convert_to_uah(transaction['amount'], transaction['currency'], rate)
 
         await db.add_transaction(
@@ -4333,17 +4439,23 @@ async def show_accounting_report(update: Update, context: ContextTypes.DEFAULT_T
     opening_balance = prev_income - prev_expense
     closing_balance = opening_balance + profit
 
-    text = f"📚 **БУХГАЛТЕРСЬКИЙ ЗВІТ**\n{MONTH_NAMES[current_date.month]} {current_date.year}\n\n"
+    entries = _simplified_accounting_entries(transactions)
+    text = f"📚 **СПРОЩЕНИЙ ОБЛІК РУХУ КОШТІВ**\n{MONTH_NAMES[current_date.month]} {current_date.year}\n\n"
     text += f"━━━ БАЛАНС ━━━\n"
     text += f"Каса: {closing_balance:.2f} грн\n"
     text += f"Капітал: {opening_balance:.2f} грн\n"
     text += f"Прибуток: {profit:.2f} грн\n\n"
     text += f"━━━ ПРОВОДКИ ━━━\n"
-    text += f"Дт 301 - Кт 701: {total_income:.2f} грн\n"
-    text += f"Дт 901 - Кт 301: {total_expense:.2f} грн\n\n"
+    for entry in entries:
+        text += (
+            f"Дт {entry['debit']} - Кт {entry['credit']}: "
+            f"{entry['amount']:.2f} грн · {entry['source_label']}\n"
+        )
+    text += "\n"
     text += f"━━━ РЕЗУЛЬТАТ ━━━\n"
     result_status = "прибуток ✅" if profit > 0 else "збиток ❌"
-    text += f"{abs(profit):.2f} грн ({result_status})"
+    text += f"{abs(profit):.2f} грн ({result_status})\n\n"
+    text += f"ℹ️ {ACCOUNTING_DISCLAIMER}"
 
     await query.edit_message_text(text, parse_mode='Markdown')
 
@@ -4380,7 +4492,7 @@ async def show_ai_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         salary = expense_by_cat.get(f'ЗП {emp}', 0)
 
         if income > 0 or salary > 0:
-            roi = ((income - salary) / salary * 100) if salary > 0 else 0
+            roi = ((income - salary) / salary * 100) if salary > 0 else None
             employees_roi.append({'name': emp, 'income': income, 'salary': salary, 'profit': income - salary, 'roi': roi})
 
     report = f"""🤖 АНАЛІЗ ФІНАНСІВ ДЛЯ AI
@@ -4409,11 +4521,14 @@ async def show_ai_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if employees_roi:
         report += "\n━━━ ROI ПРАЦІВНИКІВ ━━━\n"
         for emp_data in employees_roi:
+            roi_label = (
+                '—' if emp_data['roi'] is None else f"{emp_data['roi']:.1f}%"
+            )
             report += f"""{emp_data['name']}:
   Дохід: {emp_data['income']:.2f} UAH
   ЗП: {emp_data['salary']:.2f} UAH
   Прибуток: {emp_data['profit']:.2f} UAH
-  ROI: {emp_data['roi']:.1f}%
+  ROI: {roi_label}
 
 """
 
@@ -4482,8 +4597,7 @@ async def admin_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_cleanup_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove test users (those who have NO transactions AND NO time tracks AND
-    aren't in ADMIN_IDS). Returns the list of deleted user_ids."""
+    """Remove only synthetic ``999000*`` QA accounts and all dependencies."""
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Команда доступна лише адміністратору.")
         return
@@ -4495,39 +4609,27 @@ async def admin_cleanup_users(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
     async with db_lock:
-        cursor = db.conn.cursor()
-        # Find users with zero activity who aren't admins
-        admin_clause = ''
-        params: list = []
-        if ADMIN_IDS:
-            placeholders = ','.join('?' for _ in ADMIN_IDS)
-            admin_clause = f' AND user_id NOT IN ({placeholders})'
-            params = list(ADMIN_IDS)
-        cursor.execute(
-            f'''
-            SELECT user_id, first_name, username FROM users u
-            WHERE NOT EXISTS (SELECT 1 FROM transactions t WHERE t.user_id = u.user_id)
-              AND NOT EXISTS (SELECT 1 FROM time_tracks tt WHERE tt.user_id = u.user_id)
-              {admin_clause}
-            ''',
-            params,
+        candidates = db.conn.execute('''
+            SELECT user_id, first_name, username
+            FROM users
+            WHERE user_id LIKE '999000%'
+            ORDER BY user_id
+        ''').fetchall()
+    candidates = [row for row in candidates if str(row['user_id']) not in ADMIN_IDS]
+    if not candidates:
+        await update.message.reply_text(
+            "✨ Нічого видаляти — синтетичних QA-акаунтів немає."
         )
-        candidates = cursor.fetchall()
-        if not candidates:
-            await update.message.reply_text("✨ Нічого видаляти — всі юзери або з активністю, або адміни.")
-            return
-        removed = []
-        for row in candidates:
-            uid = row['user_id']
-            cursor.execute("DELETE FROM users WHERE user_id = ?", (uid,))
-            cursor.execute("DELETE FROM user_settings WHERE user_id = ?", (uid,))
-            cursor.execute("DELETE FROM subscriptions WHERE user_id = ?", (uid,))
-            removed.append((uid, row['first_name'] or '?', row['username']))
-        db.conn.commit()
+        return
+    removed = []
+    for row in candidates:
+        uid = str(row['user_id'])
+        await db.delete_user_account(uid)
+        removed.append((uid, row['first_name'] or '?', row['username']))
     await db.log_admin_action(
         admin_id,
         'cleanup_users',
-        target='inactive_users',
+        target='synthetic_users',
         status='ok',
         metadata={
             'removed_count': len(removed),
@@ -4842,12 +4944,33 @@ async def json_errors_middleware(request: web.Request, handler):
 # Origins that legitimately host our Mini App.
 # Telegram WebView (iOS/Android native) does not send Origin (or sends 'null'),
 # so we let those through too — the initData HMAC remains the real auth gate.
-_CORS_ALLOW = {
-    'https://web.telegram.org',
-    'https://web.telegram.com',
-    'https://t.me',
-    'https://finance-bot-production-5de8.up.railway.app',
-}
+def _origin(value):
+    try:
+        parsed = urlsplit(str(value or '').strip())
+    except ValueError:
+        return None
+    if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
+        return None
+    return f'{parsed.scheme}://{parsed.netloc}'
+
+
+def _cors_allowed_origins():
+    origins = {
+        'https://web.telegram.org',
+        'https://web.telegram.com',
+        'https://t.me',
+    }
+    public_origin = _origin(os.getenv(
+        'MINIAPP_PUBLIC_URL',
+        'https://finance-bot-production-5de8.up.railway.app',
+    ))
+    if public_origin:
+        origins.add(public_origin)
+    for raw in os.getenv('CORS_ALLOWED_ORIGINS', '').split(','):
+        allowed = _origin(raw)
+        if allowed:
+            origins.add(allowed)
+    return origins
 
 
 @web.middleware
@@ -4866,11 +4989,12 @@ async def cors_middleware(request: web.Request, handler):
     if not origin or origin == 'null':
         # Native Telegram WebView — no browser CORS context, safe to allow.
         allow = '*'
-    elif origin in _CORS_ALLOW:
+    elif origin in _cors_allowed_origins():
         allow = origin
     else:
-        allow = 'null'  # blocks the browser from reading the body
-    resp.headers['Access-Control-Allow-Origin'] = allow
+        allow = None
+    if allow is not None:
+        resp.headers['Access-Control-Allow-Origin'] = allow
     resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Telegram-Init-Data'
     resp.headers['Access-Control-Allow-Methods'] = (
         'GET, POST, PUT, PATCH, DELETE, OPTIONS'
@@ -4966,26 +5090,29 @@ async def user_context_middleware(request: web.Request, handler):
     """Register/auth-context only after the request passes its user quota."""
     if request.method == 'OPTIONS' or request.path in _SKIP_AUTH_PATHS:
         return await handler(request)
-    tg_user = request.get('tg_user') or {}
-    try:
-        await db.upsert_user(_UserObj(tg_user))
-    except Exception as e:
-        logger.warning(f'upsert_user via middleware failed: {e}')
-    settings_write = (
-        request.method in {'POST', 'PATCH', 'DELETE'}
-        and request.path.startswith(('/api/categories', '/api/employees',
-                                     '/api/time-categories', '/api/settings'))
-    )
-    if settings_write:
-        owner = str(request['user_id'])
-        async with _user_settings_locks[owner]:
-            async with _recurring_user_locks[owner]:
-                request['_settings_lock_held'] = True
-                try:
-                    return await handler(request)
-                finally:
-                    request.pop('_settings_lock_held', None)
-    return await handler(request)
+    owner = str(request['user_id'])
+    async with _account_request_locks[owner]:
+        tg_user = request.get('tg_user') or {}
+        try:
+            await db.upsert_user(_UserObj(tg_user))
+        except Exception as exc:
+            logger.warning(
+                'upsert_user via middleware failed: %s', type(exc).__name__
+            )
+        settings_write = (
+            request.method in {'POST', 'PATCH', 'DELETE'}
+            and request.path.startswith(('/api/categories', '/api/employees',
+                                         '/api/time-categories', '/api/settings'))
+        )
+        if settings_write:
+            async with _user_settings_locks[owner]:
+                async with _recurring_user_locks[owner]:
+                    request['_settings_lock_held'] = True
+                    try:
+                        return await handler(request)
+                    finally:
+                        request.pop('_settings_lock_held', None)
+        return await handler(request)
 
 
 # ---- helpers ----
@@ -5011,6 +5138,19 @@ async def _ensure_fresh_rates():
     last = exchange_rates_cache.get('last_update')
     if last is None or (datetime.now(KYIV_TZ) - last).total_seconds() > 1800:
         await update_exchange_rates()
+    return all(
+        isinstance(exchange_rates_cache.get(currency), (int, float))
+        and math.isfinite(exchange_rates_cache[currency])
+        and exchange_rates_cache[currency] > 0
+        for currency in ('USD', 'EUR')
+    )
+
+
+def _exchange_rate_unavailable_response():
+    return _json_response({
+        'detail': 'Exchange rates are temporarily unavailable. Please retry later.',
+        'code': 'EXCHANGE_RATE_UNAVAILABLE',
+    }, status=503)
 
 
 # ---- route handlers ----
@@ -5067,7 +5207,8 @@ async def api_me(request: web.Request):
 
 
 async def api_exchange_rates(request: web.Request):
-    await _ensure_fresh_rates()
+    if not await _ensure_fresh_rates():
+        return _exchange_rate_unavailable_response()
     last = exchange_rates_cache.get('last_update')
     return _json_response({
         'USD': exchange_rates_cache.get('USD'),
@@ -5158,7 +5299,7 @@ async def api_get_transactions(request: web.Request):
     # Limit. 'all' raises the cap so history filters can return everything in range.
     limit_raw = q.get('limit')
     if limit_raw == 'all':
-        limit = None
+        limit = 5000
     else:
         limit, err = _parse_limit(request, default=15, hard_cap=5000)
         if err is not None:
@@ -5453,7 +5594,10 @@ async def api_post_transaction(request: web.Request):
             status=400,
         )
 
-    rate = await get_exchange_rate(currency)
+    try:
+        rate = await get_exchange_rate(currency)
+    except ExchangeRateUnavailableError:
+        return _exchange_rate_unavailable_response()
     amount_uah = round(convert_to_uah(amount, currency, rate), 2)
     # Reject sub-kopiyka amounts: storing amount=0.001 UAH and amount_uah=0.0
     # would silently delete the entry from reports (display says 0.001, math
@@ -5508,7 +5652,12 @@ async def api_post_transaction(request: web.Request):
 
     await db.upsert_user(_UserObj(tg_user))
 
-    logger.info(f"API POST /api/transactions user={user_id} id={row_id} {t_type} {amount} {currency}")
+    logger.info(
+        "API POST /api/transactions user=%s id=%s type=%s",
+        user_id,
+        row_id,
+        t_type,
+    )
     created = {
         'id': row_id,
         'amount': amount,
@@ -5607,6 +5756,54 @@ def _payment_source_summary(rows):
             key: _round_money(value) for key, value in expense.items()
         },
     }
+
+
+ACCOUNTING_MODEL = 'simplified_cash_movement'
+ACCOUNTING_DISCLAIMER = (
+    'Спрощена класифікація руху коштів, а не повний бухгалтерський облік. '
+    'Рахунки 301/311 показують джерело коштів; перевіряйте проводки з бухгалтером.'
+)
+_ACCOUNTING_SOURCE_META = {
+    'cash': ('301', 'cash', 'Готівка'),
+    'card': ('311', 'bank', 'Картка'),
+    'transfer': ('311', 'bank', 'Переказ'),
+    'other': ('—', 'other', 'Інше джерело'),
+    PAYMENT_SOURCE_UNCLASSIFIED: (
+        '—', 'unclassified', 'Не класифіковано'
+    ),
+}
+
+
+def _simplified_accounting_entries(rows):
+    totals = defaultdict(Decimal)
+    for row in rows:
+        source = row.get('payment_source')
+        if source not in PAYMENT_SOURCES:
+            source = PAYMENT_SOURCE_UNCLASSIFIED
+        totals[(row['type'], source)] += Decimal(str(row['amount_uah']))
+
+    entries = []
+    for kind in ('income', 'expense'):
+        for source in (*PAYMENT_SOURCES, PAYMENT_SOURCE_UNCLASSIFIED):
+            amount = totals[(kind, source)]
+            if amount == 0:
+                continue
+            account, source_class, source_label = _ACCOUNTING_SOURCE_META[source]
+            entries.append({
+                'type': kind,
+                'payment_source': source,
+                'source_class': source_class,
+                'source_label': source_label,
+                'debit': account if kind == 'income' else '901',
+                'credit': '701' if kind == 'income' else account,
+                'amount': _round_money(amount),
+                'label': (
+                    f'Надходження · {source_label}'
+                    if kind == 'income'
+                    else f'Видатки · {source_label}'
+                ),
+            })
+    return entries
 
 
 async def api_monthly_report(request: web.Request):
@@ -6079,7 +6276,10 @@ async def _validate_recurring_values(user_id, body, existing=None):
 
     amount_changed = existing is None or 'amount' in body or 'currency' in body
     if amount_changed:
-        rate = await get_exchange_rate(currency)
+        try:
+            rate = await get_exchange_rate(currency)
+        except ExchangeRateUnavailableError:
+            return None, _exchange_rate_unavailable_response()
         amount_uah = round(convert_to_uah(amount, currency, rate), 2)
         if amount_uah < 0.01:
             return None, _json_response(
@@ -6257,8 +6457,36 @@ async def process_due_recurring_operations(through_date=None):
 
 
 async def api_recurring_suggestions(request: web.Request):
-    rows = await db.get_transactions(request['user_id'])
-    return _json_response(list(detect_recurring_candidates(rows)))
+    user_id = request['user_id']
+    rows = [
+        row for row in await db.get_transactions(user_id)
+        if not str(row.get('client_request_id') or '').startswith('recurring:')
+    ]
+    existing = await db.list_recurring_operations(user_id)
+
+    def identity(row):
+        try:
+            amount = Decimal(str(row.get('amount'))).quantize(
+                Decimal('0.01'), rounding=ROUND_HALF_UP
+            )
+        except (InvalidOperation, TypeError, ValueError):
+            amount = None
+        return (
+            row.get('type'),
+            str(row.get('category') or ''),
+            str(row.get('subcategory') or ''),
+            amount,
+            str(row.get('currency') or 'UAH').upper(),
+            str(row.get('payment_source') or ''),
+            ' '.join(str(row.get('description') or '').split()).casefold(),
+        )
+
+    existing_identities = {identity(row) for row in existing}
+    suggestions = [
+        candidate for candidate in detect_recurring_candidates(rows)
+        if identity(candidate) not in existing_identities
+    ]
+    return _json_response(suggestions)
 
 
 def _query_date(request, field, default):
@@ -6303,12 +6531,13 @@ async def api_weekly_digest(request: web.Request):
     return _json_response(build_weekly_digest(rows, week_start=week_start))
 
 
-def _scheduled_occurrences_for_month(
+async def _scheduled_occurrences_for_month(
     recurring_rows, *, year, month, as_of
 ):
     _, month_end_text = _month_date_bounds(year, month)
     month_end = date.fromisoformat(month_end_text) - timedelta(days=1)
     result = []
+    rates = {'UAH': 1.0}
     for row in recurring_rows:
         if not bool(row['active']):
             continue
@@ -6323,10 +6552,15 @@ def _scheduled_occurrences_for_month(
         for due_date in due_dates:
             if due_date <= as_of or due_date.year != year or due_date.month != month:
                 continue
+            currency = row['currency']
+            if currency not in rates:
+                rates[currency] = await get_exchange_rate(currency)
             result.append({
                 'date': due_date.isoformat(),
                 'type': row['type'],
-                'amount_uah': row['amount_uah'],
+                'amount_uah': round(convert_to_uah(
+                    float(row['amount']), currency, rates[currency]
+                ), 2),
             })
     return result
 
@@ -6342,9 +6576,12 @@ async def api_forecast(request: web.Request):
         return err
     rows = await db.get_transactions(request['user_id'], year=year, month=month)
     recurring = await db.list_recurring_operations(request['user_id'])
-    scheduled = _scheduled_occurrences_for_month(
-        recurring, year=year, month=month, as_of=as_of
-    )
+    try:
+        scheduled = await _scheduled_occurrences_for_month(
+            recurring, year=year, month=month, as_of=as_of
+        )
+    except ExchangeRateUnavailableError:
+        return _exchange_rate_unavailable_response()
     projected_income = sum(
         Decimal(str(row['amount_uah']))
         for row in (*rows, *scheduled) if row['type'] == 'income'
@@ -6484,13 +6721,13 @@ async def api_report_employees(request: web.Request):
                      if t['type'] == 'expense' and t['category'] == salary_cat)
         if income > 0 or salary > 0:
             profit = income - salary
-            roi = ((income - salary) / salary * 100) if salary > 0 else 0
+            roi = ((income - salary) / salary * 100) if salary > 0 else None
             employees.append({
                 'name': emp,
                 'income': round(income, 2),
                 'salary': round(salary, 2),
                 'profit': round(profit, 2),
-                'roi': round(roi, 2),
+                'roi': round(roi, 2) if roi is not None else None,
             })
 
     return _json_response(employees)
@@ -6573,12 +6810,8 @@ async def api_report_accounting(request: web.Request):
     opening_balance = prev_income - prev_expense
     closing_balance = opening_balance + profit
 
-    entries = [
-        {'debit': '301', 'credit': '701', 'amount': round(total_income, 2),
-         'label': 'Надходження доходу'},
-        {'debit': '901', 'credit': '301', 'amount': round(total_expense, 2),
-         'label': 'Видатки'},
-    ]
+    source_summary = _payment_source_summary(transactions)
+    entries = _simplified_accounting_entries(transactions)
 
     return _json_response({
         'total_income': round(total_income, 2),
@@ -6586,8 +6819,11 @@ async def api_report_accounting(request: web.Request):
         'profit': round(profit, 2),
         'opening_balance': round(opening_balance, 2),
         'closing_balance': round(closing_balance, 2),
+        **source_summary,
         'entries': entries,
         'result': 'profit' if profit > 0 else 'loss',
+        'model': ACCOUNTING_MODEL,
+        'disclaimer': ACCOUNTING_DISCLAIMER,
     })
 
 
@@ -6619,7 +6855,7 @@ async def api_report_time(request: web.Request):
     productive_minutes = sum(time_by_cat.get(c, 0) for c in productive_cats)
     unproductive_minutes = sum(time_by_cat.get(c, 0) for c in unproductive_cats)
     rest_minutes = sum(time_by_cat.get(c, 0) for c in rest_cats)
-    untracked_minutes = days_in_month * 24 * 60 - total_minutes
+    untracked_minutes = max(0, days_in_month * 24 * 60 - total_minutes)
 
     user_settings = await user_settings_for(user_id)
     user_time_cats = user_settings.get('time_categories', {}) or {}
@@ -6773,6 +7009,11 @@ async def api_categories_update(request: web.Request):
         'keywords': new_keywords[:30],
         'subcategories': clean_subs,
     }
+    removed_subcategories = tuple(
+        subcategory
+        for subcategory in current.get('subcategories', [])
+        if subcategory not in clean_subs
+    )
     new_bucket = {}
     for k, v in list(bucket.items()):
         new_bucket[new_name if k == name else k] = new_entry if k == name else v
@@ -6783,7 +7024,12 @@ async def api_categories_update(request: web.Request):
     rebuild_user_categories(settings)
     try:
         await db.save_category_rename(
-            user_id, cat_type, name, new_name, settings
+            user_id,
+            cat_type,
+            name,
+            new_name,
+            settings,
+            removed_subcategories=removed_subcategories,
         )
     except sqlite3.IntegrityError:
         return _json_response(
@@ -6844,7 +7090,7 @@ async def api_subcategories_create(request: web.Request):
     if not sub_name:
         return _json_response({'detail': 'subcategory name required'}, status=400)
 
-    settings = await user_settings_for(user_id)
+    settings = _copy.deepcopy(await user_settings_for(user_id))
     bucket = settings.get('categories', {}).get(cat_type, {})
     if cat_name not in bucket:
         return _json_response({'detail': 'category not found'}, status=404)
@@ -6871,7 +7117,7 @@ async def api_subcategories_delete(request: web.Request):
     if cat_type not in ('income', 'expense'):
         return _json_response({'detail': 'type must be income or expense'}, status=400)
 
-    settings = await user_settings_for(user_id)
+    settings = _copy.deepcopy(await user_settings_for(user_id))
     bucket = settings.get('categories', {}).get(cat_type, {})
     if cat_name not in bucket:
         return _json_response({'detail': 'category not found'}, status=404)
@@ -6881,7 +7127,9 @@ async def api_subcategories_delete(request: web.Request):
         return _json_response({'detail': 'subcategory not found'}, status=404)
 
     subs.remove(sub_name)
-    await save_user_settings(user_id, settings)
+    await db.save_subcategory_delete(
+        user_id, cat_type, cat_name, sub_name, settings
+    )
     return web.Response(status=204)
 
 
@@ -7058,7 +7306,7 @@ async def api_time_tracks_list(request: web.Request):
         if err is not None:
             return err
         year_val, month_val = y, m
-    limit_val, err = _parse_limit(request, default=None, hard_cap=500)
+    limit_val, err = _parse_limit(request, default=500, hard_cap=500)
     if err is not None:
         return err
 
@@ -7104,12 +7352,9 @@ async def api_time_tracks_create(request: web.Request):
         return err
 
     raw_minutes = body.get('minutes')
-    if raw_minutes is None or isinstance(raw_minutes, bool):
+    if not isinstance(raw_minutes, int) or isinstance(raw_minutes, bool):
         return _json_response({'detail': 'minutes required and must be an integer'}, status=400)
-    try:
-        minutes = int(raw_minutes)
-    except (TypeError, ValueError):
-        return _json_response({'detail': 'minutes must be an integer'}, status=400)
+    minutes = raw_minutes
     if minutes <= 0:
         return _json_response({'detail': 'minutes must be positive'}, status=400)
     if minutes > 24 * 60:
@@ -7175,7 +7420,7 @@ async def api_time_tracks_create(request: web.Request):
         return _json_response(
             _time_track_write_response(existing, duplicate=True)
         )
-    logger.info(f"API POST /api/time-tracks user={user_id} id={row_id} {minutes}min {category}")
+    logger.info("API POST /api/time-tracks user=%s id=%s", user_id, row_id)
     created = {
         'id': row_id,
         'user_id': user_id,
@@ -7670,7 +7915,7 @@ def main():
     elif not ENABLE_SCHEDULED_JOBS:
         logger.info("Scheduled jobs disabled by ENABLE_SCHEDULED_JOBS")
 
-    logger.info("🤖 Бот @Olesia_money_bot запущено!")
+    logger.info("Bot %s started", _bot_handle())
     logger.info(f"📊 Database: {DB_FILE}")
     logger.info(f"⚙️ Settings: {SETTINGS_FILE}")
     logger.info(f"🔑 Admin IDs: {len(ADMIN_IDS)} configured")

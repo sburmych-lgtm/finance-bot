@@ -231,7 +231,7 @@ def test_cleanup_users_command_is_rate_limited(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "ADMIN_IDS", {"42"})
     monkeypatch.setattr(bot, "_admin_limiter", fixed_limiter())
     database.conn.execute(
-        "INSERT INTO users (user_id, first_name) VALUES ('candidate-1', 'First')"
+        "INSERT INTO users (user_id, first_name) VALUES ('9990001', 'First')"
     )
     database.conn.commit()
     first = command_update(42, "/cleanup_users")
@@ -240,7 +240,7 @@ def test_cleanup_users_command_is_rate_limited(monkeypatch, tmp_path):
     async def exercise():
         await bot.admin_cleanup_users(first, SimpleNamespace())
         database.conn.execute(
-            "INSERT INTO users (user_id, first_name) VALUES ('candidate-2', 'Second')"
+            "INSERT INTO users (user_id, first_name) VALUES ('9990002', 'Second')"
         )
         database.conn.commit()
         await bot.admin_cleanup_users(second, SimpleNamespace())
@@ -248,7 +248,7 @@ def test_cleanup_users_command_is_rate_limited(monkeypatch, tmp_path):
 
     run(exercise())
     candidate_2 = database.conn.execute(
-        "SELECT 1 FROM users WHERE user_id = 'candidate-2'"
+        "SELECT 1 FROM users WHERE user_id = '9990002'"
     ).fetchone()
 
     assert candidate_2 is not None
@@ -276,7 +276,7 @@ def test_cleanup_users_command_is_audited(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "ADMIN_IDS", {"42"})
     monkeypatch.setattr(bot, "_admin_limiter", fixed_limiter())
     database.conn.execute(
-        "INSERT INTO users (user_id, first_name) VALUES ('candidate-1', 'First')"
+        "INSERT INTO users (user_id, first_name) VALUES ('9990001', 'First')"
     )
     database.conn.commit()
 
