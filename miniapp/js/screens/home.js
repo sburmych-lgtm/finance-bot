@@ -6,6 +6,7 @@ import { Telegram } from '../telegram.js';
 import { fmtMoney, fmtAmount, fmtDate, esc, toast, setHTML } from '../ui.js';
 import { normalizeBudgetResponse, paymentSourceLabel, budgetTone } from '../block2-ui.js';
 import { insightPresentation, normalizeInsights } from '../automation-ui.js';
+import { findDirectSectionHead } from '../home-layout.js';
 
 const CATEGORY_LETTER = {
   'Продукти':'П','Кафе':'К','Транспорт':'Т','Розваги':'Р','Здоров\'я':'Z',
@@ -119,7 +120,8 @@ async function renderHomeInsights() {
 
 function injectBudgetOverview() {
   document.getElementById('home-budget-overview')?.remove();
-  const sectionHead = document.querySelector('#screen-home .section-head');
+  const screen = document.getElementById('screen-home');
+  const sectionHead = findDirectSectionHead(screen);
   if (!sectionHead) return;
   const budgets = normalizeBudgetResponse({ budgets: Store.budgets })
     .filter((budget) => budget.type === 'expense');
@@ -153,7 +155,7 @@ function injectBudgetOverview() {
       </button>
     `}
   `);
-  sectionHead.parentNode.insertBefore(wrapper, sectionHead);
+  screen.insertBefore(wrapper, sectionHead);
 }
 
 
@@ -165,7 +167,8 @@ function injectUndoCard(lastTx) {
   if (existing) existing.remove();
 
   if (!lastTx) return;
-  const sectionHead = document.querySelector('#screen-home .section-head');
+  const screen = document.getElementById('screen-home');
+  const sectionHead = findDirectSectionHead(screen);
   if (!sectionHead) return;
 
   const card = document.createElement('div');
@@ -185,7 +188,7 @@ function injectUndoCard(lastTx) {
       </div>
       <button class="undo-btn" id="undoBtn">Видалити</button>
     </div>`;
-  sectionHead.parentNode.insertBefore(card, sectionHead);
+  screen.insertBefore(card, sectionHead);
 
   document.getElementById('undoBtn').addEventListener('click', async () => {
     const ok = window.confirm(`Видалити операцію «${lastTx.category} · ${amountStr}»? Цю дію неможливо скасувати.`);
