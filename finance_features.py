@@ -130,7 +130,9 @@ def _recurring_group_key(row: Mapping[str, object]) -> tuple[object, ...]:
     return (
         str(row.get("type") or ""),
         str(row.get("category") or ""),
-        _money(row.get("amount_uah")),
+        str(row.get("subcategory") or ""),
+        _money(row.get("amount", row.get("amount_uah"))),
+        str(row.get("currency") or "UAH").upper(),
         str(row.get("payment_source") or ""),
         _normal_text(row.get("description")),
     )
@@ -180,7 +182,10 @@ def detect_recurring_candidates(
             {
                 "type": key[0],
                 "category": key[1],
-                "amount_uah": _money_text(key[2]),
+                "subcategory": key[2] or None,
+                "amount": _money_text(key[3]),
+                "currency": key[4],
+                "amount_uah": _money_text(_money(latest.get("amount_uah"))),
                 "payment_source": latest.get("payment_source"),
                 "description": str(latest.get("description") or ""),
                 "frequency": frequency,

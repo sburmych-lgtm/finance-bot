@@ -22,12 +22,18 @@ def tx(
     category="Оренда",
     description="",
     payment_source=None,
+    original_amount=None,
+    currency="UAH",
+    subcategory=None,
 ):
     return {
         "date": day.isoformat(),
         "type": tx_type,
+        "amount": original_amount if original_amount is not None else amount,
+        "currency": currency,
         "amount_uah": amount,
         "category": category,
+        "subcategory": subcategory,
         "description": description,
         "payment_source": payment_source,
     }
@@ -97,6 +103,52 @@ def test_recurring_detection_does_not_merge_sources_or_income_and_expense():
     ]
 
     assert detect_recurring_candidates(rows) == ()
+
+
+def test_recurring_detection_groups_original_currency_amount_and_subcategory():
+    usd_rows = [
+        tx(
+            date(2026, month, 10),
+            amount=uah,
+            original_amount="100",
+            currency="USD",
+            category="Підписки",
+            subcategory="Софт",
+            description="Service",
+        )
+        for month, uah in ((1, "4150"), (2, "4175"), (3, "4200"))
+    ]
+    noise = [
+        tx(
+            date(2026, month, 10),
+            amount="4200",
+            original_amount="100",
+            currency="EUR",
+            category="Підписки",
+            subcategory="Софт",
+            description="Service",
+        )
+        for month in (1, 2)
+    ] + [
+        tx(
+            date(2026, month, 10),
+            amount="4200",
+            original_amount="100",
+            currency="USD",
+            category="Підписки",
+            subcategory="Хостинг",
+            description="Service",
+        )
+        for month in (1, 2)
+    ]
+
+    candidates = detect_recurring_candidates([*usd_rows, *noise])
+
+    assert len(candidates) == 1
+    assert candidates[0]["amount"] == "100.00"
+    assert candidates[0]["currency"] == "USD"
+    assert candidates[0]["subcategory"] == "Софт"
+    assert candidates[0]["amount_uah"] == "4200.00"
 
 
 def test_weekly_digest_uses_uah_and_returns_top_expense_category():
