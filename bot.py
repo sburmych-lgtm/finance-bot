@@ -7867,7 +7867,7 @@ def main():
     application.add_handler(CommandHandler("settings", show_settings))
     application.add_handler(CommandHandler("privacy", privacy_command))
     application.add_handler(CommandHandler("terms", terms_command))
-    application.add_handler(CommandHandler(["clear", "очистити"], clear_account_command))
+    application.add_handler(CommandHandler("clear", clear_account_command))
     application.add_handler(CommandHandler("admin_stats", admin_stats))
     application.add_handler(CommandHandler("stats", admin_stats))  # short alias
     application.add_handler(CommandHandler("admin", admin_stats))  # shorter alias
