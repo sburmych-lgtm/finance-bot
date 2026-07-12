@@ -9,9 +9,10 @@ import {
   isAccountDeleteConfirmation,
 } from '../privacy.js';
 import { budgetTone, normalizeBudgetResponse } from '../block2-ui.js';
+import { renderDigestSettings, renderRecurringSettings } from './automation.js';
 
 const state = {
-  section: 'main',  // main | expense_cats | income_cats | time_cats | employees | tax | budgets | privacy
+  section: 'main',  // main | categories | employees | tax | budgets | recurring | digest | privacy
   loading: false,
 };
 
@@ -86,7 +87,19 @@ function renderMain(root) {
       <div class="section-head"><div class="section-title">Планування</div></div>
       <div class="row-list">
         <button type="button" class="row row-action" data-go="budgets"><span class="avatar">◎</span>
-          <span><span class="row-title">Бюджети категорій</span><span class="row-meta">Ліміти, прогрес і перевитрати</span></span>
+          <span><span class="row-title">Бюджети витрат</span><span class="row-meta">Ліміти, прогрес і перевитрати</span></span>
+          <span class="row-chevron">›</span></button>
+      </div>
+    </div>
+
+    <div class="setting-section">
+      <div class="section-head"><div class="section-title">Автоматизація</div></div>
+      <div class="row-list">
+        <button type="button" class="row row-action" data-go="recurring"><span class="avatar">↻</span>
+          <span><span class="row-title">Регулярні операції</span><span class="row-meta">Оренда, підписки, зарплати й надходження</span></span>
+          <span class="row-chevron">›</span></button>
+        <button type="button" class="row row-action" data-go="digest"><span class="avatar">☼</span>
+          <span><span class="row-title">Недільний дайджест</span><span class="row-meta">Opt-in підсумок тижня у Telegram</span></span>
           <span class="row-chevron">›</span></button>
       </div>
     </div>
@@ -564,11 +577,8 @@ async function renderBudgetsSettings(root) {
       Api.categoriesFull(),
       Api.budgets(now.getFullYear(), now.getMonth() + 1),
     ]);
-    const categoriesByType = {
-      expense: Object.keys(full?.expense || {}),
-      income: Object.keys(full?.income || {}),
-    };
-    const budgets = normalizeBudgetResponse(response);
+    const categories = Object.keys(full?.expense || {});
+    const budgets = normalizeBudgetResponse(response).filter((budget) => budget.type === 'expense');
     Store.budgets = Array.isArray(response?.budgets) ? response.budgets : [];
 
     const budgetCards = budgets.map((budget) => {
@@ -601,12 +611,6 @@ async function renderBudgetsSettings(root) {
         <h3>Контроль по категоріях</h3>
         <p>Задайте суму на місяць. Прогрес рахується з усіх операцій у гривневому еквіваленті.</p>
         <form id="budgetForm" class="budget-form">
-          <label class="field"><span>Тип</span>
-            <select class="input" id="budgetType">
-              <option value="expense">Витрати</option>
-              <option value="income">Доходи</option>
-            </select>
-          </label>
           <label class="field"><span>Категорія</span><select class="input" id="budgetCategory"></select></label>
           <label class="field budget-limit-field"><span>Ліміт на місяць, ₴</span>
             <input class="input" id="budgetLimit" type="number" inputmode="decimal" min="0.01" step="0.01" placeholder="наприклад, 5000" required>
@@ -619,23 +623,20 @@ async function renderBudgetsSettings(root) {
       ${budgetCards || `<div class="empty-state budget-settings-empty"><div class="icon">◎</div><h3>Лімітів ще немає</h3><p>Створіть перший бюджет вище — прогрес одразу з'явиться на Огляді та у Звітах.</p></div>`}
     `);
 
-    const typeSelect = body.querySelector('#budgetType');
     const categorySelect = body.querySelector('#budgetCategory');
     const limitInput = body.querySelector('#budgetLimit');
     const status = body.querySelector('#budgetFormStatus');
     const save = body.querySelector('#budgetSave');
     let busy = false;
 
-    const setCategoryOptions = (type, preferred = null) => {
-      const categories = categoriesByType[type] || [];
+    const setCategoryOptions = (preferred = null) => {
       setHTML(categorySelect, categories.map((category) =>
         `<option value="${esc(category)}" ${category === preferred ? 'selected' : ''}>${esc(category)}</option>`
       ).join(''));
       categorySelect.disabled = categories.length === 0;
       save.disabled = categories.length === 0;
     };
-    setCategoryOptions('expense');
-    typeSelect.addEventListener('change', () => setCategoryOptions(typeSelect.value));
+    setCategoryOptions();
 
     body.querySelectorAll('[data-budget-edit]').forEach((button) => {
       button.addEventListener('click', () => {
@@ -643,8 +644,7 @@ async function renderBudgetsSettings(root) {
           `${candidate.type}:${candidate.category}` === button.dataset.budgetEdit
         );
         if (!budget) return;
-        typeSelect.value = budget.type;
-        setCategoryOptions(budget.type, budget.category);
+        setCategoryOptions(budget.category);
         limitInput.value = String(budget.monthlyLimit);
         limitInput.focus();
         status.textContent = `Редагуємо «${budget.category}»`;
@@ -666,7 +666,7 @@ async function renderBudgetsSettings(root) {
       status.textContent = '';
       try {
         await Api.upsertBudget({
-          type: typeSelect.value,
+          type: 'expense',
           category: categorySelect.value,
           monthly_limit_uah: amount,
         });
@@ -900,9 +900,14 @@ function renderPrivacy(root) {
 
 // ── Main entry ─────────────────────────────────────────────────
 export function renderSettings(opts = {}) {
-  if (opts.section === 'budgets') state.section = 'budgets';
+  if (['budgets', 'recurring', 'digest'].includes(opts.section)) state.section = opts.section;
   const root = document.getElementById('screen-settings');
   if (!root) return;
+  delete root.dataset.automationView;
+  const automationBack = () => {
+    state.section = 'main';
+    renderSettings();
+  };
   switch (state.section) {
     case 'expense_cats': renderCategoriesEditor(root, 'expense', 'Категорії витрат'); break;
     case 'income_cats':  renderCategoriesEditor(root, 'income', 'Категорії доходів'); break;
@@ -910,6 +915,8 @@ export function renderSettings(opts = {}) {
     case 'employees':    renderEmployees(root); break;
     case 'tax':          renderTaxSettings(root); break;
     case 'budgets':      renderBudgetsSettings(root); break;
+    case 'recurring':    renderRecurringSettings(root, automationBack); break;
+    case 'digest':       renderDigestSettings(root, automationBack); break;
     case 'privacy':      renderPrivacy(root); break;
     default:             renderMain(root);
   }

@@ -205,12 +205,7 @@ function doRender() {
   root.querySelectorAll('[data-period]').forEach((b) => b.addEventListener('click', () => {
     state.period = b.dataset.period;
     Telegram.haptic('selection');
-    if (state.period !== 'month') {
-      fetchRows();
-    } else {
-      // just re-render the filter bar to expose month selector; fetch happens on change
-      doRender();
-    }
+    fetchRows();
   }));
   // Month + year selects
   root.querySelector('#hYearSel')?.addEventListener('change', (e) => {

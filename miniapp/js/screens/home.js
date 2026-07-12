@@ -5,6 +5,7 @@ import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
 import { fmtMoney, fmtAmount, fmtDate, esc, toast, setHTML } from '../ui.js';
 import { normalizeBudgetResponse, paymentSourceLabel, budgetTone } from '../block2-ui.js';
+import { insightPresentation, normalizeInsights } from '../automation-ui.js';
 
 const CATEGORY_LETTER = {
   'Продукти':'П','Кафе':'К','Транспорт':'Т','Розваги':'Р','Здоров\'я':'Z',
@@ -14,6 +15,7 @@ const CATEGORY_LETTER = {
 };
 
 function letter(cat) { return CATEGORY_LETTER[cat] || (cat?.[0] || '•').toUpperCase(); }
+let insightGeneration = 0;
 
 export function renderHome() {
   const card = document.querySelector('#screen-home .balance-card');
@@ -36,6 +38,7 @@ export function renderHome() {
   const txs = (Store.transactions || []).slice(0, 8);
   injectUndoCard(txs[0]);
   injectBudgetOverview();
+  renderHomeInsights();
 
   const list = document.getElementById('recent-list');
   if (!list) return;
@@ -64,11 +67,62 @@ export function renderHome() {
   `).join('');
 }
 
+async function renderHomeInsights() {
+  const generation = ++insightGeneration;
+  document.getElementById('home-insights')?.remove();
+  const anchor = document.querySelector('#screen-home .quick-actions');
+  if (!anchor) return;
+
+  const section = document.createElement('section');
+  section.id = 'home-insights';
+  section.className = 'home-insights';
+  setHTML(section, `
+    <div class="section-head"><div class="section-title">Розумні підказки</div></div>
+    <div class="panel insight-loading" aria-busy="true"><span class="sk"></span><span class="sk"></span></div>
+  `);
+  anchor.after(section);
+
+  try {
+    const insights = normalizeInsights(await Api.insights());
+    if (generation !== insightGeneration || Store.screen !== 'home' || !section.isConnected) return;
+    const cards = insights.slice(0, 4).map((insight) => insightPresentation(insight)).filter(Boolean);
+    setHTML(section, `
+      <div class="section-head"><div class="section-title">Розумні підказки</div><span class="section-link">без AI</span></div>
+      ${cards.length ? `
+        <div class="insight-strip" aria-label="Фінансові підказки">
+          ${cards.map((card) => `
+            <article class="panel insight-card ${esc(card.tone)}">
+              <div class="insight-icon" aria-hidden="true">${esc(card.icon)}</div>
+              <div><h3>${esc(card.title)}</h3><p>${esc(card.body)}</p></div>
+            </article>
+          `).join('')}
+        </div>
+      ` : `
+        <div class="panel insight-empty">
+          <span class="insight-icon" aria-hidden="true">◇</span>
+          <span><strong>Фінансовий ритм формується</strong><small>Підказки з’являться, коли буде достатньо операцій для чесного порівняння.</small></span>
+        </div>
+      `}
+    `);
+  } catch (error) {
+    if (generation !== insightGeneration || Store.screen !== 'home' || !section.isConnected) return;
+    setHTML(section, `
+      <div class="section-head"><div class="section-title">Розумні підказки</div></div>
+      <div class="panel insight-error" role="status">
+        <span>Не вдалося завантажити підказки.</span>
+        <button type="button" class="btn btn-secondary insight-retry">Повторити</button>
+      </div>
+    `);
+    section.querySelector('.insight-retry')?.addEventListener('click', renderHomeInsights);
+  }
+}
+
 function injectBudgetOverview() {
   document.getElementById('home-budget-overview')?.remove();
   const sectionHead = document.querySelector('#screen-home .section-head');
   if (!sectionHead) return;
-  const budgets = normalizeBudgetResponse({ budgets: Store.budgets });
+  const budgets = normalizeBudgetResponse({ budgets: Store.budgets })
+    .filter((budget) => budget.type === 'expense');
   const wrapper = document.createElement('section');
   wrapper.id = 'home-budget-overview';
   wrapper.className = 'home-budget-overview';

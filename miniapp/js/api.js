@@ -61,6 +61,18 @@ export const Api = {
   upsertBudget:    (payload)             => request('/api/budgets',                 { method: 'PUT', body: payload }),
   deleteBudget:    (type, category)      => request(`/api/budgets/${type}/${encodeURIComponent(category)}`, { method: 'DELETE' }),
 
+  // Automation, insights and opt-in digest
+  recurringOperations:()                => request('/api/recurring-operations'),
+  addRecurringOperation:(payload)        => request('/api/recurring-operations',       { method: 'POST', body: payload }),
+  patchRecurringOperation:(id, payload)  => request(`/api/recurring-operations/${id}`, { method: 'PATCH', body: payload }),
+  deleteRecurringOperation:(id)          => request(`/api/recurring-operations/${id}`, { method: 'DELETE' }),
+  recurringSuggestions:()                => request('/api/recurring-suggestions'),
+  insights:        (asOf)                => request(`/api/insights${asOf ? `?as_of=${encodeURIComponent(asOf)}` : ''}`),
+  weeklyDigest:    (weekStart)            => request(`/api/digest/weekly${weekStart ? `?week_start=${encodeURIComponent(weekStart)}` : ''}`),
+  forecast:        (year, month, asOf)   => request(`/api/forecast?year=${year}&month=${month}${asOf ? `&as_of=${encodeURIComponent(asOf)}` : ''}`),
+  notificationSettings:()               => request('/api/settings/notifications'),
+  patchNotificationSettings:(payload)   => request('/api/settings/notifications',     { method: 'PATCH', body: payload }),
+
   // Categories
   categories:      ()                    => request('/api/categories'),
   categoriesFull:  ()                    => request('/api/categories/full'),

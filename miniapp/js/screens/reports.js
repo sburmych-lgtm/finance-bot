@@ -9,6 +9,7 @@ import {
   normalizeBudgetResponse,
   normalizePaymentSourceBreakdown,
 } from '../block2-ui.js';
+import { normalizeForecast } from '../automation-ui.js';
 
 const SLICE_COLORS = ['#6E0F1F', '#D8B56D', '#9B1B30', '#6FB67E', '#D45A4F', '#7A6E66'];
 
@@ -144,7 +145,32 @@ function openAIModal(prompt) {
 }
 
 // ── Tab renderers ──────────────────────────────────────────────
-function overviewMarkup(report, sourceSummary = {}, budgets = []) {
+function forecastMarkup(state) {
+  if (state?.data) {
+    const forecast = state.data;
+    return `
+      <div class="section-head"><div class="section-title">Прогноз результату місяця</div><span class="section-link">записано + заплановано</span></div>
+      <div class="panel forecast-card">
+        <div class="forecast-kicker">Орієнтовний результат після податків</div>
+        <div class="forecast-value">${esc(fmtMoney(forecast.projectedAfterTax, 'UAH'))}</div>
+        <div class="forecast-grid">
+          <div><span>Записаний результат</span><strong>${esc(fmtMoney(forecast.currentNet, 'UAH'))}</strong></div>
+          <div><span>Заплановані доходи</span><strong>${esc(fmtAmount(forecast.scheduledIncome, 'UAH'))}</strong></div>
+          <div><span>Заплановані витрати</span><strong>${esc(fmtAmount(forecast.scheduledExpense, 'UAH'))}</strong></div>
+          <div><span>Орієнтовні податки</span><strong>${esc(fmtAmount(forecast.estimatedTax, 'UAH'))}</strong></div>
+        </div>
+        <p>Це прогноз результату за обраний місяць, а не баланс банківського рахунку.</p>
+      </div>`;
+  }
+  return `
+    <div class="section-head"><div class="section-title">Прогноз результату місяця</div></div>
+    <div class="panel forecast-error" role="status">
+      <span>Не вдалося завантажити прогноз.</span>
+      <button type="button" class="btn btn-secondary forecast-retry">Повторити</button>
+    </div>`;
+}
+
+function overviewMarkup(report, sourceSummary = {}, budgets = [], forecastState = null) {
   const { expenseSlices: slices, incomeSlices, totalExpense, totalIncome } = report;
   const paymentSources = normalizePaymentSourceBreakdown(sourceSummary, 'expense');
   const paymentSourceTotal = paymentSources.reduce((sum, source) => sum + source.value, 0);
@@ -196,6 +222,7 @@ function overviewMarkup(report, sourceSummary = {}, budgets = []) {
         <div class="metric"><span>Витрати</span><strong>${esc(fmtAmount(totalExpense, 'UAH'))}</strong></div>
       </div>
     </div>
+    ${forecastMarkup(forecastState)}
     <div class="section-head"><div class="section-title">Витрати по категоріях</div></div>
     ${slices.length ? '<p class="drill-hint">Оберіть категорію, щоб побачити підрозділи ›</p>' : ''}
     <div class="panel" style="padding: var(--sp-4);">
@@ -224,18 +251,23 @@ function overviewMarkup(report, sourceSummary = {}, budgets = []) {
 async function renderOverview(container, generation) {
   setHTML(container, loadingSkeleton());
   try {
-    const [rawReport, rawBudgets] = await Promise.all([
+    const [rawReport, rawBudgets, rawForecast] = await Promise.all([
       Api.monthlyReport(state.year, state.month),
       Api.budgets(state.year, state.month).catch(() => ({ budgets: [] })),
+      Api.forecast(state.year, state.month).catch((error) => ({ __error: error })),
     ]);
     const report = normalizeMonthlyReport(rawReport);
     const sourceSummary = rawReport;
-    const budgets = normalizeBudgetResponse(rawBudgets);
+    const budgets = normalizeBudgetResponse(rawBudgets)
+      .filter((budget) => budget.type === 'expense');
+    const forecast = rawForecast?.__error ? null : normalizeForecast(rawForecast);
+    const forecastState = forecast ? { data: forecast } : { error: true };
     if (generation !== renderGeneration) return;
     state.data.overview = report;
     state.data.budgets = budgets;
-    setHTML(container, overviewMarkup(report, sourceSummary, budgets));
+    setHTML(container, overviewMarkup(report, sourceSummary, budgets, forecastState));
     wireDrill(container);
+    container.querySelector('.forecast-retry')?.addEventListener('click', () => renderReports());
   } catch (e) {
     if (generation !== renderGeneration) return;
     setHTML(container, emptyState('Помилка: ' + (e.message || 'не вдалось завантажити')));

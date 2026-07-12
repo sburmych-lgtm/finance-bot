@@ -8,8 +8,14 @@ export const Telegram = {
     try {
       tg.ready();
       tg.expand();
-      // Try fullscreen (Bot API 8.0+); silently ignore on older clients.
-      if (typeof tg.requestFullscreen === 'function') {
+      // Telegram exposes some future methods on older SDK shells but logs an
+      // unsupported-method error when they are invoked. Check the negotiated
+      // WebApp version as well as method presence.
+      const supportsFullscreen = (
+        typeof tg.isVersionAtLeast === 'function'
+        && tg.isVersionAtLeast('8.0')
+      );
+      if (supportsFullscreen && typeof tg.requestFullscreen === 'function') {
         try { tg.requestFullscreen(); } catch (_) {}
       }
       // Disable vertical swipes so dragging inside numpad / scroll doesn't close the app.

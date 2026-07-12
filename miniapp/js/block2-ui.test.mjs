@@ -88,3 +88,16 @@ test('generic Add stays unclassified while Home cash entry is explicit', () => {
   assert.match(appSource, /opts\.paymentSource = goBtn\.dataset\.paymentSource/);
   assert.match(indexSource, /data-kind="expense" data-payment-source="cash"/);
 });
+
+test('History refetches when returning to a previously selected calendar month', () => {
+  const source = fs.readFileSync(new URL('./screens/history.js', import.meta.url), 'utf8');
+  assert.match(source, /state\.period = b\.dataset\.period;\s*Telegram\.haptic\('selection'\);\s*fetchRows\(\);/s);
+  assert.doesNotMatch(source, /state\.period !== 'month'/);
+});
+
+test('budget editor creates expense limits only', () => {
+  const source = fs.readFileSync(new URL('./screens/settings.js', import.meta.url), 'utf8');
+  assert.match(source, /const budgets = normalizeBudgetResponse\(response\)\.filter\(\(budget\) => budget\.type === 'expense'\)/);
+  assert.match(source, /type:\s*'expense'/);
+  assert.doesNotMatch(source, /id="budgetType"/);
+});
