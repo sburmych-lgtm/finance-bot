@@ -21,4 +21,3 @@ test('Home budget anchor ignores a nested stale insights header on rerender', ()
 
   assert.equal(findDirectSectionHead(screen), recentOperationsHeader);
 });
-

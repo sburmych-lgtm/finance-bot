@@ -2271,6 +2271,45 @@ def convert_to_uah(amount, currency, rate):
 
 
 # ========== UTILITY FUNCTIONS ==========
+MAX_TRANSACTION_AMOUNT = Decimal('1000000000')
+CALLBACK_REF_PREFIX = '~'
+
+
+def _callback_ref(value):
+    """Return a deterministic, Telegram-safe opaque reference for user text."""
+    digest = hashlib.blake2s(str(value).encode('utf-8'), digest_size=9).hexdigest()
+    return f'{CALLBACK_REF_PREFIX}{digest}'
+
+
+def _resolve_callback_ref(raw_value, candidates):
+    """Resolve current opaque callbacks while accepting legacy/raw callback text."""
+    raw = str(raw_value)
+    available = tuple(str(candidate) for candidate in candidates)
+    if raw.startswith(CALLBACK_REF_PREFIX):
+        matches = tuple(value for value in available if _callback_ref(value) == raw)
+        if len(matches) == 1:
+            return matches[0]
+        return raw if not matches and raw in available else None
+    if raw in available:
+        return raw
+    # Buttons created before this release replaced colons with this sentinel.
+    legacy = raw.replace('_COLON_', ':')
+    return legacy if legacy in available else None
+
+
+def _parse_positive_money(value):
+    """Parse the shared bot/API money domain without float overflow surprises."""
+    if isinstance(value, bool):
+        return None
+    try:
+        amount = Decimal(str(value).strip().replace(',', '.'))
+    except (InvalidOperation, ValueError):
+        return None
+    if not amount.is_finite() or not 0 < amount <= MAX_TRANSACTION_AMOUNT:
+        return None
+    return float(amount)
+
+
 def parse_transaction(text, categories_by_type=None):
     """Parse transaction from text"""
     text_lower = text.lower().strip()
@@ -2285,12 +2324,19 @@ def parse_transaction(text, categories_by_type=None):
 
     trans_type = 'income' if is_income else 'expense'
 
-    amount_match = re.search(r'(\d+(?:[.,]\d{1,2})?)', text)
+    amount_text = text.strip()
+    if amount_text.startswith(('+', '-')):
+        amount_text = amount_text[1:].lstrip()
+    amount_match = re.search(
+        r'(?<![\w.,])(\d+(?:[.,]\d{1,2})?)(?![\w.,])', amount_text
+    )
     if not amount_match:
         return None
 
     amount_str = amount_match.group(1).replace(',', '.')
-    amount = float(amount_str)
+    amount = _parse_positive_money(amount_str)
+    if amount is None:
+        return None
 
     currency = 'UAH'
     if any(word in text_lower for word in ['usd', 'долар', 'доллар', '$']):
@@ -2322,14 +2368,15 @@ def parse_time_input(text):
     text = text.lower().strip()
     
     # Pattern: "90" or "90хв"
-    match = re.match(r'^(\d+(?:\.\d+)?)\s*(?:хв|м|min|minute|minutes)?$', text)
+    match = re.match(r'^(\d+)\s*(?:хв|м|min|minute|minutes)?$', text)
     if match:
-        return int(float(match.group(1)))
+        return int(match.group(1))
     
     # Pattern: "1.5год" or "2h"
     match = re.match(r'^(\d+(?:\.\d+)?)\s*(?:год|h|hour|hours)$', text)
     if match:
-        return int(float(match.group(1)) * 60)
+        minutes = Decimal(match.group(1)) * 60
+        return int(minutes) if minutes == minutes.to_integral_value() else None
     
     # Pattern: "2год 30хв" or "2h 30m"
     match = re.match(r'^(\d+)\s*(?:год|h)\s+(\d+)\s*(?:хв|м|min)?$', text)
@@ -2341,7 +2388,7 @@ def parse_time_input(text):
     # Just a number
     try:
         return int(text)
-    except:
+    except (TypeError, ValueError):
         return None
 
 
@@ -2378,7 +2425,7 @@ def get_time_category_keyboard(time_categories=None):
         emoji = cat_data['emoji']
         button = InlineKeyboardButton(
             f"{emoji} {cat_name}",
-            callback_data=f"timecat:{cat_name}"
+            callback_data=f"timecat:{_callback_ref(cat_name)}"
         )
         row.append(button)
         
@@ -2396,10 +2443,11 @@ def get_time_category_keyboard(time_categories=None):
 
 def get_currency_keyboard(trans_type, category):
     """Create currency selection keyboard"""
+    category_ref = _callback_ref(category)
     keyboard = [
-        [InlineKeyboardButton("UAH ₴", callback_data=f"curr:{trans_type}:{category}:UAH")],
-        [InlineKeyboardButton("USD $", callback_data=f"curr:{trans_type}:{category}:USD")],
-        [InlineKeyboardButton("EUR €", callback_data=f"curr:{trans_type}:{category}:EUR")],
+        [InlineKeyboardButton("UAH ₴", callback_data=f"curr:{trans_type}:{category_ref}:UAH")],
+        [InlineKeyboardButton("USD $", callback_data=f"curr:{trans_type}:{category_ref}:USD")],
+        [InlineKeyboardButton("EUR €", callback_data=f"curr:{trans_type}:{category_ref}:EUR")],
         [InlineKeyboardButton("◀️ Назад", callback_data=f"type:{trans_type}")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -2422,7 +2470,7 @@ def get_category_keyboard(trans_type, categories_by_type=None):
             emoji = cat_data['emoji']
             button = InlineKeyboardButton(
                 f"{emoji} {cat_name}",
-                callback_data=f"cat:expense:{cat_name}"
+                callback_data=f"cat:expense:{_callback_ref(cat_name)}"
             )
             row.append(button)
 
@@ -2443,7 +2491,7 @@ def get_category_keyboard(trans_type, categories_by_type=None):
             emoji = cat_data['emoji']
             button = InlineKeyboardButton(
                 f"{emoji} {cat_name}",
-                callback_data=f"cat:income:{cat_name}"
+                callback_data=f"cat:income:{_callback_ref(cat_name)}"
             )
             row.append(button)
 
@@ -2467,7 +2515,7 @@ def get_salary_submenu_keyboard(employees=None):
     for emp in (employees if employees is not None else EMPLOYEES):
         keyboard.append([InlineKeyboardButton(
             f"💼 {emp}",
-            callback_data=f"cat:expense:ЗП {emp}"
+            callback_data=f"cat:expense:{_callback_ref(f'ЗП {emp}')}"
         )])
     keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="type:expense")])
     return InlineKeyboardMarkup(keyboard)
@@ -2479,7 +2527,7 @@ def get_employee_income_submenu_keyboard(employees=None):
     for emp in (employees if employees is not None else EMPLOYEES):
         keyboard.append([InlineKeyboardButton(
             f"👤 {emp}",
-            callback_data=f"cat:income:Від {emp}"
+            callback_data=f"cat:income:{_callback_ref(f'Від {emp}')}"
         )])
     keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="type:income")])
     return InlineKeyboardMarkup(keyboard)
@@ -2505,8 +2553,8 @@ def get_time_category_list_keyboard(time_categories=None):
     for cat_name, cat_data in (time_categories or TIME_CATEGORIES).items():
         emoji = cat_data['emoji']
         keyboard.append([
-            InlineKeyboardButton(f"{emoji} {cat_name}", callback_data=f"timecatview:{cat_name}"),
-            InlineKeyboardButton("❌", callback_data=f"timecatdel:{cat_name}")
+            InlineKeyboardButton(f"{emoji} {cat_name}", callback_data=f"timecatview:{_callback_ref(cat_name)}"),
+            InlineKeyboardButton("❌", callback_data=f"timecatdel:{_callback_ref(cat_name)}")
         ])
     
     keyboard.append([InlineKeyboardButton("➕ Додати категорію", callback_data="timecatadd")])
@@ -2519,8 +2567,8 @@ def get_employee_list_keyboard(employees=None):
     keyboard = []
     for emp in (employees if employees is not None else EMPLOYEES):
         keyboard.append([
-            InlineKeyboardButton(f"👤 {emp}", callback_data=f"emp_view:{emp}"),
-            InlineKeyboardButton("❌", callback_data=f"emp_del:{emp}")
+            InlineKeyboardButton(f"👤 {emp}", callback_data=f"emp_view:{_callback_ref(emp)}"),
+            InlineKeyboardButton("❌", callback_data=f"emp_del:{_callback_ref(emp)}")
         ])
     keyboard.append([InlineKeyboardButton("➕ Додати працівника", callback_data="emp_add")])
     keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="settings:main")])
@@ -2542,8 +2590,8 @@ def get_category_list_keyboard(cat_type, categories_by_type=None):
         cat_data = categories[cat_name]
         emoji = cat_data['emoji']
         keyboard.append([
-            InlineKeyboardButton(f"{emoji} {cat_name}", callback_data=f"catview:{cat_type}:{cat_name}"),
-            InlineKeyboardButton("❌", callback_data=f"catdel:{cat_type}:{cat_name}")
+            InlineKeyboardButton(f"{emoji} {cat_name}", callback_data=f"catview:{cat_type}:{_callback_ref(cat_name)}"),
+            InlineKeyboardButton("❌", callback_data=f"catdel:{cat_type}:{_callback_ref(cat_name)}")
         ])
 
     keyboard.append([InlineKeyboardButton("➕ Додати категорію", callback_data=f"catadd:{cat_type}")])
@@ -2641,34 +2689,34 @@ async def get_time_month_selection_keyboard(user_id):
 
 def get_numpad_keyboard(current_amount, trans_type, category, currency):
     """Create numpad keyboard"""
-    cat_encoded = category.replace(':', '_COLON_')
+    category_ref = _callback_ref(category)
 
     keyboard = [
         [
-            InlineKeyboardButton("1", callback_data=f"num:{trans_type}:{cat_encoded}:{currency}:1"),
-            InlineKeyboardButton("2", callback_data=f"num:{trans_type}:{cat_encoded}:{currency}:2"),
-            InlineKeyboardButton("3", callback_data=f"num:{trans_type}:{cat_encoded}:{currency}:3")
+            InlineKeyboardButton("1", callback_data=f"num:{trans_type}:{category_ref}:{currency}:1"),
+            InlineKeyboardButton("2", callback_data=f"num:{trans_type}:{category_ref}:{currency}:2"),
+            InlineKeyboardButton("3", callback_data=f"num:{trans_type}:{category_ref}:{currency}:3")
         ],
         [
-            InlineKeyboardButton("4", callback_data=f"num:{trans_type}:{cat_encoded}:{currency}:4"),
-            InlineKeyboardButton("5", callback_data=f"num:{trans_type}:{cat_encoded}:{currency}:5"),
-            InlineKeyboardButton("6", callback_data=f"num:{trans_type}:{cat_encoded}:{currency}:6")
+            InlineKeyboardButton("4", callback_data=f"num:{trans_type}:{category_ref}:{currency}:4"),
+            InlineKeyboardButton("5", callback_data=f"num:{trans_type}:{category_ref}:{currency}:5"),
+            InlineKeyboardButton("6", callback_data=f"num:{trans_type}:{category_ref}:{currency}:6")
         ],
         [
-            InlineKeyboardButton("7", callback_data=f"num:{trans_type}:{cat_encoded}:{currency}:7"),
-            InlineKeyboardButton("8", callback_data=f"num:{trans_type}:{cat_encoded}:{currency}:8"),
-            InlineKeyboardButton("9", callback_data=f"num:{trans_type}:{cat_encoded}:{currency}:9")
+            InlineKeyboardButton("7", callback_data=f"num:{trans_type}:{category_ref}:{currency}:7"),
+            InlineKeyboardButton("8", callback_data=f"num:{trans_type}:{category_ref}:{currency}:8"),
+            InlineKeyboardButton("9", callback_data=f"num:{trans_type}:{category_ref}:{currency}:9")
         ],
         [
-            InlineKeyboardButton("⌫", callback_data=f"num:{trans_type}:{cat_encoded}:{currency}:back"),
-            InlineKeyboardButton("0", callback_data=f"num:{trans_type}:{cat_encoded}:{currency}:0"),
-            InlineKeyboardButton(".", callback_data=f"num:{trans_type}:{cat_encoded}:{currency}:dot")
+            InlineKeyboardButton("⌫", callback_data=f"num:{trans_type}:{category_ref}:{currency}:back"),
+            InlineKeyboardButton("0", callback_data=f"num:{trans_type}:{category_ref}:{currency}:0"),
+            InlineKeyboardButton(".", callback_data=f"num:{trans_type}:{category_ref}:{currency}:dot")
         ],
         [
-            InlineKeyboardButton("✅ Підтвердити", callback_data=f"num:{trans_type}:{cat_encoded}:{currency}:confirm"),
+            InlineKeyboardButton("✅ Підтвердити", callback_data=f"num:{trans_type}:{category_ref}:{currency}:confirm"),
         ],
         [
-            InlineKeyboardButton("◀️ Назад", callback_data=f"cat:{trans_type}:{cat_encoded}")
+            InlineKeyboardButton("◀️ Назад", callback_data=f"cat:{trans_type}:{category_ref}")
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -3023,7 +3071,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "timecat":
         # Time category selected
-        category = ':'.join(data_parts[1:])
+        category = _resolve_callback_ref(
+            ':'.join(data_parts[1:]), user_time_categories
+        )
+        if category is None:
+            await query.edit_message_text(
+                "⚠️ Ця кнопка застаріла. Відкрийте меню додавання ще раз."
+            )
+            return
         context.user_data['waiting_for'] = f'time_minutes:{category}'
         
         cat_emoji = user_time_categories.get(category, {}).get('emoji', '⏱️')
@@ -3107,10 +3162,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    elif action == "timecatview":
+        cat_name = _resolve_callback_ref(
+            ':'.join(data_parts[1:]), user_time_categories
+        )
+        if cat_name is None:
+            await query.edit_message_text("⚠️ Категорію часу не знайдено.")
+            return
+        emoji = user_time_categories[cat_name].get('emoji', '⏱️')
+        await query.edit_message_text(
+            f"{emoji} Категорія часу\n\nНазва: {cat_name}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "◀️ Назад", callback_data="settings:time_cats"
+                )
+            ]]),
+        )
+        return
+
     elif action == "timecatdel":
-        cat_name = ':'.join(data_parts[1:])
+        cat_name = _resolve_callback_ref(
+            ':'.join(data_parts[1:]), user_time_categories
+        )
         
-        if cat_name in user_time_categories and cat_name != 'Інше':
+        if cat_name is not None and cat_name != 'Інше':
             await update_user_settings(
                 user_id, lambda s: s['time_categories'].pop(cat_name, None))
             
@@ -3130,9 +3205,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    elif action == "emp_view":
+        emp_name = _resolve_callback_ref(
+            ':'.join(data_parts[1:]), user_employees
+        )
+        if emp_name is None:
+            await query.edit_message_text("⚠️ Працівника не знайдено.")
+            return
+        await query.edit_message_text(
+            f"👤 Працівник\n\nІм'я: {emp_name}\n"
+            f"Дохідна категорія: Від {emp_name}\n"
+            f"Витратна категорія: ЗП {emp_name}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "◀️ Назад", callback_data="settings:employees"
+                )
+            ]]),
+        )
+        return
+
     elif action == "emp_del":
-        emp_name = ':'.join(data_parts[1:])
-        if emp_name in user_employees:
+        emp_name = _resolve_callback_ref(
+            ':'.join(data_parts[1:]), user_employees
+        )
+        if emp_name is not None:
             await delete_employee_for_user(user_id, emp_name)
 
             await query.edit_message_text(
@@ -3153,12 +3249,46 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    elif action == "catview":
+        cat_type = data_parts[1] if len(data_parts) > 1 else ''
+        categories = user_categories.get(cat_type, {})
+        cat_name = _resolve_callback_ref(
+            ':'.join(data_parts[2:]), categories
+        )
+        if cat_name is None:
+            await query.edit_message_text("⚠️ Категорію не знайдено.")
+            return
+        cat_data = categories[cat_name]
+        cat_type_name = "витрат" if cat_type == "expense" else "доходів"
+        keywords = ', '.join(cat_data.get('keywords') or []) or 'немає'
+        subcategories = ', '.join(cat_data.get('subcategories') or []) or 'немає'
+        await query.edit_message_text(
+            f"{cat_data.get('emoji', '📦')} Категорія {cat_type_name}\n\n"
+            f"Назва: {cat_name}\n"
+            f"Ключові слова: {keywords}\n"
+            f"Підрозділи: {subcategories}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "◀️ Назад",
+                    callback_data=(
+                        "settings:expense_cats"
+                        if cat_type == "expense"
+                        else "settings:income_cats"
+                    ),
+                )
+            ]]),
+        )
+        return
+
     elif action == "catdel":
-        cat_type = data_parts[1]
-        cat_name = ':'.join(data_parts[2:])
+        cat_type = data_parts[1] if len(data_parts) > 1 else ''
+        categories = user_categories.get(cat_type, {})
+        cat_name = _resolve_callback_ref(
+            ':'.join(data_parts[2:]), categories
+        )
 
         if (
-            cat_name in user_categories[cat_type]
+            cat_name is not None
             and cat_name != 'Інше'
             and not _is_employee_category_namespace(cat_type, cat_name)
         ):
@@ -3216,9 +3346,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     elif action == "cat":
-        trans_type = data_parts[1]
-        category = ':'.join(data_parts[2:])
-        category = category.replace('_COLON_', ':')
+        trans_type = data_parts[1] if len(data_parts) > 1 else ''
+        categories = user_categories.get(trans_type, {})
+        category = _resolve_callback_ref(
+            ':'.join(data_parts[2:]), categories
+        )
+        if category is None:
+            await query.edit_message_text(
+                "⚠️ Ця категорія більше недоступна. Оберіть її знову."
+            )
+            return
 
         context.user_data['trans_type'] = trans_type
         context.user_data['category'] = category
@@ -3232,9 +3369,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif action == "curr":
-        trans_type = data_parts[1]
-        category = data_parts[2].replace('_COLON_', ':')
-        currency = data_parts[3]
+        trans_type = data_parts[1] if len(data_parts) > 1 else ''
+        currency = data_parts[-1] if len(data_parts) > 2 else ''
+        categories = user_categories.get(trans_type, {})
+        category = _resolve_callback_ref(
+            ':'.join(data_parts[2:-1]), categories
+        )
+        if category is None or currency not in ('UAH', 'USD', 'EUR'):
+            await query.edit_message_text(
+                "⚠️ Ця кнопка застаріла. Оберіть категорію та валюту знову."
+            )
+            return
 
         context.user_data['trans_type'] = trans_type
         context.user_data['category'] = category
@@ -3353,10 +3498,22 @@ async def handle_numpad(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = await user_settings_for(query.from_user.id)
 
     parts = query.data.split(':')
-    trans_type = parts[1]
-    category = parts[2].replace('_COLON_', ':')
-    currency = parts[3]
-    action = parts[4]
+    trans_type = parts[1] if len(parts) > 1 else ''
+    currency = parts[-2] if len(parts) > 3 else ''
+    action = parts[-1] if len(parts) > 2 else ''
+    categories = settings['categories'].get(trans_type, {})
+    category = _resolve_callback_ref(':'.join(parts[2:-2]), categories)
+    if (
+        category is None
+        or currency not in ('UAH', 'USD', 'EUR')
+        or action not in {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+                          'back', 'dot', 'confirm'}
+    ):
+        await query.answer(
+            "⚠️ Ця кнопка застаріла. Почніть введення суми знову.",
+            show_alert=True,
+        )
+        return
 
     current_amount = context.user_data.get('amount', '')
 
@@ -3395,14 +3552,21 @@ async def save_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     user_id = str(update.effective_user.id)
     settings = await user_settings_for(user_id)
 
-    try:
-        amount = float(amount_str)
-    except ValueError:
+    amount = _parse_positive_money(amount_str)
+    category_entry = settings.get('categories', {}).get(trans_type, {}).get(category)
+    if (
+        amount is None
+        or currency not in ('UAH', 'USD', 'EUR')
+        or not isinstance(category_entry, dict)
+    ):
         await query.answer("❌ Невірна сума!", show_alert=True)
         return
 
     rate = await get_exchange_rate(currency)
-    amount_uah = convert_to_uah(amount, currency, rate)
+    amount_uah = round(convert_to_uah(amount, currency, rate), 2)
+    if not math.isfinite(amount_uah) or amount_uah < 0.01:
+        await query.answer("❌ Сума надто мала або некоректна!", show_alert=True)
+        return
 
     now = datetime.now(KYIV_TZ)
 
@@ -3420,8 +3584,7 @@ async def save_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
     emoji = "💸" if trans_type == "expense" else "💰"
     type_name = "Витрата" if trans_type == "expense" else "Дохід"
-    cat_data = settings['categories'][trans_type].get(category, {'emoji': '📦'})
-    cat_emoji = cat_data['emoji']
+    cat_emoji = category_entry.get('emoji', '📦')
 
     currency_symbol = {'UAH': '₴', 'USD': '$', 'EUR': '€'}.get(currency, '')
 
@@ -3460,12 +3623,13 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
         
         minutes = parse_time_input(text)
         
-        if minutes is None or minutes <= 0:
+        if minutes is None or not 1 <= minutes <= 24 * 60:
             await update.message.reply_text(
                 "❌ Не зрозумів. Спробуйте:\n"
                 "• `90` — 90 хвилин\n"
                 "• `1.5год` — 1.5 години\n"
-                "• `2h 30m` — 2 год 30 хв",
+                "• `2h 30m` — 2 год 30 хв\n"
+                "Максимум за один запис — 1440 хвилин.",
                 parse_mode='Markdown'
             )
             return
@@ -3509,8 +3673,10 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
     if waiting_for == 'time_category_name':
         cat_name = update.message.text.strip()
         
-        if len(cat_name) < 2:
-            await update.message.reply_text("❌ Назва занадто коротка. Спробуйте ще раз.")
+        if not cat_name or len(cat_name) > 60:
+            await update.message.reply_text(
+                "❌ Назва має містити від 1 до 60 символів. Спробуйте ще раз."
+            )
             return
 
         if cat_name in user_time_categories:
@@ -3553,8 +3719,10 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
     if waiting_for == 'employee_name':
         emp_name = update.message.text.strip()
 
-        if len(emp_name) < 2:
-            await update.message.reply_text("❌ Ім'я занадто коротке. Спробуйте ще раз.")
+        if not emp_name or len(emp_name) > 60:
+            await update.message.reply_text(
+                "❌ Ім'я має містити від 1 до 60 символів. Спробуйте ще раз."
+            )
             return
 
         if emp_name in user_employees:
@@ -3575,8 +3743,10 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
         cat_type = waiting_for.split(':')[1]
         cat_name = update.message.text.strip()
 
-        if len(cat_name) < 2:
-            await update.message.reply_text("❌ Назва занадто коротка. Спробуйте ще раз.")
+        if not cat_name or len(cat_name) > 80:
+            await update.message.reply_text(
+                "❌ Назва має містити від 1 до 80 символів. Спробуйте ще раз."
+            )
             return
 
         if _is_employee_category_namespace(cat_type, cat_name):
@@ -7414,6 +7584,29 @@ def build_api_app() -> web.Application:
     return app
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log Telegram failures and give users a stable, non-sensitive response."""
+    error = getattr(context, 'error', None)
+    logger.exception(
+        "Unhandled Telegram update error (%s)",
+        type(error).__name__ if error is not None else 'unknown',
+        exc_info=(type(error), error, error.__traceback__) if error is not None else None,
+    )
+    message = (
+        getattr(update, 'effective_message', None)
+        or getattr(update, 'message', None)
+        or getattr(getattr(update, 'callback_query', None), 'message', None)
+    )
+    if message is None or not hasattr(message, 'reply_text'):
+        return
+    try:
+        await message.reply_text(
+            "⚠️ Сталася тимчасова помилка. Спробуйте ще раз трохи пізніше."
+        )
+    except Exception:
+        logger.warning("Could not send generic Telegram error response")
+
+
 def main():
     """Start the bot"""
     import datetime as _dt
@@ -7446,6 +7639,7 @@ def main():
 
     # Text messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
+    application.add_error_handler(error_handler)
 
     # Only the primary worker may register jobs. Redirect/migration services
     # set ENABLE_SCHEDULED_JOBS=false to avoid duplicate writes/messages.

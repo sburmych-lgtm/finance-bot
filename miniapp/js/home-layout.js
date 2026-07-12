@@ -4,4 +4,3 @@ export function findDirectSectionHead(screen) {
     child?.classList?.contains('section-head')
   ) || null;
 }
-
