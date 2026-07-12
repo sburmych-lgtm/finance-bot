@@ -3004,11 +3004,11 @@ async def api_get_transactions(request: web.Request):
             to_date   = f'{year_v:04d}-{month_v:02d}-{last_day:02d}'
         elif period == '10d':
             from datetime import timedelta
-            from_date = (now - timedelta(days=10)).strftime('%Y-%m-%d')
+            from_date = (now - timedelta(days=9)).strftime('%Y-%m-%d')
             to_date   = now.strftime('%Y-%m-%d')
         elif period == '30d':
             from datetime import timedelta
-            from_date = (now - timedelta(days=30)).strftime('%Y-%m-%d')
+            from_date = (now - timedelta(days=29)).strftime('%Y-%m-%d')
             to_date   = now.strftime('%Y-%m-%d')
         elif period == 'month':
             # specific month — use ?year & ?month
@@ -3029,6 +3029,8 @@ async def api_get_transactions(request: web.Request):
     for k, v in (('from', from_date), ('to', to_date)):
         if v and not _looks_like_iso_date(v):
             return _json_response({'detail': f'{k} must be YYYY-MM-DD'}, status=400)
+    if from_date and to_date and from_date > to_date:
+        return _json_response({'detail': 'from must not be after to'}, status=400)
 
     # Limit. 'all' raises the cap so history filters can return everything in range.
     limit_raw = q.get('limit')
@@ -3065,8 +3067,11 @@ async def api_get_transactions(request: web.Request):
 
 
 def _looks_like_iso_date(s: str) -> bool:
-    import re as _re
-    return bool(_re.fullmatch(r'\d{4}-\d{2}-\d{2}', s))
+    try:
+        datetime.strptime(s, '%Y-%m-%d')
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 async def api_post_transaction(request: web.Request):
@@ -3082,10 +3087,7 @@ async def api_post_transaction(request: web.Request):
     if t_type not in ('income', 'expense'):
         return _json_response({'detail': 'type must be income or expense'}, status=400)
 
-    # Ensure this user has a settings row (so /api/employees etc. don't 404 on
-    # first interaction). Side-effects only; we don't read from it here since
-    # the Mini App sends an explicit category string.
-    await user_settings_for(user_id)
+    user_settings = await user_settings_for(user_id)
 
     raw_amount = body.get('amount')
     if raw_amount is None or isinstance(raw_amount, bool):
@@ -3113,6 +3115,15 @@ async def api_post_transaction(request: web.Request):
     description = _clean_text(body.get('description'), max_len=200, default='')
     # Optional subcategory (hierarchical categories). None when absent/empty.
     subcategory = _clean_text(body.get('subcategory'), max_len=80, default='') or None
+    category_entry = user_settings.get('categories', {}).get(t_type, {}).get(category)
+    if not isinstance(category_entry, dict):
+        return _json_response({'detail': f'unknown {t_type} category "{category}"'}, status=400)
+    known_subcategories = category_entry.get('subcategories') or []
+    if subcategory and subcategory not in known_subcategories:
+        return _json_response(
+            {'detail': f'unknown subcategory "{subcategory}" for category "{category}"'},
+            status=400,
+        )
 
     rate = await get_exchange_rate(currency)
     amount_uah = round(convert_to_uah(amount, currency, rate), 2)
@@ -3500,19 +3511,33 @@ async def api_categories_create(request: web.Request):
     if cat_type not in ('income', 'expense'):
         return _json_response({'detail': 'type must be income or expense'}, status=400)
 
-    name = (body.get('name') or '').strip()
+    name = _clean_text(body.get('name'), max_len=80)
     if not name:
         return _json_response({'detail': 'name required'}, status=400)
+    if len(str(body.get('name') or '').strip()) > 80:
+        return _json_response({'detail': 'name must be at most 80 characters'}, status=400)
 
     settings = await user_settings_for(user_id)
     bucket = settings.setdefault('categories', {}).setdefault(cat_type, {})
     if name in bucket:
         return _json_response({'detail': 'category already exists'}, status=409)
 
+    raw_subcategories = body.get('subcategories') or []
+    if not isinstance(raw_subcategories, list):
+        return _json_response({'detail': 'subcategories must be a list'}, status=400)
+    subcategories = list(dict.fromkeys(
+        cleaned for item in raw_subcategories
+        if isinstance(item, str) and (cleaned := _clean_text(item, max_len=80))
+    ))
+    if len(subcategories) > 30:
+        return _json_response({'detail': 'too many subcategories (max 30)'}, status=400)
+    keywords = body.get('keywords', []) or []
+    if not isinstance(keywords, list) or not all(isinstance(k, str) for k in keywords):
+        return _json_response({'detail': 'keywords must be a list of strings'}, status=400)
     entry = {
-        'emoji': body.get('emoji', '📦'),
-        'keywords': body.get('keywords', []) or [],
-        'subcategories': [s for s in (body.get('subcategories') or []) if isinstance(s, str)],
+        'emoji': _clean_text(body.get('emoji'), max_len=16, default='📦'),
+        'keywords': keywords[:30],
+        'subcategories': subcategories,
     }
     bucket[name] = entry
     await save_user_settings(user_id, settings)
@@ -3537,11 +3562,26 @@ async def api_categories_update(request: web.Request):
         return _json_response({'detail': 'Invalid JSON'}, status=400)
 
     current = bucket[name]
-    new_emoji = body.get('emoji', current.get('emoji', '📦'))
+    new_emoji = _clean_text(
+        body.get('emoji', current.get('emoji', '📦')), max_len=16, default='📦')
     new_keywords = body.get('keywords', current.get('keywords', []))
     # Preserve subcategories across rename/update unless explicitly provided.
     new_subs = body.get('subcategories', current.get('subcategories', []))
-    new_name = (body.get('new_name') or name).strip() or name
+    raw_new_name = str(body.get('new_name') or name).strip()
+    if len(raw_new_name) > 80:
+        return _json_response({'detail': 'new_name must be at most 80 characters'}, status=400)
+    new_name = raw_new_name or name
+
+    if not isinstance(new_keywords, list) or not all(isinstance(k, str) for k in new_keywords):
+        return _json_response({'detail': 'keywords must be a list of strings'}, status=400)
+    if not isinstance(new_subs, list):
+        return _json_response({'detail': 'subcategories must be a list'}, status=400)
+    clean_subs = list(dict.fromkeys(
+        cleaned for item in new_subs
+        if isinstance(item, str) and (cleaned := _clean_text(item, max_len=80))
+    ))
+    if len(clean_subs) > 30:
+        return _json_response({'detail': 'too many subcategories (max 30)'}, status=400)
 
     if new_name != name and new_name in bucket:
         return _json_response({'detail': 'target name already exists'}, status=409)
@@ -3550,8 +3590,8 @@ async def api_categories_update(request: web.Request):
 
     new_entry = {
         'emoji': new_emoji,
-        'keywords': new_keywords or [],
-        'subcategories': [s for s in (new_subs or []) if isinstance(s, str)],
+        'keywords': new_keywords[:30],
+        'subcategories': clean_subs,
     }
     new_bucket = {}
     for k, v in list(bucket.items()):
@@ -3664,11 +3704,11 @@ async def api_report_category_breakdown(request: web.Request):
     if not from_date and not to_date:
         if period == '10d':
             from datetime import timedelta
-            from_date = (now - timedelta(days=10)).strftime('%Y-%m-%d')
+            from_date = (now - timedelta(days=9)).strftime('%Y-%m-%d')
             to_date = now.strftime('%Y-%m-%d')
         elif period == '30d':
             from datetime import timedelta
-            from_date = (now - timedelta(days=30)).strftime('%Y-%m-%d')
+            from_date = (now - timedelta(days=29)).strftime('%Y-%m-%d')
             to_date = now.strftime('%Y-%m-%d')
         elif period == 'month':
             year_v, month_v, err = _parse_year_month(request)
@@ -3681,6 +3721,12 @@ async def api_report_category_breakdown(request: web.Request):
             last_day = calendar.monthrange(now.year, now.month)[1]
             from_date = f'{now.year:04d}-{now.month:02d}-01'
             to_date = f'{now.year:04d}-{now.month:02d}-{last_day:02d}'
+
+    for key, value in (('from', from_date), ('to', to_date)):
+        if value and not _looks_like_iso_date(value):
+            return _json_response({'detail': f'{key} must be YYYY-MM-DD'}, status=400)
+    if from_date and to_date and from_date > to_date:
+        return _json_response({'detail': 'from must not be after to'}, status=400)
 
     rows = await db.get_transactions(
         user_id, t_type=cat_type, from_date=from_date, to_date=to_date,
@@ -3891,6 +3937,16 @@ async def api_settings_tax_update(request: web.Request):
     settings = await user_settings_for(user_id)
     tax_cfg = settings.setdefault('tax_config', _copy.deepcopy(DEFAULT_SETTINGS['tax_config']))
 
+    def finite_number(value, field):
+        import math
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None, _json_response({'detail': f'{field} must be a number'}, status=400)
+        if not math.isfinite(number):
+            return None, _json_response({'detail': f'{field} must be finite'}, status=400)
+        return number, None
+
     if 'group' in body:
         group = str(body['group']).strip().lower()
         if group not in ('fop1', 'fop2', 'fop3', 'none'):
@@ -3899,38 +3955,34 @@ async def api_settings_tax_update(request: web.Request):
         tax_cfg['group'] = group
 
     if 'single_tax_rate' in body:
-        try:
-            rate = float(body['single_tax_rate'])
-        except (TypeError, ValueError):
-            return _json_response({'detail': 'single_tax_rate must be a number'}, status=400)
+        rate, err = finite_number(body['single_tax_rate'], 'single_tax_rate')
+        if err is not None:
+            return err
         if rate < 0.01 or rate > 0.25:
             return _json_response(
                 {'detail': 'single_tax_rate must be between 0.01 (1%) and 0.25 (25%)'}, status=400)
         tax_cfg['single_tax_rate'] = rate
 
     if 'fop1_fixed' in body:
-        try:
-            v = float(body['fop1_fixed'])
-        except (TypeError, ValueError):
-            return _json_response({'detail': 'fop1_fixed must be a number'}, status=400)
+        v, err = finite_number(body['fop1_fixed'], 'fop1_fixed')
+        if err is not None:
+            return err
         if v < 0 or v > 10000:
             return _json_response({'detail': 'fop1_fixed must be between 0 and 10000'}, status=400)
         tax_cfg['fop1_fixed'] = v
 
     if 'fop2_fixed' in body:
-        try:
-            v = float(body['fop2_fixed'])
-        except (TypeError, ValueError):
-            return _json_response({'detail': 'fop2_fixed must be a number'}, status=400)
+        v, err = finite_number(body['fop2_fixed'], 'fop2_fixed')
+        if err is not None:
+            return err
         if v < 0 or v > 20000:
             return _json_response({'detail': 'fop2_fixed must be between 0 and 20000'}, status=400)
         tax_cfg['fop2_fixed'] = v
 
     if 'esv_fixed' in body:
-        try:
-            esv = float(body['esv_fixed'])
-        except (TypeError, ValueError):
-            return _json_response({'detail': 'esv_fixed must be a number'}, status=400)
+        esv, err = finite_number(body['esv_fixed'], 'esv_fixed')
+        if err is not None:
+            return err
         if esv < 0 or esv > 50000:
             return _json_response(
                 {'detail': 'esv_fixed must be between 0 and 50000 UAH'}, status=400)
