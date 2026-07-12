@@ -92,19 +92,64 @@ def due_recurrence_dates(
     """Enumerate due dates inclusively, bounded against runaway catch-up."""
     if max_occurrences < 1:
         raise ValueError("max_occurrences must be positive")
+    if frequency not in SUPPORTED_FREQUENCIES:
+        raise ValueError("unsupported frequency")
+    if isinstance(interval, bool) or not isinstance(interval, int) or interval < 1:
+        raise ValueError("interval must be a positive integer")
     if through < start_date:
         return ()
 
     anchor = anchor_day or start_date.day
     candidate = start_date
-    examined = 0
+    if last_generated_date is not None and last_generated_date >= start_date:
+        if frequency in {"daily", "weekly"}:
+            step_days = interval * (7 if frequency == "weekly" else 1)
+            jumps = ((last_generated_date - start_date).days // step_days) + 1
+            candidate = start_date + timedelta(days=jumps * step_days)
+        elif frequency == "monthly":
+            elapsed_months = (
+                (last_generated_date.year - start_date.year) * 12
+                + last_generated_date.month
+                - start_date.month
+            )
+            jumps = max(0, elapsed_months // interval)
+            if jumps:
+                candidate = advance_recurrence(
+                    start_date,
+                    frequency,
+                    interval=jumps * interval,
+                    anchor_day=anchor,
+                )
+            while candidate <= last_generated_date:
+                candidate = advance_recurrence(
+                    candidate,
+                    frequency,
+                    interval=interval,
+                    anchor_day=anchor,
+                )
+        else:
+            elapsed_years = last_generated_date.year - start_date.year
+            jumps = max(0, elapsed_years // interval)
+            if jumps:
+                candidate = advance_recurrence(
+                    start_date,
+                    frequency,
+                    interval=jumps * interval,
+                    anchor_day=anchor,
+                )
+            while candidate <= last_generated_date:
+                candidate = advance_recurrence(
+                    candidate,
+                    frequency,
+                    interval=interval,
+                    anchor_day=anchor,
+                )
+
     result: list[date] = []
     while candidate <= through:
-        examined += 1
-        if examined > max_occurrences:
+        if len(result) >= max_occurrences:
             raise ValueError("max_occurrences exceeded")
-        if last_generated_date is None or candidate > last_generated_date:
-            result.append(candidate)
+        result.append(candidate)
         candidate = advance_recurrence(
             candidate,
             frequency,

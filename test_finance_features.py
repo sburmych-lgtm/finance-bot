@@ -69,6 +69,16 @@ def test_due_dates_are_bounded_and_resume_after_last_generated_date():
         )
 
 
+def test_daily_recurrence_resume_does_not_count_lifetime_history_toward_cap():
+    assert due_recurrence_dates(
+        start_date=date(2020, 1, 1),
+        through=date(2026, 7, 12),
+        frequency="daily",
+        last_generated_date=date(2026, 7, 10),
+        max_occurrences=10,
+    ) == (date(2026, 7, 11), date(2026, 7, 12))
+
+
 def test_occurrence_key_is_stable_and_namespaced():
     assert recurrence_occurrence_key(42, date(2026, 7, 12)) == (
         "recurring:42:2026-07-12"
