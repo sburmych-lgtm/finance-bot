@@ -22,6 +22,7 @@ Env:
                   seconds at process start, or RAILWAY_GIT_COMMIT_SHA if set)
 """
 from __future__ import annotations
+import json
 import os
 import re
 import time
@@ -75,9 +76,16 @@ def _bust_html(text: str) -> str:
 def _inject_api_base(html: str) -> str:
     if not API_BASE:
         return html
+    encoded_api_base = json.dumps(API_BASE, ensure_ascii=False)
+    # JSON quoting protects the JavaScript string; escaping HTML-significant
+    # characters also prevents a configured value from closing the script tag.
+    encoded_api_base = (encoded_api_base
+                        .replace('&', r'\u0026')
+                        .replace('<', r'\u003c')
+                        .replace('>', r'\u003e'))
     return re.sub(
         r"window\.__RUBY_API_BASE__\s*=\s*window\.__RUBY_API_BASE__\s*\|\|\s*['\"][^'\"]*['\"]\s*;",
-        f"window.__RUBY_API_BASE__ = '{API_BASE}';",
+        lambda _match: f"window.__RUBY_API_BASE__ = {encoded_api_base};",
         html,
         count=1,
     )

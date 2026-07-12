@@ -1,6 +1,5 @@
 /* Reports screen — full tab set: Огляд / Працівники / Податки / Бухгалтерія / Час / AI */
 
-import { Store } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
 import { fmtMoney, fmtAmount, esc, toast, setHTML } from '../ui.js';
@@ -145,8 +144,10 @@ function overviewMarkup(report) {
   const { expenseSlices: slices, incomeSlices, totalExpense, totalIncome } = report;
   const legend = slices.map((s, i) => {
     const pct = ((s.value / (totalExpense || 1)) * 100).toFixed(0);
-    const hasSub = Store.subcategoriesFor('expense', s.name).length > 0;
-    const drillAttr = hasSub ? ` data-drill="expense" data-drill-cat="${esc(s.name)}"` : '';
+    // Always allow drill-down: historical transactions can retain a
+    // subcategory that was later removed from the current category settings.
+    const hasSub = true;
+    const drillAttr = ` data-drill="expense" data-drill-cat="${esc(s.name)}"`;
     return `
       <div class="legend-item ${hasSub ? 'drillable' : ''}"${drillAttr}>
         <span class="swatch" style="background:${SLICE_COLORS[i % SLICE_COLORS.length]}"></span>
@@ -155,8 +156,8 @@ function overviewMarkup(report) {
       </div>`;
   }).join('');
   const incomeBars = incomeSlices.map(({ name: k, value: v }) => {
-    const hasSub = Store.subcategoriesFor('income', k).length > 0;
-    const drillAttr = hasSub ? ` data-drill="income" data-drill-cat="${esc(k)}"` : '';
+    const hasSub = true;
+    const drillAttr = ` data-drill="income" data-drill-cat="${esc(k)}"`;
     return `
     <div class="${hasSub ? 'drillable-bar' : ''}"${drillAttr}>
       <div class="bar-meta"><span>${esc(k)}${hasSub ? ' <span class="drill-arrow">›</span>' : ''}</span><strong>${esc(fmtAmount(v, 'UAH'))}</strong></div>

@@ -149,7 +149,11 @@ async function renderCategoriesEditor(root, type, label) {
                 <div class="row-title">${esc(name)} ${subs.length ? `<span class="sub-count">${subs.length}</span>` : ''}</div>
                 <div class="row-meta">${subs.length ? `${subs.length} підрозділ(ів) · торкніться, щоб відкрити` : 'Торкніться, щоб додати підрозділи'}</div>
               </div>
-              ${name === 'Інше' ? '<div class="row-chevron">🔒</div>' : `<button class="ghost-btn delete-cat" data-name="${esc(name)}" aria-label="Видалити">×</button>`}
+              ${name === 'Інше' ? '<div class="row-chevron">🔒</div>' : `
+                <div style="display:flex; gap:var(--sp-1);">
+                  <button class="ghost-btn rename-cat" data-name="${esc(name)}" aria-label="Перейменувати">✎</button>
+                  <button class="ghost-btn delete-cat" data-name="${esc(name)}" aria-label="Видалити">×</button>
+                </div>`}
             </div>
             ${isOpen ? `
               <div class="sub-editor">
@@ -176,6 +180,7 @@ async function renderCategoriesEditor(root, type, label) {
       if (!name) { toast('Введіть назву'); return; }
       try {
         await Api.addCategory({ type, name, keywords: [] });
+        await Store.hydrate();
         Telegram.haptic('success');
         toast('Категорію додано');
         renderCategoriesEditor(root, type, label);
@@ -189,11 +194,29 @@ async function renderCategoriesEditor(root, type, label) {
         if (!window.confirm(`Видалити категорію «${name}» з усіма підрозділами?`)) return;
         try {
           await Api.deleteCategory(type, name);
+          await Store.hydrate();
           Telegram.haptic('warning');
           toast(`«${name}» видалено`);
           if (_openCat === name) _openCat = null;
           renderCategoriesEditor(root, type, label);
         } catch (e) { Telegram.haptic('error'); toast(e.message || 'Помилка'); }
+      });
+    });
+
+    body.querySelectorAll('.rename-cat').forEach((b) => {
+      b.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const name = b.dataset.name;
+        const newName = window.prompt('Нова назва категорії', name)?.trim();
+        if (!newName || newName === name) return;
+        try {
+          await Api.patchCategory(type, name, { new_name: newName });
+          await Store.hydrate();
+          Telegram.haptic('success');
+          toast(`«${name}» перейменовано на «${newName}»`);
+          if (_openCat === name) _openCat = newName;
+          renderCategoriesEditor(root, type, label);
+        } catch (err) { Telegram.haptic('error'); toast(err.message || 'Помилка'); }
       });
     });
 
@@ -216,6 +239,7 @@ async function renderCategoriesEditor(root, type, label) {
         if (!subName) { toast('Введіть назву підрозділу'); return; }
         try {
           await Api.addSubcategory(type, cat, subName);
+          await Store.hydrate();
           Telegram.haptic('success');
           toast('Підрозділ додано');
           _openCat = cat;
@@ -231,6 +255,7 @@ async function renderCategoriesEditor(root, type, label) {
         const sub = btn.dataset.subDel;
         try {
           await Api.deleteSubcategory(type, cat, sub);
+          await Store.hydrate();
           Telegram.haptic('warning');
           toast('Підрозділ видалено');
           _openCat = cat;
@@ -389,6 +414,7 @@ async function renderTaxSettings(root) {
     const fop1 = tax.fop1_fixed ?? 303;
     const fop2 = tax.fop2_fixed ?? 1600;
     const esv = tax.esv_fixed ?? 1760;
+    const draft = { rate, fop1, fop2, esv };
 
     const groupCards = TAX_GROUPS.map((g) => `
       <button class="tax-group-card ${group === g.id ? 'active' : ''}" data-group="${esc(g.id)}">
@@ -425,8 +451,9 @@ async function renderTaxSettings(root) {
       btn.addEventListener('click', () => {
         body.querySelectorAll('[data-group]').forEach((b) => b.classList.toggle('active', b === btn));
         const newGroup = btn.dataset.group;
+        captureTaxDraft(body, draft);
         body.querySelector('#taxFieldsPanel').innerHTML =
-          renderTaxFields(newGroup, { rate: getCurrentRate(body), fop1: getCurrentFop1(body), fop2: getCurrentFop2(body), esv: getCurrentEsv(body) });
+          renderTaxFields(newGroup, draft);
         Telegram.haptic('selection');
       });
     });
@@ -434,6 +461,7 @@ async function renderTaxSettings(root) {
     body.querySelector('#saveTaxBtn').addEventListener('click', async () => {
       const activeGroup = body.querySelector('[data-group].active')?.dataset.group || 'fop3';
       const payload = { group: activeGroup };
+      captureTaxDraft(body, draft);
 
       if (activeGroup === 'fop3') {
         const r = parseFloat(body.querySelector('#taxRate')?.value);
@@ -467,10 +495,20 @@ async function renderTaxSettings(root) {
   }
 }
 
-function getCurrentRate(root) { return parseFloat(root.querySelector('#taxRate')?.value) || 5; }
-function getCurrentFop1(root) { return parseFloat(root.querySelector('#taxFop1')?.value) || 303; }
-function getCurrentFop2(root) { return parseFloat(root.querySelector('#taxFop2')?.value) || 1600; }
-function getCurrentEsv(root)  { return parseFloat(root.querySelector('#taxEsv')?.value)  || 1760; }
+function captureTaxDraft(root, draft) {
+  const fields = [
+    ['taxRate', 'rate'],
+    ['taxFop1', 'fop1'],
+    ['taxFop2', 'fop2'],
+    ['taxEsv', 'esv'],
+  ];
+  fields.forEach(([id, key]) => {
+    const input = root.querySelector(`#${id}`);
+    if (!input) return;
+    const value = parseFloat(input.value);
+    if (Number.isFinite(value)) draft[key] = value;
+  });
+}
 
 function renderTaxFields(group, { rate, fop1, fop2, esv }) {
   if (group === 'none') {
@@ -533,7 +571,7 @@ function renderPrivacy(root) {
       </p>
       <p style="color: var(--ruby-ivory); font-weight: 700; margin-top: var(--sp-4);">Право на видалення</p>
       <p style="color: var(--ruby-muted); font-size: var(--fs-13); line-height: 1.6;">
-        Нижче — кнопка «Очистити всі мої дані». Це фінально, без відновлення.
+        Повне видалення транзакцій і налаштувань доступне в чаті бота через команду <b>/очистити</b>.
       </p>
     </div>
     <div class="panel" style="padding: var(--sp-4); margin-top: var(--sp-3);">
@@ -544,11 +582,6 @@ function renderPrivacy(root) {
         Скидає тільки <b>налаштування</b> (працівники, категорії, податки) до базового стану.
         Транзакції та час залишаються незмінними.
       </p>
-    </div>
-    <div class="panel" style="padding: var(--sp-4); margin-top: var(--sp-3); border-color: rgba(212, 90, 79, 0.4);">
-      <button class="btn btn-secondary" id="clearAllBtn" style="background: rgba(212, 90, 79, 0.18); color: var(--ruby-danger); border-color: rgba(212, 90, 79, 0.4);">
-        🗑 Очистити всі мої дані
-      </button>
     </div>
   `;
   root.appendChild(body);
@@ -565,10 +598,6 @@ function renderPrivacy(root) {
       Telegram.haptic('error');
       toast(e.message || 'Помилка');
     }
-  });
-  body.querySelector('#clearAllBtn').addEventListener('click', () => {
-    Telegram.haptic('warning');
-    toast('Очищення всіх даних — поки тільки через бот: /очистити');
   });
 }
 

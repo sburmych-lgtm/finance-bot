@@ -23,6 +23,7 @@ const state = {
   rows: null,             // null = loading, [] = empty, [..] = loaded
   err: null,
 };
+let fetchGeneration = 0;
 
 function letter(cat) {
   return CATEGORY_LETTER[cat] || (cat?.[0] || '•').toUpperCase();
@@ -43,14 +44,17 @@ function buildQuery() {
 }
 
 async function fetchRows() {
+  const generation = ++fetchGeneration;
   state.rows = null;
   state.err = null;
   doRender();
   try {
     const url = `/api/transactions${buildQuery()}`;
     const data = await Api._request(url);
+    if (generation !== fetchGeneration) return;
     state.rows = data || [];
   } catch (e) {
+    if (generation !== fetchGeneration) return;
     state.err = e.message || 'Не вдалось завантажити';
     state.rows = [];
   }
