@@ -409,6 +409,16 @@ class Database:
             cursor.execute("SELECT user_id FROM users")
             return [row[0] for row in cursor.fetchall()]
 
+    async def get_all_users(self):
+        """Full user roster with metadata — for the admin audit endpoint."""
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT user_id, username, first_name, last_name, first_seen, last_seen "
+                "FROM users ORDER BY first_seen"
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
     async def get_subscription(self, user_id):
         async with db_lock:
             cursor = self.conn.cursor()
@@ -4053,29 +4063,53 @@ async def api_admin_broadcast(request: web.Request):
     if not token:
         return _json_response({'detail': 'bot token unavailable'}, status=500)
 
-    sent, failed, skipped = 0, 0, 0
+    sent_ids, failed_ids, skipped_ids = [], [], []
     url = f'https://api.telegram.org/bot{token}/sendMessage'
     async with aiohttp.ClientSession() as session:
         for uid in user_ids:
             # Skip the synthetic QA test accounts (999000***) that never
             # correspond to a real Telegram chat.
             if str(uid).startswith('999000'):
-                skipped += 1
+                skipped_ids.append(str(uid))
                 continue
             try:
                 async with session.post(url, json={'chat_id': int(uid), 'text': text}) as resp:
                     if resp.status == 200:
-                        sent += 1
+                        sent_ids.append(str(uid))
                     else:
-                        failed += 1
+                        detail = ''
+                        try:
+                            detail = (await resp.json()).get('description', '')
+                        except Exception:
+                            pass
+                        failed_ids.append({'id': str(uid), 'reason': detail or f'HTTP {resp.status}'})
             except Exception as e:
-                failed += 1
+                failed_ids.append({'id': str(uid), 'reason': str(e)})
                 logger.warning(f'admin broadcast to {uid} failed: {e}')
             await asyncio.sleep(0.05)  # stay well under Telegram rate limits
 
-    logger.info(f"API admin broadcast: sent={sent} failed={failed} skipped={skipped}")
-    return _json_response({'sent': sent, 'failed': failed, 'skipped': skipped,
-                           'total_users': len(user_ids)})
+    logger.info(f"API admin broadcast: sent={len(sent_ids)} failed={len(failed_ids)} skipped={len(skipped_ids)}")
+    return _json_response({
+        'sent': len(sent_ids), 'failed': len(failed_ids), 'skipped': len(skipped_ids),
+        'total_users': len(user_ids),
+        'sent_ids': sent_ids, 'failed_ids': failed_ids, 'skipped_ids': skipped_ids,
+    })
+
+
+async def api_admin_users(request: web.Request):
+    """GET /api/admin/users — admin-only roster straight from the DB.
+    Proves exactly who is registered (id, name, @username, first/last seen)."""
+    if not is_admin(request['user_id']):
+        return _json_response({'detail': 'admin only'}, status=403)
+    users = await db.get_all_users()
+    real = [u for u in users if not str(u['user_id']).startswith('999000')]
+    test = [u for u in users if str(u['user_id']).startswith('999000')]
+    return _json_response({
+        'total': len(users),
+        'real_count': len(real),
+        'test_count': len(test),
+        'users': users,
+    })
 
 
 def build_api_app() -> web.Application:
@@ -4127,6 +4161,7 @@ def build_api_app() -> web.Application:
     app.router.add_route('DELETE', '/api/settings', api_settings_reset)
     # admin
     app.router.add_route('POST', '/api/admin/broadcast', api_admin_broadcast)
+    app.router.add_route('GET', '/api/admin/users', api_admin_users)
 
     # Catch-all OPTIONS for CORS preflight on any path
     async def options_handler(_request):
