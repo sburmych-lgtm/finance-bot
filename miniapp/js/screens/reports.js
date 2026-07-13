@@ -170,6 +170,89 @@ function forecastMarkup(state) {
     </div>`;
 }
 
+// ── Money-flow (Sankey) ────────────────────────────────────────
+// A curved band between two vertical segments (source [ya0,ya1] → dest [yb0,yb1]).
+function flowBand(x0, ya0, ya1, x1, yb0, yb1, fill, op) {
+  const mx = (x0 + x1) / 2;
+  return `<path d="M ${x0} ${ya0} C ${mx} ${ya0}, ${mx} ${yb0}, ${x1} ${yb0} `
+    + `L ${x1} ${yb1} C ${mx} ${yb1}, ${mx} ${ya1}, ${x0} ${ya1} Z" fill="${fill}" opacity="${op}"/>`;
+}
+
+// Honest money flow: income sources → central pool → expense categories (+ savings
+// / deficit to balance). We don't know which income funded which expense, so the
+// pool in the middle is the truthful model (no fabricated source→category links).
+function flowChartSVG(income, expense, totalIncome, totalExpense) {
+  const cap = (arr, n = 4) => {
+    const clean = (arr || []).filter((x) => x.value > 0);
+    if (clean.length <= n + 1) return clean;
+    const rest = clean.slice(n).reduce((s, x) => s + x.value, 0);
+    return [...clean.slice(0, n), { name: 'Інше', value: rest }];
+  };
+  const savings = totalIncome - totalExpense;
+  const left = cap(income).map((x, i) => ({ ...x, color: SLICE_COLORS[i % SLICE_COLORS.length] }));
+  if (savings < 0) left.push({ name: 'З резервів', value: -savings, color: '#D45A4F' });
+  const right = cap(expense).map((x, i) => ({ ...x, color: SLICE_COLORS[i % SLICE_COLORS.length] }));
+  if (savings > 0) right.push({ name: 'Заощадження', value: savings, color: '#6FB67E' });
+  if (!left.length || !right.length) return '';
+
+  const total = Math.max(
+    left.reduce((s, x) => s + x.value, 0),
+    right.reduce((s, x) => s + x.value, 0),
+    1,
+  );
+  const W = 320, H = 250, pad = 6, usable = H - 2 * pad;
+  const scale = usable / total;
+  const colW = 11, leftX = 74, hubX = W / 2 - colW / 2, rightX = W - 74 - colW;
+  const clip = (s, n = 12) => (String(s).length > n ? String(s).slice(0, n - 1) + '…' : String(s));
+  const stack = (nodes) => {
+    let y = pad; const out = [];
+    for (const node of nodes) {
+      const h = Math.max(2, node.value * scale);
+      out.push({ node, y0: y, y1: y + h }); y += h;
+    }
+    return out;
+  };
+  const parts = [`<rect x="${hubX}" y="${pad}" width="${colW}" height="${usable}" rx="3" fill="#3a2a2e"/>`];
+  stack(left).forEach(({ node, y0, y1 }) => {
+    parts.push(flowBand(leftX + colW, y0, y1, hubX, y0, y1, node.color, 0.5));
+    parts.push(`<rect x="${leftX}" y="${y0}" width="${colW}" height="${y1 - y0}" rx="2" fill="${node.color}"/>`);
+    parts.push(`<text x="${leftX - 5}" y="${(y0 + y1) / 2 + 3}" text-anchor="end" font-size="9" fill="#CFC3B4">${esc(clip(node.name))}</text>`);
+  });
+  stack(right).forEach(({ node, y0, y1 }) => {
+    parts.push(flowBand(hubX + colW, y0, y1, rightX, y0, y1, node.color, 0.5));
+    parts.push(`<rect x="${rightX}" y="${y0}" width="${colW}" height="${y1 - y0}" rx="2" fill="${node.color}"/>`);
+    parts.push(`<text x="${rightX + colW + 5}" y="${(y0 + y1) / 2 + 3}" text-anchor="start" font-size="9" fill="#CFC3B4">${esc(clip(node.name))}</text>`);
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" class="flow-svg" role="img" aria-label="Потік коштів: доходи у витрати">${parts.join('')}</svg>`;
+}
+
+function flowSection(report) {
+  const svg = flowChartSVG(report.incomeSlices, report.expenseSlices, report.totalIncome, report.totalExpense);
+  if (!svg) return '';
+  return `
+    <div class="section-head"><div class="section-title">Потік коштів</div><span class="section-link">дохід → витрати</span></div>
+    <div class="panel flow-panel">${svg}</div>`;
+}
+
+// ── Pace forecast (spending-rate extrapolation for the ongoing month) ──
+function paceForecastMarkup(report, year, month) {
+  const now = new Date();
+  if (year !== now.getFullYear() || month !== now.getMonth() + 1) return '';
+  if (!(report.totalExpense > 0)) return '';
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const dayNow = Math.max(1, Math.min(now.getDate(), daysInMonth));
+  const pct = Math.round((dayNow / daysInMonth) * 100);
+  const projExpense = (report.totalExpense / dayNow) * daysInMonth;
+  const remaining = Math.max(0, projExpense - report.totalExpense);
+  return `
+    <div class="section-head"><div class="section-title">Темп витрат</div><span class="section-link">день ${dayNow}/${daysInMonth}</span></div>
+    <div class="panel pace-card">
+      <div class="pace-head"><span>Прогноз витрат на кінець місяця</span><strong>${esc(fmtAmount(projExpense, 'UAH'))}</strong></div>
+      <div class="pace-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><span style="width:${pct}%"></span></div>
+      <p>За поточним темпом лишилось ще ~${esc(fmtAmount(remaining, 'UAH'))} до кінця місяця (минуло ${pct}% місяця).</p>
+    </div>`;
+}
+
 function overviewMarkup(report, sourceSummary = {}, budgets = [], forecastState = null) {
   const { expenseSlices: slices, incomeSlices, totalExpense, totalIncome } = report;
   const paymentSources = normalizePaymentSourceBreakdown(sourceSummary, 'expense');
@@ -223,6 +306,8 @@ function overviewMarkup(report, sourceSummary = {}, budgets = [], forecastState 
       </div>
     </div>
     ${forecastMarkup(forecastState)}
+    ${paceForecastMarkup(report, state.year, state.month)}
+    ${flowSection(report)}
     <div class="section-head"><div class="section-title">Витрати по категоріях</div></div>
     ${slices.length ? '<p class="drill-hint">Оберіть категорію, щоб побачити підрозділи ›</p>' : ''}
     <div class="panel" style="padding: var(--sp-4);">

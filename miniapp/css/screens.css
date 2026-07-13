@@ -670,3 +670,14 @@
 .import-cat { min-height: 44px; padding: 8px 12px; font-size: var(--fs-13); }
 .import-actions { display: flex; gap: var(--sp-3); }
 .import-actions .btn { flex: 1 1 0; }
+
+/* ── Money flow (Sankey) + pace forecast (Block 6 slice) ──────── */
+.flow-panel { padding: var(--sp-4) var(--sp-2); }
+.flow-svg { display: block; width: 100%; height: auto; }
+.pace-card { padding: var(--sp-4); }
+.pace-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-3); margin-bottom: var(--sp-3); }
+.pace-head span { font-size: var(--fs-13); color: var(--ruby-muted); }
+.pace-head strong { font-family: var(--font-display); font-size: var(--fs-20); color: var(--ruby-gold); font-variant-numeric: tabular-nums; }
+.pace-track { position: relative; height: 8px; border-radius: 999px; background: rgba(255,255,255,.06); overflow: hidden; }
+.pace-track > span { position: absolute; inset: 0 auto 0 0; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--ruby-gold-soft), var(--ruby-gold)); }
+.pace-card p { margin-top: var(--sp-3); font-size: var(--fs-12); color: var(--ruby-muted); line-height: 1.45; }
