@@ -165,3 +165,37 @@ def test_api_write_free_for_vip(monkeypatch, tmp_path):
             return resp.status
 
     assert run(exercise()) in (200, 201)  # VIP bypass
+
+
+def test_payment_claim_notifies_then_activation_grants_write(monkeypatch, tmp_path):
+    use_db(monkeypatch, tmp_path)
+    token = "gate-token"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
+    flags(monkeypatch, paywall=True, admins={"admin1"})
+    monkeypatch.setattr(bot, "TRIAL_DAYS", 0)  # no trial → buyer starts gated
+    sent = []
+
+    async def fake_send(chat_id, text, reply_markup=None):
+        sent.append((str(chat_id), reply_markup))
+        return True
+
+    monkeypatch.setattr(bot, "_tg_http_send", fake_send)
+    bot._payment_claim_at.clear()
+
+    async def exercise():
+        async with TestClient(TestServer(bot.build_api_app())) as client:
+            blocked = await client.post("/api/transactions",
+                                        headers=_auth(token, "buyer"), json=_TX)
+            claim = await client.post("/api/payment/claim", headers=_auth(token, "buyer"))
+            claim_body = await claim.json()
+            await bot._activate_paid_subscription("buyer")  # admin confirms
+            allowed = await client.post("/api/transactions",
+                                        headers=_auth(token, "buyer"), json=_TX)
+            return blocked.status, claim.status, claim_body, allowed.status
+
+    blocked, claim_status, body, allowed = run(exercise())
+    assert blocked == 402                      # gated before paying
+    assert claim_status == 200 and body["ok"] is True
+    assert body["admins_notified"] == 1        # the one admin was pinged
+    assert len(sent) == 1 and sent[0][0] == "admin1"
+    assert allowed in (200, 201)               # activation restored write access

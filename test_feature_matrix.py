@@ -163,6 +163,13 @@ def test_me_returns_verified_profile_admin_flag_and_registers_user(monkeypatch, 
         "first_name": "Олеся",
         "last_name": "Ruby",
         "is_admin": True,
+        "subscription": {
+            "state": "vip",
+            "days_left": None,
+            "price": bot.SUBSCRIPTION_PRICE_UAH,
+            "jar_url": bot.PAYMENT_JAR_URL,
+            "paywall_enabled": bot.PAYWALL_ENABLED,
+        },
     }
     assert [(user["user_id"], user["username"]) for user in users] == [("42", "olesia")]
 

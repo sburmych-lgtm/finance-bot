@@ -225,7 +225,7 @@ PAYWALL_ENABLED = os.environ.get('PAYWALL_ENABLED', '').strip().lower() in ('1',
 VIP_IDS = {x.strip() for x in os.environ.get('VIP_IDS', '').split(',') if x.strip()}
 TRIAL_DAYS = int(os.environ.get('TRIAL_DAYS', '5') or 5)
 SUBSCRIPTION_DAYS = int(os.environ.get('SUBSCRIPTION_DAYS', '30') or 30)
-SUBSCRIPTION_PRICE_UAH = int(os.environ.get('PRICE_UAH', '149') or 149)
+SUBSCRIPTION_PRICE_UAH = int(os.environ.get('PRICE_UAH', '199') or 199)
 PAYMENT_JAR_URL = os.environ.get('PAYMENT_JAR_URL', '').strip()
 
 
@@ -411,6 +411,9 @@ async def subscription_status(user_id, *, start_trial=False):
         return {**base, 'state': 'trial', 'days_left': _days_left(expires, now),
                 'expires_at': row.get('expires_at')}
     if row is None:
+        # TRIAL_DAYS<=0 → no trial: a brand-new user must pay immediately.
+        if TRIAL_DAYS <= 0:
+            return {**base, 'state': 'expired', 'days_left': 0, 'expires_at': None}
         # Brand-new user — still inside the trial. Persist the anchor only when
         # this is a gating call (start_trial); a bare status check must not write.
         expires = now + timedelta(days=TRIAL_DAYS)
@@ -449,16 +452,99 @@ def _paywall_api_response(status):
 
 
 def _paywall_bot_text():
-    """Paywall message for the legacy bot save flows."""
+    """Paywall message for the legacy bot save flows (neutral: works with or
+    without a trial)."""
     price = SUBSCRIPTION_PRICE_UAH
-    jar = PAYMENT_JAR_URL or '(посилання додасться найближчим часом)'
+    jar = PAYMENT_JAR_URL or '(посилання на оплату додасться найближчим часом)'
     return (
-        f"🔒 Тріал завершився.\n\n"
-        f"Щоб додавати нові операції, оформіть підписку — {price} ₴/міс.\n"
-        f"Переглядати наявні дані та звіти можна й далі.\n\n"
-        f"Оплатити 👉 {jar}\n"
-        f"Після оплати натисніть «✅ Я оплатив» у застосунку або напишіть боту."
+        f"🔒 Щоб додавати операції, потрібна підписка — {price} ₴/міс.\n"
+        f"Переглядати наявні дані та звіти можна й далі, безкоштовно.\n\n"
+        f"Оплатити на банку 👇\n{jar}\n\n"
+        f"Після оплати натисніть «✅ Я оплатив» — ми перевіримо й активуємо."
     )
+
+
+def _paywall_bot_markup():
+    rows = []
+    try:
+        url = _miniapp_public_url()
+        if url:
+            rows.append([InlineKeyboardButton('💎 Відкрити застосунок', web_app=WebAppInfo(url=url))])
+    except Exception:
+        pass
+    rows.append([InlineKeyboardButton('✅ Я оплатив', callback_data='paysub:claim')])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _tg_http_send(chat_id, text, reply_markup=None):
+    """Fire-and-forget Telegram send over HTTP (usable from API handlers, no
+    Application instance needed). reply_markup is a raw dict."""
+    token = os.getenv('TELEGRAM_BOT_TOKEN', '')
+    if not token:
+        return False
+    payload = {'chat_id': int(chat_id), 'text': text, 'disable_web_page_preview': True}
+    if reply_markup is not None:
+        payload['reply_markup'] = reply_markup
+    url = f'https://api.telegram.org/bot{token}/sendMessage'
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as resp:
+                data = await resp.json()
+                return bool(data.get('ok'))
+    except Exception as e:
+        logger.warning(f'tg http send to {chat_id} failed: {e}')
+        return False
+
+
+async def _notify_admins_of_payment_claim(user_id, display_name):
+    """Ping every admin with a payment claim + confirm/reject buttons."""
+    markup = {'inline_keyboard': [[
+        {'text': '✅ Підтвердити', 'callback_data': f'paysub:ok:{user_id}'},
+        {'text': '❌ Відхилити', 'callback_data': f'paysub:no:{user_id}'},
+    ]]}
+    text = (
+        f"💳 Заявка про оплату підписки\n\n"
+        f"Користувач: {display_name}\n"
+        f"ID: {user_id}\n"
+        f"Сума: {SUBSCRIPTION_PRICE_UAH} ₴ / міс\n\n"
+        f"Перевірте надходження у банці та підтвердьте."
+    )
+    sent = 0
+    for admin_id in ADMIN_IDS:
+        if await _tg_http_send(admin_id, text, reply_markup=markup):
+            sent += 1
+    return sent
+
+
+_payment_claim_at = {}  # user_id -> last claim monotonic time (in-memory throttle)
+
+
+async def _activate_paid_subscription(user_id):
+    expires = (_sub_now() + timedelta(days=SUBSCRIPTION_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+    await db.set_subscription(str(user_id), 'active', expires)
+    return expires
+
+
+async def api_payment_claim(request: web.Request):
+    """Mini App «Я оплатив» → notify admins for manual confirmation.
+    Throttled to one claim per user per 60s to avoid spamming the admin."""
+    import time as _time
+    user_id = str(request['user_id'])
+    tg_user = request.get('tg_user') or {}
+    now = _time.monotonic()
+    if now - _payment_claim_at.get(user_id, 0) < 60:
+        return _json_response({
+            'ok': True, 'throttled': True,
+            'message': 'Заявку вже надіслано, очікуйте підтвердження.',
+        })
+    _payment_claim_at[user_id] = now
+    username = tg_user.get('username')
+    display = f'@{username}' if username else (tg_user.get('first_name') or user_id)
+    notified = await _notify_admins_of_payment_claim(user_id, display)
+    return _json_response({
+        'ok': True, 'admins_notified': notified,
+        'message': 'Дякуємо! Заявку надіслано, очікуйте підтвердження.',
+    })
 
 # Exchange rate cache
 exchange_rates_cache = {
@@ -3569,6 +3655,37 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = data_parts[0]
     user_id = str(query.from_user.id)
 
+    if action == 'paysub':
+        sub = data_parts[1] if len(data_parts) > 1 else ''
+        if sub == 'claim':
+            name = (f'@{query.from_user.username}' if query.from_user.username
+                    else (query.from_user.first_name or user_id))
+            await _notify_admins_of_payment_claim(user_id, name)
+            await query.edit_message_text(
+                'Дякуємо! Заявку про оплату надіслано. Щойно підтвердимо — '
+                'доступ увімкнеться, ми повідомимо. ⏳')
+            return
+        if sub in ('ok', 'no'):
+            if not is_admin(user_id):
+                return
+            target = data_parts[2] if len(data_parts) > 2 else ''
+            if sub == 'ok' and target:
+                await _activate_paid_subscription(target)
+                await _tg_http_send(
+                    target,
+                    f'✅ Оплату підтверджено! Підписку активовано на '
+                    f'{SUBSCRIPTION_DAYS} днів. Дякуємо, що з нами 💛')
+                await query.edit_message_text(
+                    f'✅ Підтверджено. Користувачу {target} активовано підписку '
+                    f'на {SUBSCRIPTION_DAYS} днів.')
+            elif target:
+                await _tg_http_send(
+                    target,
+                    'На жаль, оплату поки не підтверджено. Якщо це помилка — '
+                    'напишіть у підтримку, розберемось.')
+                await query.edit_message_text(f'❌ Відхилено для користувача {target}.')
+        return
+
     if action == 'admin_broadcast':
         if not is_admin(user_id):
             await query.edit_message_text('⛔ Дія доступна лише адміністратору.')
@@ -4120,7 +4237,9 @@ async def save_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     query = update.callback_query
     user_id = str(update.effective_user.id)
     if not await has_access(user_id):
-        await query.edit_message_text(_paywall_bot_text(), disable_web_page_preview=True)
+        await query.edit_message_text(
+            _paywall_bot_text(), reply_markup=_paywall_bot_markup(),
+            disable_web_page_preview=True)
         return
     settings = await user_settings_for(user_id)
 
@@ -4460,7 +4579,9 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
 
     if transaction:
         if not await has_access(user_id):
-            await update.message.reply_text(_paywall_bot_text(), disable_web_page_preview=True)
+            await update.message.reply_text(
+                _paywall_bot_text(), reply_markup=_paywall_bot_markup(),
+                disable_web_page_preview=True)
             return
         try:
             rate = await get_exchange_rate(transaction['currency'])
@@ -5700,12 +5821,20 @@ async def api_health(request: web.Request):
 async def api_me(request: web.Request):
     tg_user = request['tg_user']
     uid = request['user_id']
+    status = await subscription_status(uid)
     return _json_response({
         'id': uid,
         'username': tg_user.get('username'),
         'first_name': tg_user.get('first_name'),
         'last_name': tg_user.get('last_name'),
         'is_admin': uid in ADMIN_IDS,
+        'subscription': {
+            'state': status['state'],
+            'days_left': status['days_left'],
+            'price': status['price'],
+            'jar_url': status['jar_url'],
+            'paywall_enabled': status['paywall_enabled'],
+        },
     })
 
 
@@ -8561,6 +8690,8 @@ def build_api_app() -> web.Application:
     app.router.add_route('POST', '/api/import/confirm', api_import_confirm)
     app.router.add_route('GET', '/api/import/batches', api_import_batches_list)
     app.router.add_route('DELETE', '/api/import/batches/{id}', api_import_batch_delete)
+    # Monetization (Крок 5) — manual «Я оплатив» claim
+    app.router.add_route('POST', '/api/payment/claim', api_payment_claim)
 
     # Catch-all OPTIONS for CORS preflight on any path
     async def options_handler(_request):
