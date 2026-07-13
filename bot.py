@@ -514,6 +514,110 @@ def _transaction_request_fingerprint(
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _parse_import_amount(raw):
+    """Parse a money string ('1 234,56', '-500.00', '1,234.56') -> float or None."""
+    import re as _re
+    s = str(raw or '').replace(' ', ' ').strip()
+    s = _re.sub(r'[^0-9,.\-+]', '', s)
+    if not s or s in ('-', '+', '.', ','):
+        return None
+    if ',' in s and '.' in s:                      # both present: last is decimal
+        if s.rfind(',') > s.rfind('.'):
+            s = s.replace('.', '').replace(',', '.')
+        else:
+            s = s.replace(',', '')
+    elif ',' in s:                                 # comma decimal (UA)
+        s = s.replace(',', '.')
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _parse_import_date(raw):
+    """Parse common date formats -> 'YYYY-MM-DD' or None."""
+    s = str(raw or '').strip()
+    if not s:
+        return None
+    s = s.replace('T', ' ').split(' ')[0]          # drop any time part
+    for fmt in ('%Y-%m-%d', '%d.%m.%Y', '%d/%m/%Y', '%d-%m-%Y', '%Y/%m/%d', '%d.%m.%y'):
+        try:
+            return datetime.strptime(s, fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    return None
+
+
+def parse_import_csv(text, default_currency='UAH'):
+    """Best-effort parse of a bank-statement CSV -> (rows, errors).
+
+    Each row: {date, type, amount, currency, description, line}. Detection is
+    heuristic (bank formats vary); the Mini App preview lets the user review and
+    correct every row before anything is written.
+    """
+    import csv as _csv, io as _io
+    text = (text or '').strip()
+    if not text:
+        return [], ['Порожній файл.']
+    first = text.splitlines()[0]
+    delim = ';' if first.count(';') > first.count(',') else (
+        '\t' if first.count('\t') > first.count(',') else ',')
+    try:
+        table = list(_csv.reader(_io.StringIO(text), delimiter=delim))
+    except Exception:
+        return [], ['Не вдалося прочитати CSV.']
+    table = [r for r in table if any((c or '').strip() for c in r)]
+    if not table:
+        return [], ['Немає рядків.']
+    header = [(h or '').strip().lower() for h in table[0]]
+
+    def col(*keys):
+        for i, h in enumerate(header):
+            if any(k in h for k in keys):
+                return i
+        return None
+
+    i_date = col('дата', 'date', 'час', 'time')
+    i_amount = col('сума', 'amount', 'сумма')
+    i_debit = col('дебет', 'debit', 'витрат', 'списанн', 'видатк')
+    i_credit = col('кредит', 'credit', 'надходж', 'зарахуванн', 'прибут')
+    i_curr = col('валют', 'currency', 'curr')
+    i_desc = col('опис', 'деталі', 'детали', 'description', 'призначенн',
+                 'контрагент', 'merchant', 'коментар')
+    has_header = any(x is not None for x in (i_date, i_amount, i_debit, i_credit))
+    body = table[1:] if has_header else table
+    rows, errors = [], []
+
+    def cell(r, i):
+        return r[i].strip() if (i is not None and i < len(r)) else ''
+
+    for n, r in enumerate(body, start=1):
+        date = _parse_import_date(cell(r, i_date)) if i_date is not None else None
+        amount = t_type = None
+        if i_amount is not None:
+            amount = _parse_import_amount(cell(r, i_amount))
+            if amount is not None:
+                t_type = 'income' if amount >= 0 else 'expense'
+                amount = abs(amount)
+        elif i_debit is not None or i_credit is not None:
+            deb = _parse_import_amount(cell(r, i_debit)) if i_debit is not None else None
+            cred = _parse_import_amount(cell(r, i_credit)) if i_credit is not None else None
+            if cred:
+                amount, t_type = abs(cred), 'income'
+            elif deb:
+                amount, t_type = abs(deb), 'expense'
+        if amount is None or t_type is None or not date:
+            errors.append(f'Рядок {n}: не вдалося визначити дату/суму — потрібне ручне виправлення.')
+            continue
+        curr = cell(r, i_curr).upper() if i_curr is not None else ''
+        if curr not in ('UAH', 'USD', 'EUR'):
+            curr = default_currency
+        desc = cell(r, i_desc) if i_desc is not None else ''
+        rows.append({'date': date, 'type': t_type, 'amount': round(amount, 2),
+                     'currency': curr, 'description': desc[:200], 'line': n})
+    return rows, errors
+
+
 # Category labels are currently the relationship key. Keep all dependent-table
 # writes in these registries so a future recurring-operations table can join
 # the same atomic rename/delete transaction with one explicit hook.
