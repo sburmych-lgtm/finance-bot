@@ -99,6 +99,10 @@
   --nav-h: 76px;
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
+  /* Telegram fullscreen overlays its own Close / ⋯ controls on top of the app.
+     telegram.js sets this to safeAreaInset.top + contentSafeAreaInset.top so
+     our header clears them; falls back to the OS notch when not fullscreen. */
+  --tg-top-inset: env(safe-area-inset-top, 0px);
 }
 
 /* Light mode is intentionally NOT supported — Ruby Finance is dark-only.

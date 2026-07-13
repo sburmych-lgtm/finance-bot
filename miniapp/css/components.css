@@ -43,7 +43,7 @@ body::before {
 
 /* ── Header ─────────────────────────────────────────────────── */
 .app-header {
-  padding: var(--sp-3) var(--sp-5) var(--sp-2);
+  padding: calc(var(--sp-3) + var(--tg-top-inset)) var(--sp-5) var(--sp-2);
   display: flex; align-items: center; justify-content: space-between;
   gap: var(--sp-3);
 }

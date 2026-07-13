@@ -35,6 +35,26 @@ export const Telegram = {
       if (typeof tg.setBottomBarColor === 'function') {
         try { tg.setBottomBarColor('#0A0608'); } catch (_) {}
       }
+      // Fullscreen mode overlays Telegram's own Close / ⋯ controls on top of the
+      // app, covering our header. Push the header below them using Telegram's
+      // safe-area insets (device notch) + content-safe-area insets (TG controls).
+      const applyInsets = () => {
+        try {
+          const sa = tg.safeAreaInset || {};
+          const csa = tg.contentSafeAreaInset || {};
+          const top = (Number(sa.top) || 0) + (Number(csa.top) || 0);
+          if (top > 0) {
+            document.documentElement.style.setProperty('--tg-top-inset', `${top}px`);
+          }
+        } catch (_) {}
+      };
+      applyInsets();
+      // Insets can arrive slightly after the fullscreen transition — re-apply on
+      // the relevant events (and once shortly after) so the header settles right.
+      ['safeAreaChanged', 'contentSafeAreaChanged', 'fullscreenChanged'].forEach((ev) => {
+        try { tg.onEvent(ev, applyInsets); } catch (_) {}
+      });
+      setTimeout(applyInsets, 300);
     } catch (e) {
       console.warn('Telegram.ready failed', e);
     }
