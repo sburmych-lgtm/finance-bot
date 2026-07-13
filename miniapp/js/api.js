@@ -26,6 +26,10 @@ async function request(path, { method = 'GET', body } = {}) {
         detail: { message: error.message },
       }));
     }
+    if (error.code === 'PAYWALL') {
+      error.paywall = payload.paywall || {};
+      window.dispatchEvent(new CustomEvent('ruby:paywall', { detail: error.paywall }));
+    }
     throw error;
   }
   if (res.status === 204) return null;
@@ -121,4 +125,7 @@ export const Api = {
   importConfirm:     (rows, source)      => request('/api/import/confirm', { method: 'POST', body: { rows, source } }),
   importBatches:     ()                  => request('/api/import/batches'),
   importBatchDelete: (id)                => request(`/api/import/batches/${id}`, { method: 'DELETE' }),
+
+  // Monetization (Крок 5) — manual «Я оплатив» claim
+  paymentClaim:      ()                  => request('/api/payment/claim', { method: 'POST' }),
 };

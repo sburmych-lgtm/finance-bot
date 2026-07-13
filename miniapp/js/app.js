@@ -2,7 +2,7 @@
 
 import { Telegram } from './telegram.js';
 import { Api } from './api.js';
-import { fmtMoney, fmtDate, toast } from './ui.js';
+import { fmtMoney, fmtDate, toast, el } from './ui.js';
 import { renderHome } from './screens/home.js';
 import { renderAdd } from './screens/add.js';
 import { renderReports } from './screens/reports.js';
@@ -66,6 +66,47 @@ export const Store = {
 };
 
 window.Ruby = { Store, Api, Telegram, toast, fmtMoney, fmtDate };
+
+// ── Paywall modal (Крок 5) — shown when a write returns 402 PAYWALL ──
+function showPaywallModal(pw = {}) {
+  const price = pw.price || 199;
+  const jar = pw.jar_url || '';
+  document.getElementById('paywallModal')?.remove();
+
+  const card = el('div', { class: 'paywall-card' },
+    el('div', { class: 'paywall-emoji' }, '🔒'),
+    el('div', { class: 'paywall-title' }, 'Потрібна підписка'),
+    el('div', { class: 'paywall-text' },
+      `Щоб додавати нові операції — ${price} ₴/міс. Переглядати наявні дані та звіти можна й далі, безкоштовно.`),
+    jar ? el('a', { class: 'btn btn-primary paywall-pay', href: jar, target: '_blank', rel: 'noopener' },
+      `💳 Оплатити ${price} ₴`) : null,
+  );
+
+  const paid = el('button', { class: 'btn btn-secondary', type: 'button' }, '✅ Я оплатив');
+  paid.addEventListener('click', async () => {
+    paid.disabled = true;
+    try {
+      const r = await Api.paymentClaim();
+      toast(r?.message || 'Заявку надіслано, очікуйте підтвердження.', 4500);
+      document.getElementById('paywallModal')?.remove();
+    } catch (_) {
+      toast('Не вдалося надіслати заявку. Спробуйте ще раз.');
+      paid.disabled = false;
+    }
+  });
+  card.appendChild(paid);
+
+  const later = el('button', { class: 'btn btn-ghost', type: 'button' }, 'Пізніше');
+  later.addEventListener('click', () => document.getElementById('paywallModal')?.remove());
+  card.appendChild(later);
+
+  const overlay = el('div', { id: 'paywallModal', class: 'paywall-overlay' }, card);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
+  Telegram.haptic('warning');
+}
+
+window.addEventListener('ruby:paywall', (e) => showPaywallModal(e.detail || {}));
 
 let authExpiryShown = false;
 window.addEventListener('ruby:auth-expired', () => {
