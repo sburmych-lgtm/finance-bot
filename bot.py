@@ -2672,6 +2672,55 @@ MAX_TRANSACTION_AMOUNT = Decimal('1000000000')
 CALLBACK_REF_PREFIX = '~'
 
 
+def _md(text):
+    """Escape user-controlled text for Telegram legacy Markdown (parse_mode='Markdown').
+
+    Legacy Markdown treats _ * ` [ as formatting.  An unescaped user value
+    (category name, emoji, employee name) can break rendering or make Telegram
+    reject the whole message — which previously bubbled up and, on retry,
+    double-saved the transaction.  Escaping the four specials neutralises that;
+    ordinary names/emojis contain none of them, so users see no change.
+    """
+    if text is None:
+        return ''
+    out = str(text)
+    for ch in ('_', '*', '`', '['):
+        out = out.replace(ch, '\\' + ch)
+    return out
+
+
+TELEGRAM_MESSAGE_LIMIT = 4096
+
+
+def _split_telegram_text(text, limit=TELEGRAM_MESSAGE_LIMIT):
+    """Split text into chunks each <= limit chars, preferring newline boundaries.
+
+    Telegram rejects any single message over 4096 characters, so a report with
+    many categories must be paginated.  Splitting on newlines keeps each line
+    (and its self-contained **bold** markers) intact; a pathological single
+    line longer than the limit is hard-split as a last resort.
+    """
+    lines = str(text).split('\n')
+    chunks = []
+    current = ''
+    for line in lines:
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ''
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = line if not current else current + '\n' + line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or ['']
+
+
 def _callback_ref(value):
     """Return a deterministic, Telegram-safe opaque reference for user text."""
     digest = hashlib.blake2s(str(value).encode('utf-8'), digest_size=9).hexdigest()
@@ -3502,7 +3551,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cat_emoji = user_time_categories.get(category, {}).get('emoji', '⏱️')
         
         await query.edit_message_text(
-            f"{cat_emoji} **{category}**\n\n"
+            f"{_md(cat_emoji)} **{_md(category)}**\n\n"
             f"⏱️ Скільки хвилин витратили?\n\n"
             f"Приклади:\n"
             f"• `90` — 90 хвилин\n"
@@ -3539,7 +3588,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"⚠️ **ВІДМІНИТИ ОСТАННЮ ТРАНЗАКЦІЮ?**\n\n"
                 f"{emoji} {amount_display}\n"
-                f"{cat_emoji} Категорія: {last['category']}\n"
+                f"{_md(cat_emoji)} Категорія: {_md(last['category'])}\n"
                 f"📅 Дата: {last['date']}\n\n"
                 f"Цю дію неможливо скасувати!",
                 reply_markup=InlineKeyboardMarkup(keyboard),
@@ -3857,7 +3906,7 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
         text = "👥 **ПРАЦІВНИКИ**\n\n"
         text += "Поточний список:\n"
         for i, emp in enumerate(employees, 1):
-            text += f"{i}. {emp}\n"
+            text += f"{i}. {_md(emp)}\n"
         text += "\nНатисніть ❌ щоб видалити або ➕ щоб додати"
 
         await query.edit_message_text(
@@ -4016,7 +4065,7 @@ async def save_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
     response_text = (
         f"{emoji} **Записано!**\n\n"
-        f"{cat_emoji} Категорія: {category}\n"
+        f"{_md(cat_emoji)} Категорія: {_md(category)}\n"
         f"💰 Сума: {amount:.2f} {currency} {currency_symbol}\n"
     )
 
@@ -4094,7 +4143,7 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
         
         response_text = (
             f"⏱️ **Записано!**\n\n"
-            f"{cat_emoji} Категорія: {category}\n"
+            f"{_md(cat_emoji)} Категорія: {_md(category)}\n"
             f"⏰ Час: {minutes} хв"
         )
         
@@ -4337,7 +4386,7 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
 
         response_text = (
             f"{emoji} **Записано!**\n\n"
-            f"{cat_emoji} Категорія: {transaction['category']}\n"
+            f"{_md(cat_emoji)} Категорія: {_md(transaction['category'])}\n"
             f"💰 Сума: {transaction['amount']:.2f} {transaction['currency']} {currency_symbol}\n"
         )
 
@@ -4541,20 +4590,24 @@ async def show_monthly_report(update: Update, context: ContextTypes.DEFAULT_TYPE
         text += "💰 **Доходи:**\n"
         for cat in sorted(income_by_cat.items(), key=lambda x: x[1], reverse=True):
             emoji = settings['categories']['income'].get(cat[0], {}).get('emoji', '📦')
-            text += f"  {emoji} {cat[0]}: {cat[1]:.2f} грн\n"
+            text += f"  {_md(emoji)} {_md(cat[0])}: {cat[1]:.2f} грн\n"
         text += f"  💰 Разом: {total_income:.2f} грн\n\n"
 
     if expenses_by_cat:
         text += "💸 **Витрати:**\n"
         for cat in sorted(expenses_by_cat.items(), key=lambda x: x[1], reverse=True):
             emoji = settings['categories']['expense'].get(cat[0], {}).get('emoji', '📦')
-            text += f"  {emoji} {cat[0]}: {cat[1]:.2f} грн\n"
+            text += f"  {_md(emoji)} {_md(cat[0])}: {cat[1]:.2f} грн\n"
         text += f"  💸 Разом: {total_expense:.2f} грн\n\n"
 
     text += f"━━━━━━━━━━━━━━━━\n"
     text += f"📊 **Баланс:** {total_income - total_expense:.2f} грн"
 
-    await query.edit_message_text(text, parse_mode='Markdown')
+    # Paginate: Telegram rejects any message over 4096 chars (many categories).
+    chunks = _split_telegram_text(text)
+    await query.edit_message_text(chunks[0], parse_mode='Markdown')
+    for chunk in chunks[1:]:
+        await query.message.reply_text(chunk, parse_mode='Markdown')
 
 
 async def show_income_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
