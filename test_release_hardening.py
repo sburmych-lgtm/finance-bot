@@ -466,7 +466,9 @@ def test_user_facing_bot_handle_comes_from_environment(monkeypatch, tmp_path):
 
     run(exercise())
 
-    assert expected in start_message.replies[0]["text"]
+    # The Mini App-first welcome intentionally shows no bot handle (just the
+    # app-open button); it must still never leak the legacy handle.
+    assert "застосунок" in start_message.replies[0]["text"]
     assert expected in info_message.replies[0]["text"]
     assert "@Olesia_money_bot" not in start_message.replies[0]["text"]
     assert "@Olesia_money_bot" not in info_message.replies[0]["text"]

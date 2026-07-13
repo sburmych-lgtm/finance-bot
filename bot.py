@@ -10,7 +10,7 @@ import weakref
 from functools import wraps
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -2937,23 +2937,25 @@ def generate_text_chart(data_dict, total, title, categories_by_type=None):
 
 
 # ========== COMMAND HANDLERS ==========
+def _open_app_keyboard():
+    """A single large button that opens the Mini App directly."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "💎 Відкрити Ruby Finance",
+            web_app=WebAppInfo(url=_miniapp_public_url()),
+        )
+    ]])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
+    """Start command — Mini App-first welcome (no legacy menu/commands)."""
     await db.upsert_user(update.effective_user)
     await update.message.reply_text(
-        f"👋 Привіт! Я бот для обліку фінансів та часу {_bot_handle()}\n\n"
-        "📝 Ви можете:\n"
-        "• Використовувати кнопки меню внизу\n"
-        "• Писати текстом: `100 кава`, `зарплата 30000`\n"
-        "• Валюти: `+50 USD консультація`, `100 EUR`\n"
-        "• Відслідковувати час на активності ⏱️\n\n"
-        "💡 Корисні команди:\n"
-        "• **↩️ Відмінити** — в меню \"📂 Додати\"\n"
-        "• `/settings` — працівники, категорії, податки\n"
-        "• `/info` або кнопка **ℹ️ Інфо** — повна довідка\n\n"
-        "Оберіть дію в меню внизу 👇",
-        reply_markup=get_main_keyboard(),
-        parse_mode='Markdown'
+        "👋 Вітаємо у Ruby Finance!\n\n"
+        "Це ваш особистий застосунок для обліку доходів, витрат, часу "
+        "та податків ФОП — усе зручно й наочно в одному місці.\n\n"
+        "Натисніть кнопку нижче, щоб відкрити застосунок 👇",
+        reply_markup=_open_app_keyboard(),
     )
 
 
