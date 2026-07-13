@@ -861,6 +861,36 @@ class Database:
             except Exception as e:
                 logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
 
+        # 20260713_import_batches
+        #   CSV bank-statement import: each transaction carries an import_batch_id
+        #   so a whole import can be previewed and rolled back atomically.
+        mig = '20260713_import_batches'
+        if not applied(mig):
+            try:
+                cursor.execute("PRAGMA table_info(transactions)")
+                cols = {r[1] for r in cursor.fetchall()}
+                if 'import_batch_id' not in cols:
+                    cursor.execute(
+                        "ALTER TABLE transactions ADD COLUMN import_batch_id INTEGER"
+                    )
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS import_batches (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT NOT NULL,
+                        source TEXT,
+                        row_count INTEGER DEFAULT 0,
+                        created_at TEXT
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_tx_import_batch
+                    ON transactions(user_id, import_batch_id)
+                ''')
+                mark(mig)
+                logger.info(f"Migration {mig}: import_batches ready")
+            except Exception as e:
+                logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
+
         # 20260712_add_client_request_id
         #   Mini App writes can be retried after a timeout or a double tap. A
         #   caller-provided request id makes those retries safe, while scoping
@@ -1041,6 +1071,7 @@ class Database:
             'broadcast_receipts',
             'feature_reactions',
             'feature_comments',
+            'import_batches',
             'transactions',
             'time_tracks',
             'budgets',
@@ -1266,7 +1297,7 @@ class Database:
     async def add_transaction(self, user_id, amount, currency, amount_uah, t_type,
                              category, description, date, timestamp, subcategory=None,
                              client_request_id=None, payment_source=None,
-                             request_fingerprint=None):
+                             request_fingerprint=None, import_batch_id=None):
         """Add transaction to database"""
         async with db_lock:
             cursor = self.conn.cursor()
@@ -1275,18 +1306,64 @@ class Database:
                     INSERT INTO transactions
                     (user_id, amount, currency, amount_uah, type, category,
                      subcategory, description, date, timestamp, client_request_id,
-                     payment_source, request_fingerprint)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     payment_source, request_fingerprint, import_batch_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     user_id, amount, currency, amount_uah, t_type, category,
                     subcategory, description, date, timestamp, client_request_id,
-                    payment_source, request_fingerprint,
+                    payment_source, request_fingerprint, import_batch_id,
                 ))
                 self.conn.commit()
                 return cursor.lastrowid
             except sqlite3.IntegrityError:
                 self.conn.rollback()
                 raise
+
+    # ---- CSV import batches (Block 4) ----
+    async def create_import_batch(self, user_id, source, created_at):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "INSERT INTO import_batches (user_id, source, created_at) VALUES (?, ?, ?)",
+                (str(user_id), str(source)[:80], created_at),
+            )
+            self.conn.commit()
+            return cursor.lastrowid
+
+    async def finalize_import_batch(self, batch_id, row_count):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE import_batches SET row_count=? WHERE id=?",
+                (int(row_count), int(batch_id)),
+            )
+            self.conn.commit()
+
+    async def list_import_batches(self, user_id, limit=50):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT id, source, row_count, created_at FROM import_batches "
+                "WHERE user_id=? ORDER BY id DESC LIMIT ?",
+                (str(user_id), int(limit)),
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    async def rollback_import_batch(self, user_id, batch_id):
+        """Owner-scoped: delete every transaction from one import batch + the batch."""
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "DELETE FROM transactions WHERE user_id=? AND import_batch_id=?",
+                (str(user_id), int(batch_id)),
+            )
+            deleted = cursor.rowcount
+            cursor.execute(
+                "DELETE FROM import_batches WHERE user_id=? AND id=?",
+                (str(user_id), int(batch_id)),
+            )
+            self.conn.commit()
+            return deleted
 
     async def get_transaction_by_client_request_id(
         self, user_id, client_request_id

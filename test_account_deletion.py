@@ -33,6 +33,7 @@ USER_OWNED_TABLES = {
     "broadcast_receipts",
     "feature_reactions",
     "feature_comments",
+    "import_batches",
 }
 
 
@@ -149,6 +150,11 @@ def seed_two_users(database):
                (user_id, comment, created_at)
                VALUES (?, ?, ?)""",
             (user_id, f"comment-{user_id}", "2026-07-12 10:03:00"),
+        )
+        conn.execute(
+            """INSERT INTO import_batches (user_id, source, row_count, created_at)
+               VALUES (?, 'csv', 1, ?)""",
+            (user_id, "2026-07-12 10:04:00"),
         )
 
     conn.commit()
