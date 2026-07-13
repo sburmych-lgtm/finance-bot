@@ -431,6 +431,35 @@ async def has_access(user_id) -> bool:
     status = await subscription_status(user_id, start_trial=True)
     return status['state'] in ('vip', 'trial', 'active')
 
+
+def _paywall_api_response(status):
+    """402 body the Mini App turns into a subscribe screen. Reads stay free —
+    only write endpoints call this."""
+    return _json_response({
+        'detail': 'subscription required',
+        'code': 'PAYWALL',
+        'paywall': {
+            'state': status.get('state'),
+            'price': status.get('price'),
+            'currency': 'UAH',
+            'jar_url': status.get('jar_url'),
+            'trial_days': status.get('trial_days'),
+        },
+    }, status=402)
+
+
+def _paywall_bot_text():
+    """Paywall message for the legacy bot save flows."""
+    price = SUBSCRIPTION_PRICE_UAH
+    jar = PAYMENT_JAR_URL or '(посилання додасться найближчим часом)'
+    return (
+        f"🔒 Тріал завершився.\n\n"
+        f"Щоб додавати нові операції, оформіть підписку — {price} ₴/міс.\n"
+        f"Переглядати наявні дані та звіти можна й далі.\n\n"
+        f"Оплатити 👉 {jar}\n"
+        f"Після оплати натисніть «✅ Я оплатив» у застосунку або напишіть боту."
+    )
+
 # Exchange rate cache
 exchange_rates_cache = {
     'USD': None,
@@ -4090,6 +4119,9 @@ async def save_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     """Save transaction to database"""
     query = update.callback_query
     user_id = str(update.effective_user.id)
+    if not await has_access(user_id):
+        await query.edit_message_text(_paywall_bot_text(), disable_web_page_preview=True)
+        return
     settings = await user_settings_for(user_id)
 
     amount = _parse_positive_money(amount_str)
@@ -4427,6 +4459,9 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
     transaction = parse_transaction(text, user_categories)
 
     if transaction:
+        if not await has_access(user_id):
+            await update.message.reply_text(_paywall_bot_text(), disable_web_page_preview=True)
+            return
         try:
             rate = await get_exchange_rate(transaction['currency'])
         except ExchangeRateUnavailableError:
@@ -5971,6 +6006,9 @@ def _idempotency_conflict_response():
 async def api_post_transaction(request: web.Request):
     user_id = request['user_id']
     tg_user = request['tg_user']
+
+    if not await has_access(user_id):
+        return _paywall_api_response(await subscription_status(user_id))
 
     try:
         body = await request.json()
@@ -8272,6 +8310,8 @@ async def api_import_confirm(request: web.Request):
     but at least one row must be valid or no batch is created (400).
     """
     user_id = request['user_id']
+    if not await has_access(user_id):
+        return _paywall_api_response(await subscription_status(user_id))
     tg_user = request['tg_user']
     try:
         body = await request.json()

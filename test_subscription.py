@@ -91,3 +91,77 @@ def test_price_and_jar_surface_in_status(monkeypatch, tmp_path):
     assert status["price"] == 149
     assert status["jar_url"] == "https://send.monobank.ua/jar/demo"
     assert status["paywall_enabled"] is True
+
+
+# ── API write-gate (POST /api/transactions) ─────────────────────
+import hashlib
+import hmac
+import json
+import time as _time
+from urllib.parse import urlencode
+
+from aiohttp.test_utils import TestClient, TestServer
+
+
+def _auth(token, uid):
+    params = {"auth_date": str(int(_time.time())),
+              "user": json.dumps({"id": uid}, separators=(",", ":"))}
+    check = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
+    secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    params["hash"] = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    return {"X-Telegram-Init-Data": urlencode(params)}
+
+
+_TX = {"type": "expense", "amount": 10, "currency": "UAH",
+       "category": "Інше", "payment_source": "cash"}
+
+
+def test_api_write_gated_402_when_expired(monkeypatch, tmp_path):
+    database = use_db(monkeypatch, tmp_path)
+    token = "gate-token"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
+    flags(monkeypatch, paywall=True)
+    run(database.set_subscription("gated", "trial", "2020-01-01 00:00:00"))  # expired
+
+    async def exercise():
+        async with TestClient(TestServer(bot.build_api_app())) as client:
+            resp = await client.post("/api/transactions",
+                                     headers=_auth(token, "gated"), json=_TX)
+            return resp.status, await resp.json()
+
+    status, body = run(exercise())
+    assert status == 402
+    assert body["code"] == "PAYWALL"
+    assert body["paywall"]["state"] == "expired"
+    assert body["paywall"]["price"] == bot.SUBSCRIPTION_PRICE_UAH
+
+
+def test_api_write_free_when_paywall_off(monkeypatch, tmp_path):
+    database = use_db(monkeypatch, tmp_path)
+    token = "gate-token"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
+    flags(monkeypatch, paywall=False)
+    run(database.set_subscription("gated", "trial", "2020-01-01 00:00:00"))  # expired
+
+    async def exercise():
+        async with TestClient(TestServer(bot.build_api_app())) as client:
+            resp = await client.post("/api/transactions",
+                                     headers=_auth(token, "gated"), json=_TX)
+            return resp.status
+
+    assert run(exercise()) in (200, 201)  # dark → normal write
+
+
+def test_api_write_free_for_vip(monkeypatch, tmp_path):
+    use_db(monkeypatch, tmp_path)
+    token = "gate-token"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
+    flags(monkeypatch, paywall=True, vip={"vipper"})
+
+    async def exercise():
+        async with TestClient(TestServer(bot.build_api_app())) as client:
+            resp = await client.post("/api/transactions",
+                                     headers=_auth(token, "vipper"), json=_TX)
+            return resp.status
+
+    assert run(exercise()) in (200, 201)  # VIP bypass
