@@ -10,6 +10,7 @@ import {
 } from '../privacy.js';
 import { budgetTone, normalizeBudgetResponse } from '../block2-ui.js';
 import { renderDigestSettings, renderRecurringSettings } from './automation.js';
+import { renderImport } from './import.js';
 
 const state = {
   section: 'main',  // main | categories | employees | tax | budgets | recurring | digest | privacy
@@ -88,6 +89,15 @@ function renderMain(root) {
       <div class="row-list">
         <button type="button" class="row row-action" data-go="budgets"><span class="avatar">◎</span>
           <span><span class="row-title">Бюджети витрат</span><span class="row-meta">Ліміти, прогрес і перевитрати</span></span>
+          <span class="row-chevron">›</span></button>
+      </div>
+    </div>
+
+    <div class="setting-section">
+      <div class="section-head"><div class="section-title">Дані</div></div>
+      <div class="row-list">
+        <button type="button" class="row row-action" data-go="import"><span class="avatar">↓</span>
+          <span><span class="row-title">Імпорт виписки</span><span class="row-meta">Завантажити операції з CSV банку</span></span>
           <span class="row-chevron">›</span></button>
       </div>
     </div>
@@ -915,6 +925,7 @@ export function renderSettings(opts = {}) {
     case 'employees':    renderEmployees(root); break;
     case 'tax':          renderTaxSettings(root); break;
     case 'budgets':      renderBudgetsSettings(root); break;
+    case 'import':       renderImport(root, () => { state.section = 'main'; renderSettings(); }); break;
     case 'recurring':    renderRecurringSettings(root, automationBack); break;
     case 'digest':       renderDigestSettings(root, automationBack); break;
     case 'privacy':      renderPrivacy(root); break;

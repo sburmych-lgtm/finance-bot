@@ -114,4 +114,11 @@ export const Api = {
   resetSettings:   ()                    => request('/api/settings',                         { method: 'DELETE' }),
   deleteAccount:   (confirmation)        => request('/api/account',                          { method: 'DELETE', body: { confirmation } }),
   exchangeRates:   ()                    => request('/api/exchange-rates'),
+
+  // CSV import (Block 4) — preview writes nothing; confirm creates one atomic,
+  // rollback-able batch; batches list + per-batch rollback.
+  importPreview:     (csv, currency)     => request('/api/import/preview', { method: 'POST', body: { csv, currency } }),
+  importConfirm:     (rows, source)      => request('/api/import/confirm', { method: 'POST', body: { rows, source } }),
+  importBatches:     ()                  => request('/api/import/batches'),
+  importBatchDelete: (id)                => request(`/api/import/batches/${id}`, { method: 'DELETE' }),
 };

@@ -645,3 +645,28 @@
   opacity: .42;
   box-shadow: none;
 }
+
+/* ── CSV import (Block 4) ─────────────────────────────────────── */
+.import-intro { padding: var(--sp-4); margin-bottom: var(--sp-4); }
+.import-intro-title { font-family: var(--font-display); font-size: var(--fs-17); color: var(--ruby-ivory); margin-bottom: var(--sp-2); }
+.import-intro-text { font-size: var(--fs-13); line-height: 1.5; color: var(--ruby-muted); }
+.import-file-btn { display: flex; justify-content: center; text-align: center; cursor: pointer; }
+.import-textarea { min-height: 120px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: var(--fs-13); resize: vertical; white-space: pre; }
+.import-summary { padding: var(--sp-3) var(--sp-4); margin-bottom: var(--sp-3); font-size: var(--fs-14); color: var(--ruby-ivory); }
+.import-dup-count { color: var(--ruby-warning); }
+.import-errors { margin-top: var(--sp-2); font-size: var(--fs-12); color: var(--ruby-warning); }
+.import-rows { display: flex; flex-direction: column; gap: var(--sp-2); max-height: 46vh; overflow-y: auto; margin-bottom: var(--sp-4); padding-right: 2px; }
+.import-row { display: flex; align-items: flex-start; gap: var(--sp-3); padding: var(--sp-3); border: 1px solid var(--ruby-line-soft); border-radius: 14px; background: rgba(255,255,255,.03); }
+.import-row.is-dup { opacity: .72; border-style: dashed; }
+.import-include { flex: 0 0 auto; width: 22px; height: 22px; min-height: 22px; margin-top: 2px; accent-color: var(--ruby-gold); }
+.import-row-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
+.import-row-top { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-2); }
+.import-date { font-size: var(--fs-12); color: var(--ruby-muted); }
+.import-amount { font-family: var(--font-display); font-size: var(--fs-15); font-variant-numeric: tabular-nums; }
+.import-amount.income { color: var(--ruby-success); }
+.import-amount.expense { color: var(--ruby-danger); }
+.import-desc { font-size: var(--fs-13); color: var(--ruby-ivory); overflow-wrap: anywhere; }
+.badge-dup { display: inline-block; margin-left: var(--sp-1); padding: 1px 7px; border-radius: 999px; font-size: var(--fs-12); background: rgba(212,160,60,.16); color: var(--ruby-warning); white-space: nowrap; }
+.import-cat { min-height: 44px; padding: 8px 12px; font-size: var(--fs-13); }
+.import-actions { display: flex; gap: var(--sp-3); }
+.import-actions .btn { flex: 1 1 0; }
