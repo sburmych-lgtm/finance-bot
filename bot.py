@@ -217,6 +217,17 @@ DB_FILE = os.environ.get('DB_FILE', os.path.join(DATA_DIR, 'finance.db'))
 SETTINGS_FILE = os.environ.get('SETTINGS_FILE', os.path.join(DATA_DIR, 'settings.json'))
 ADMIN_IDS = {x.strip() for x in os.environ.get('ADMIN_IDS', '').split(',') if x.strip()}
 
+# ── Monetization (Крок 5) — everything configurable via env, ships DARK ──
+# PAYWALL_ENABLED gates the whole feature: while False, has_access() returns
+# True for everyone, so deploying this code changes nothing for current users.
+# Flip it on only after PAYMENT_JAR_URL + PRICE_UAH are set in Railway env.
+PAYWALL_ENABLED = os.environ.get('PAYWALL_ENABLED', '').strip().lower() in ('1', 'true', 'yes', 'on')
+VIP_IDS = {x.strip() for x in os.environ.get('VIP_IDS', '').split(',') if x.strip()}
+TRIAL_DAYS = int(os.environ.get('TRIAL_DAYS', '5') or 5)
+SUBSCRIPTION_DAYS = int(os.environ.get('SUBSCRIPTION_DAYS', '30') or 30)
+SUBSCRIPTION_PRICE_UAH = int(os.environ.get('PRICE_UAH', '149') or 149)
+PAYMENT_JAR_URL = os.environ.get('PAYMENT_JAR_URL', '').strip()
+
 
 def _bot_handle():
     raw = (
@@ -351,13 +362,74 @@ def is_admin(user_id) -> bool:
     return str(user_id) in ADMIN_IDS
 
 
+def is_vip(user_id) -> bool:
+    """Free-forever: admins + explicit VIP ids (owner + Olesia)."""
+    return is_admin(user_id) or str(user_id) in VIP_IDS
+
+
+def _sub_now():
+    """Kyiv wall-clock as a naive datetime (subscriptions store naive Kyiv)."""
+    return datetime.now(KYIV_TZ).replace(tzinfo=None)
+
+
+def _parse_sub_dt(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value)[:19], '%Y-%m-%d %H:%M:%S')
+    except (ValueError, TypeError):
+        try:
+            return datetime.strptime(str(value)[:10], '%Y-%m-%d')
+        except (ValueError, TypeError):
+            return None
+
+
+def _days_left(expires, now):
+    return max(0, math.ceil((expires - now).total_seconds() / 86400))
+
+
+async def subscription_status(user_id, *, start_trial=False):
+    """Resolve a user's access state. `start_trial` persists a fresh 5-day trial
+    for a brand-new user (called from the write-gate, not from read/status)."""
+    now = _sub_now()
+    base = {
+        'price': SUBSCRIPTION_PRICE_UAH,
+        'jar_url': PAYMENT_JAR_URL,
+        'paywall_enabled': PAYWALL_ENABLED,
+        'trial_days': TRIAL_DAYS,
+        'subscription_days': SUBSCRIPTION_DAYS,
+    }
+    if is_vip(user_id):
+        return {**base, 'state': 'vip', 'days_left': None, 'expires_at': None}
+    row = await db.get_subscription(user_id)
+    plan = (row or {}).get('plan') or 'free'
+    expires = _parse_sub_dt((row or {}).get('expires_at'))
+    if plan in ('active', 'paid') and expires and expires > now:
+        return {**base, 'state': 'active', 'days_left': _days_left(expires, now),
+                'expires_at': row.get('expires_at')}
+    if plan == 'trial' and expires and expires > now:
+        return {**base, 'state': 'trial', 'days_left': _days_left(expires, now),
+                'expires_at': row.get('expires_at')}
+    if row is None:
+        # Brand-new user — still inside the trial. Persist the anchor only when
+        # this is a gating call (start_trial); a bare status check must not write.
+        expires = now + timedelta(days=TRIAL_DAYS)
+        expires_s = expires.strftime('%Y-%m-%d %H:%M:%S')
+        if start_trial:
+            await db.set_subscription(user_id, 'trial', expires_s)
+        return {**base, 'state': 'trial', 'days_left': TRIAL_DAYS, 'expires_at': expires_s}
+    # Had a trial/subscription that lapsed → expired (read stays free, writes gated).
+    return {**base, 'state': 'expired', 'days_left': 0, 'expires_at': (row or {}).get('expires_at')}
+
+
 async def has_access(user_id) -> bool:
-    """Зараз тримаємо бот у FREE-режимі для всіх. Інфраструктура для майбутнього paywall —
-    адмін без обмежень; пейволу нема, тому решта також пропускається. Коли увімкнемо
-    монетизацію — змінимо False default + перевірка expires_at."""
-    if is_admin(user_id):
+    """Write-gate. Dark by default (PAYWALL_ENABLED off → everyone passes)."""
+    if not PAYWALL_ENABLED:
         return True
-    return True  # FREE for everyone until monetization is turned on
+    if is_vip(user_id):
+        return True
+    status = await subscription_status(user_id, start_trial=True)
+    return status['state'] in ('vip', 'trial', 'active')
 
 # Exchange rate cache
 exchange_rates_cache = {
