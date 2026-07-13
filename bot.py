@@ -1469,6 +1469,39 @@ class Database:
             self.conn.commit()
             return deleted
 
+    async def get_import_batch(self, user_id, batch_id):
+        """Return one owner's import batch, or None (used for 404 + ownership check)."""
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT id, source, row_count, created_at FROM import_batches "
+                "WHERE user_id=? AND id=?",
+                (str(user_id), int(batch_id)),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    async def existing_transaction_keys(self, user_id):
+        """Set of (date, type, amount, currency) keys for duplicate detection.
+
+        Loaded once per preview so each parsed CSV row can be flagged without a
+        per-row query.  Amounts are rounded to kopiykas so 250.5 and 250.50 match.
+        """
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT date, type, amount, currency FROM transactions WHERE user_id=?",
+                (str(user_id),),
+            )
+            keys = set()
+            for r in cursor.fetchall():
+                try:
+                    amount = round(float(r['amount']), 2)
+                except (TypeError, ValueError):
+                    continue
+                keys.add((r['date'], r['type'], amount, (r['currency'] or 'UAH')))
+            return keys
+
     async def get_transaction_by_client_request_id(
         self, user_id, client_request_id
     ):
@@ -8042,6 +8075,226 @@ async def api_admin_feedback(request: web.Request):
     return _json_response(await db.get_feedback_summary())
 
 
+# ========== CSV IMPORT (Block 4) ==========
+MAX_IMPORT_CSV_CHARS = 200_000
+MAX_IMPORT_ROWS = 2000
+
+
+async def api_import_preview(request: web.Request):
+    """Parse an uploaded bank-statement CSV and flag likely duplicates.
+
+    Read-only: never writes a transaction or a batch.  The Mini App renders the
+    parsed rows for review/correction, then calls POST /api/import/confirm.
+    """
+    user_id = request['user_id']
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+    if not isinstance(body, dict):
+        return _json_response({'detail': 'JSON body must be an object'}, status=400)
+
+    raw = body.get('csv')
+    if not isinstance(raw, str) or not raw.strip():
+        return _json_response({'detail': 'csv required (non-empty string)'}, status=400)
+    if len(raw) > MAX_IMPORT_CSV_CHARS:
+        return _json_response(
+            {'detail': f'csv too large (max {MAX_IMPORT_CSV_CHARS} characters)'},
+            status=400,
+        )
+
+    default_currency = str(body.get('currency', 'UAH')).upper()
+    if default_currency not in ('UAH', 'USD', 'EUR'):
+        default_currency = 'UAH'
+
+    rows, errors = parse_import_csv(raw, default_currency=default_currency)
+    if len(rows) > MAX_IMPORT_ROWS:
+        return _json_response(
+            {'detail': f'too many rows (max {MAX_IMPORT_ROWS})'}, status=400
+        )
+
+    existing = await db.existing_transaction_keys(user_id)
+    income = expense = duplicates = 0
+    out = []
+    for r in rows:
+        key = (r['date'], r['type'], round(float(r['amount']), 2), r['currency'])
+        is_dup = key in existing
+        if is_dup:
+            duplicates += 1
+        if r['type'] == 'income':
+            income += 1
+        else:
+            expense += 1
+        out.append({**r, 'duplicate': is_dup, 'category': 'Інше'})
+
+    return _json_response({
+        'rows': out,
+        'errors': errors,
+        'summary': {
+            'total': len(out),
+            'income': income,
+            'expense': expense,
+            'duplicates': duplicates,
+            'errors': len(errors),
+        },
+    })
+
+
+async def api_import_confirm(request: web.Request):
+    """Insert every valid reviewed row as one atomic, rollback-able batch.
+
+    A single bad row is skipped and reported, never aborting the whole import;
+    but at least one row must be valid or no batch is created (400).
+    """
+    user_id = request['user_id']
+    tg_user = request['tg_user']
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+    if not isinstance(body, dict):
+        return _json_response({'detail': 'JSON body must be an object'}, status=400)
+
+    rows = body.get('rows')
+    if not isinstance(rows, list) or not rows:
+        return _json_response({'detail': 'rows required (non-empty array)'}, status=400)
+    if len(rows) > MAX_IMPORT_ROWS:
+        return _json_response(
+            {'detail': f'too many rows (max {MAX_IMPORT_ROWS})'}, status=400
+        )
+
+    source = _clean_text(body.get('source'), max_len=80, default='csv') or 'csv'
+    user_settings = await user_settings_for(user_id)
+    categories = user_settings.get('categories', {})
+
+    prepared = []
+    errors = []
+    for idx, r in enumerate(rows):
+        if not isinstance(r, dict):
+            errors.append({'index': idx, 'detail': 'row must be an object'})
+            continue
+        t_type = r.get('type')
+        if t_type not in ('income', 'expense'):
+            errors.append({'index': idx, 'detail': 'type must be income or expense'})
+            continue
+        raw_amount = r.get('amount')
+        if isinstance(raw_amount, bool) or raw_amount is None:
+            errors.append({'index': idx, 'detail': 'amount required'})
+            continue
+        try:
+            amount = float(raw_amount)
+        except (TypeError, ValueError):
+            errors.append({'index': idx, 'detail': 'amount must be a number'})
+            continue
+        if not math.isfinite(amount) or amount <= 0 or amount > 1_000_000_000:
+            errors.append({'index': idx, 'detail': 'amount out of range'})
+            continue
+        currency = str(r.get('currency', 'UAH')).upper()
+        if currency not in ('UAH', 'USD', 'EUR'):
+            errors.append({'index': idx, 'detail': 'currency must be UAH, USD, or EUR'})
+            continue
+        date_str = str(r.get('date', ''))
+        if not _looks_like_iso_date(date_str):
+            errors.append({'index': idx, 'detail': 'date must be YYYY-MM-DD'})
+            continue
+        category = _clean_text(r.get('category'), max_len=80, default='Інше') or 'Інше'
+        entry = categories.get(t_type, {}).get(category)
+        if not isinstance(entry, dict):
+            errors.append(
+                {'index': idx, 'detail': f'unknown {t_type} category "{category}"'}
+            )
+            continue
+        subcategory = _clean_text(r.get('subcategory'), max_len=80, default='') or None
+        if subcategory and subcategory not in (entry.get('subcategories') or []):
+            errors.append(
+                {'index': idx, 'detail': f'unknown subcategory "{subcategory}"'}
+            )
+            continue
+        payment_source, ps_err = _parse_payment_source(r)
+        if ps_err is not None:
+            errors.append({'index': idx, 'detail': 'invalid payment_source'})
+            continue
+        description = _clean_text(r.get('description'), max_len=200, default='')
+        prepared.append({
+            'amount': amount, 'currency': currency, 't_type': t_type,
+            'category': category, 'subcategory': subcategory,
+            'payment_source': payment_source, 'description': description,
+            'date': date_str,
+        })
+
+    if not prepared:
+        return _json_response(
+            {'detail': 'no valid rows to import', 'errors': errors}, status=400
+        )
+
+    # Convert currencies once per currency (rates are cached; UAH is a no-op).
+    rate_cache = {}
+    for p in prepared:
+        cur = p['currency']
+        if cur not in rate_cache:
+            try:
+                rate_cache[cur] = await get_exchange_rate(cur)
+            except ExchangeRateUnavailableError:
+                return _exchange_rate_unavailable_response()
+        p['amount_uah'] = round(convert_to_uah(p['amount'], cur, rate_cache[cur]), 2)
+
+    batch_id = await db.create_import_batch(
+        user_id, source, datetime.now(KYIV_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    )
+    await db.upsert_user(_UserObj(tg_user))
+    imported = 0
+    for p in prepared:
+        ts = f"{p['date']} 12:00:00"
+        try:
+            await db.add_transaction(
+                user_id, p['amount'], p['currency'], p['amount_uah'],
+                p['t_type'], p['category'], p['description'], p['date'], ts,
+                subcategory=p['subcategory'], payment_source=p['payment_source'],
+                import_batch_id=batch_id,
+            )
+            imported += 1
+        except Exception as exc:
+            errors.append({'detail': f'insert failed: {type(exc).__name__}'})
+    await db.finalize_import_batch(batch_id, imported)
+
+    logger.info(
+        f"API import confirm user={user_id} batch={batch_id} "
+        f"imported={imported} skipped={len(rows) - imported}"
+    )
+    return _json_response({
+        'ok': True,
+        'batch_id': batch_id,
+        'imported': imported,
+        'skipped': len(rows) - imported,
+        'errors': errors,
+    })
+
+
+async def api_import_batches_list(request: web.Request):
+    """List one owner's import batches, newest first."""
+    user_id = request['user_id']
+    batches = await db.list_import_batches(user_id)
+    return _json_response({'batches': batches})
+
+
+async def api_import_batch_delete(request: web.Request):
+    """Roll one owner's import batch back: delete its transactions + the batch."""
+    user_id = request['user_id']
+    raw_id = request.match_info.get('id', '')
+    try:
+        batch_id = int(raw_id)
+    except (TypeError, ValueError):
+        return _json_response({'detail': 'invalid batch id'}, status=400)
+    batch = await db.get_import_batch(user_id, batch_id)
+    if batch is None:
+        return _json_response({'detail': 'batch not found'}, status=404)
+    deleted = await db.rollback_import_batch(user_id, batch_id)
+    logger.info(
+        f"API import rollback user={user_id} batch={batch_id} deleted={deleted}"
+    )
+    return _json_response({'ok': True, 'deleted_transactions': deleted})
+
+
 def build_api_app() -> web.Application:
     """Build and return the aiohttp API application."""
     # Order matters: json_errors first (catches everything else), then CORS
@@ -8138,6 +8391,11 @@ def build_api_app() -> web.Application:
     app.router.add_route('GET', '/api/admin/audit', api_admin_audit)
     app.router.add_route('GET', '/api/admin/users', api_admin_users)
     app.router.add_route('GET', '/api/admin/feedback', api_admin_feedback)
+    # CSV import (Block 4) — owner-scoped preview/confirm/list/rollback
+    app.router.add_route('POST', '/api/import/preview', api_import_preview)
+    app.router.add_route('POST', '/api/import/confirm', api_import_confirm)
+    app.router.add_route('GET', '/api/import/batches', api_import_batches_list)
+    app.router.add_route('DELETE', '/api/import/batches/{id}', api_import_batch_delete)
 
     # Catch-all OPTIONS for CORS preflight on any path
     async def options_handler(_request):
