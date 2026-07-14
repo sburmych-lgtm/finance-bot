@@ -226,7 +226,7 @@ VIP_IDS = {x.strip() for x in os.environ.get('VIP_IDS', '').split(',') if x.stri
 # Admins are VIP (paywall-exempt) by default. Set ADMIN_IS_VIP=0 to let an admin
 # hit the paywall too (keeps confirm powers) — handy for self-testing payments.
 ADMIN_IS_VIP = os.environ.get('ADMIN_IS_VIP', '1').strip().lower() not in ('0', 'false', 'no', 'off')
-TRIAL_DAYS = int(os.environ.get('TRIAL_DAYS', '5') or 5)
+TRIAL_DAYS = int(os.environ.get('TRIAL_DAYS', '7') or 7)
 SUBSCRIPTION_DAYS = int(os.environ.get('SUBSCRIPTION_DAYS', '30') or 30)
 SUBSCRIPTION_PRICE_UAH = int(os.environ.get('PRICE_UAH', '199') or 199)
 PAYMENT_JAR_URL = os.environ.get('PAYMENT_JAR_URL', '').strip()
@@ -391,9 +391,14 @@ def _days_left(expires, now):
     return max(0, math.ceil((expires - now).total_seconds() / 86400))
 
 
-async def subscription_status(user_id, *, start_trial=False):
-    """Resolve a user's access state. `start_trial` persists a fresh 5-day trial
-    for a brand-new user (called from the write-gate, not from read/status)."""
+async def subscription_status(user_id):
+    """Resolve access state (reads never write). States:
+      vip      — free-forever (admin/VIP)
+      active   — paid, not expired
+      trial    — free trial running
+      new      — no record yet → gated, but eligible for the one-time free trial
+      expired  — trial/sub used up → gated, must subscribe (trial no longer offered)
+    """
     now = _sub_now()
     base = {
         'price': SUBSCRIPTION_PRICE_UAH,
@@ -403,39 +408,44 @@ async def subscription_status(user_id, *, start_trial=False):
         'subscription_days': SUBSCRIPTION_DAYS,
     }
     if is_vip(user_id):
-        return {**base, 'state': 'vip', 'days_left': None, 'expires_at': None}
+        return {**base, 'state': 'vip', 'days_left': None, 'trial_eligible': False, 'expires_at': None}
     row = await db.get_subscription(user_id)
-    plan = (row or {}).get('plan') or 'free'
-    expires = _parse_sub_dt((row or {}).get('expires_at'))
+    if row is None:
+        # Never subscribed and never used the trial → offer the free trial.
+        return {**base, 'state': 'new', 'days_left': 0,
+                'trial_eligible': TRIAL_DAYS > 0, 'expires_at': None}
+    plan = row.get('plan') or 'free'
+    expires = _parse_sub_dt(row.get('expires_at'))
     if plan in ('active', 'paid') and expires and expires > now:
         return {**base, 'state': 'active', 'days_left': _days_left(expires, now),
-                'expires_at': row.get('expires_at')}
+                'trial_eligible': False, 'expires_at': row.get('expires_at')}
     if plan == 'trial' and expires and expires > now:
         return {**base, 'state': 'trial', 'days_left': _days_left(expires, now),
-                'expires_at': row.get('expires_at')}
-    if row is None:
-        # TRIAL_DAYS<=0 → no trial: a brand-new user must pay immediately.
-        if TRIAL_DAYS <= 0:
-            return {**base, 'state': 'expired', 'days_left': 0, 'expires_at': None}
-        # Brand-new user — still inside the trial. Persist the anchor only when
-        # this is a gating call (start_trial); a bare status check must not write.
-        expires = now + timedelta(days=TRIAL_DAYS)
-        expires_s = expires.strftime('%Y-%m-%d %H:%M:%S')
-        if start_trial:
-            await db.set_subscription(user_id, 'trial', expires_s)
-        return {**base, 'state': 'trial', 'days_left': TRIAL_DAYS, 'expires_at': expires_s}
-    # Had a trial/subscription that lapsed → expired (read stays free, writes gated).
-    return {**base, 'state': 'expired', 'days_left': 0, 'expires_at': (row or {}).get('expires_at')}
+                'trial_eligible': False, 'expires_at': row.get('expires_at')}
+    # A trial/subscription that lapsed → expired; the trial was already used.
+    return {**base, 'state': 'expired', 'days_left': 0,
+            'trial_eligible': False, 'expires_at': row.get('expires_at')}
 
 
 async def has_access(user_id) -> bool:
-    """Write-gate. Dark by default (PAYWALL_ENABLED off → everyone passes)."""
+    """Write-gate. Dark by default. 'new' and 'expired' are gated."""
     if not PAYWALL_ENABLED:
         return True
     if is_vip(user_id):
         return True
-    status = await subscription_status(user_id, start_trial=True)
+    status = await subscription_status(user_id)
     return status['state'] in ('vip', 'trial', 'active')
+
+
+async def start_free_trial(user_id):
+    """Start the one-time free trial for an eligible user. Returns the new status,
+    or None if the trial isn't available (already used / disabled)."""
+    status = await subscription_status(user_id)
+    if not status.get('trial_eligible'):
+        return None
+    expires = (_sub_now() + timedelta(days=TRIAL_DAYS)).strftime('%Y-%m-%d %H:%M:%S')
+    await db.set_subscription(user_id, 'trial', expires)
+    return await subscription_status(user_id)
 
 
 def _paywall_api_response(status):
@@ -450,25 +460,31 @@ def _paywall_api_response(status):
             'currency': 'UAH',
             'jar_url': status.get('jar_url'),
             'trial_days': status.get('trial_days'),
+            'trial_eligible': status.get('trial_eligible', False),
         },
     }, status=402)
 
 
-def _paywall_bot_text():
-    """Paywall message for the legacy bot save flows (neutral: works with or
-    without a trial)."""
+def _paywall_bot_text(status=None):
+    """Paywall message for the legacy bot save flows."""
     price = SUBSCRIPTION_PRICE_UAH
     jar = PAYMENT_JAR_URL or '(посилання на оплату додасться найближчим часом)'
-    return (
-        f"🔒 Щоб додавати операції, потрібна підписка — {price} ₴/міс.\n"
-        f"Переглядати наявні дані та звіти можна й далі, безкоштовно.\n\n"
-        f"Оплатити на банку 👇\n{jar}\n\n"
-        f"Після оплати натисніть «✅ Я оплатив» — ми перевіримо й активуємо."
-    )
+    eligible = bool((status or {}).get('trial_eligible'))
+    lines = ["🔒 Щоб додавати операції, потрібен доступ.",
+             "Переглядати наявні дані та звіти можна й далі, безкоштовно.\n"]
+    if eligible:
+        lines.append(f"🎁 Спробуйте безкоштовно {TRIAL_DAYS} днів — або оформіть підписку {price} ₴/міс.")
+    else:
+        lines.append(f"Оформіть підписку — {price} ₴/міс.")
+    lines.append(f"\nОплата на банку 👇\n{jar}\nПісля оплати натисніть «✅ Я оплатив».")
+    return "\n".join(lines)
 
 
-def _paywall_bot_markup():
+def _paywall_bot_markup(status=None):
     rows = []
+    if bool((status or {}).get('trial_eligible')):
+        rows.append([InlineKeyboardButton(
+            f'🎁 Спробувати безкоштовно {TRIAL_DAYS} днів', callback_data='trial:start')])
     try:
         url = _miniapp_public_url()
         if url:
@@ -547,6 +563,18 @@ async def api_payment_claim(request: web.Request):
     return _json_response({
         'ok': True, 'admins_notified': notified,
         'message': 'Дякуємо! Заявку надіслано, очікуйте підтвердження.',
+    })
+
+
+async def api_trial_start(request: web.Request):
+    """User opts into the one-time free trial from the paywall."""
+    result = await start_free_trial(request['user_id'])
+    if result is None:
+        return _json_response(
+            {'detail': 'trial not available', 'code': 'TRIAL_USED'}, status=409)
+    return _json_response({
+        'ok': True, 'state': result['state'], 'days_left': result['days_left'],
+        'message': f'Активовано безкоштовний період на {result["days_left"]} днів.',
     })
 
 
@@ -3692,6 +3720,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = data_parts[0]
     user_id = str(query.from_user.id)
 
+    if action == 'trial':
+        result = await start_free_trial(user_id)
+        if result is None:
+            await query.edit_message_text(
+                'Безкоштовний період уже використано. Щоб продовжити — оформіть підписку.')
+        else:
+            await query.edit_message_text(
+                f'🎁 Готово! Активовано безкоштовний період на {result["days_left"]} днів.\n'
+                f'Тепер можна додавати операції. Приємного користування 💛')
+        return
+
     if action == 'paysub':
         sub = data_parts[1] if len(data_parts) > 1 else ''
         if sub == 'claim':
@@ -4274,8 +4313,9 @@ async def save_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     query = update.callback_query
     user_id = str(update.effective_user.id)
     if not await has_access(user_id):
+        _st = await subscription_status(user_id)
         await query.edit_message_text(
-            _paywall_bot_text(), reply_markup=_paywall_bot_markup(),
+            _paywall_bot_text(_st), reply_markup=_paywall_bot_markup(_st),
             disable_web_page_preview=True)
         return
     settings = await user_settings_for(user_id)
@@ -4616,8 +4656,9 @@ async def handle_text_transaction(update: Update, context: ContextTypes.DEFAULT_
 
     if transaction:
         if not await has_access(user_id):
+            _st = await subscription_status(user_id)
             await update.message.reply_text(
-                _paywall_bot_text(), reply_markup=_paywall_bot_markup(),
+                _paywall_bot_text(_st), reply_markup=_paywall_bot_markup(_st),
                 disable_web_page_preview=True)
             return
         try:
@@ -5871,6 +5912,8 @@ async def api_me(request: web.Request):
             'price': status['price'],
             'jar_url': status['jar_url'],
             'paywall_enabled': status['paywall_enabled'],
+            'trial_eligible': status.get('trial_eligible', False),
+            'trial_days': status.get('trial_days'),
         },
     })
 
@@ -8727,7 +8770,8 @@ def build_api_app() -> web.Application:
     app.router.add_route('POST', '/api/import/confirm', api_import_confirm)
     app.router.add_route('GET', '/api/import/batches', api_import_batches_list)
     app.router.add_route('DELETE', '/api/import/batches/{id}', api_import_batch_delete)
-    # Monetization (Крок 5) — manual «Я оплатив» claim + admin subscription tool
+    # Monetization (Крок 5) — free-trial opt-in, «Я оплатив» claim, admin tool
+    app.router.add_route('POST', '/api/trial/start', api_trial_start)
     app.router.add_route('POST', '/api/payment/claim', api_payment_claim)
     app.router.add_route('POST', '/api/admin/subscription', api_admin_subscription)
 

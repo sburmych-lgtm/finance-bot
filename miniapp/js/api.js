@@ -126,6 +126,7 @@ export const Api = {
   importBatches:     ()                  => request('/api/import/batches'),
   importBatchDelete: (id)                => request(`/api/import/batches/${id}`, { method: 'DELETE' }),
 
-  // Monetization (Крок 5) — manual «Я оплатив» claim
+  // Monetization (Крок 5) — free trial opt-in + manual «Я оплатив» claim
+  trialStart:        ()                  => request('/api/trial/start', { method: 'POST' }),
   paymentClaim:      ()                  => request('/api/payment/claim', { method: 'POST' }),
 };

@@ -169,6 +169,8 @@ def test_me_returns_verified_profile_admin_flag_and_registers_user(monkeypatch, 
             "price": bot.SUBSCRIPTION_PRICE_UAH,
             "jar_url": bot.PAYMENT_JAR_URL,
             "paywall_enabled": bot.PAYWALL_ENABLED,
+            "trial_eligible": False,
+            "trial_days": bot.TRIAL_DAYS,
         },
     }
     assert [(user["user_id"], user["username"]) for user in users] == [("42", "olesia")]

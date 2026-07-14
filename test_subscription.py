@@ -46,14 +46,20 @@ def test_vip_and_admin_free_forever(monkeypatch, tmp_path):
     assert run(bot.subscription_status("963610407"))["state"] == "vip"
 
 
-def test_new_user_gets_trial(monkeypatch, tmp_path):
+def test_new_user_gated_but_can_opt_into_trial(monkeypatch, tmp_path):
     use_db(monkeypatch, tmp_path)
     flags(monkeypatch, paywall=True)
-    # first gated action → access granted + trial persisted
+    monkeypatch.setattr(bot, "TRIAL_DAYS", 7)
+    # new user is gated (no auto-trial) but eligible to start one
+    assert run(bot.has_access("newbie")) is False
+    st = run(bot.subscription_status("newbie"))
+    assert st["state"] == "new" and st["trial_eligible"] is True
+    # opt in → trial starts, access granted
+    started = run(bot.start_free_trial("newbie"))
+    assert started["state"] == "trial" and started["days_left"] == 7
     assert run(bot.has_access("newbie")) is True
-    status = run(bot.subscription_status("newbie"))
-    assert status["state"] == "trial"
-    assert 0 < status["days_left"] <= 5
+    # trial is one-time: not eligible again
+    assert run(bot.start_free_trial("newbie")) is None
 
 
 def test_lapsed_trial_loses_write_access(monkeypatch, tmp_path):
@@ -74,11 +80,11 @@ def test_paid_subscription_restores_access(monkeypatch, tmp_path):
     assert run(bot.subscription_status("payer"))["state"] == "active"
 
 
-def test_status_check_does_not_start_trial(monkeypatch, tmp_path):
+def test_status_check_never_writes(monkeypatch, tmp_path):
     database = use_db(monkeypatch, tmp_path)
     flags(monkeypatch, paywall=True)
-    # a bare status read reports trial but must NOT persist a row
-    assert run(bot.subscription_status("reader"))["state"] == "trial"
+    # a bare status read reports 'new' but must NOT persist a row
+    assert run(bot.subscription_status("reader"))["state"] == "new"
     assert run(database.get_subscription("reader")) is None
 
 
@@ -206,9 +212,9 @@ def test_admin_paywalled_when_admin_is_vip_off_but_keeps_admin(monkeypatch, tmp_
     flags(monkeypatch, paywall=True, admins={"boss"})
     monkeypatch.setattr(bot, "TRIAL_DAYS", 0)
     monkeypatch.setattr(bot, "ADMIN_IS_VIP", False)
-    # admin no longer VIP → hits the paywall
+    # admin no longer VIP → hits the paywall (no record yet → 'new')
     assert run(bot.has_access("boss")) is False
-    assert run(bot.subscription_status("boss"))["state"] == "expired"
+    assert run(bot.subscription_status("boss"))["state"] == "new"
     # but keeps admin powers (can confirm payments)
     assert bot.is_admin("boss") is True
     # flip back → admin is VIP again
@@ -240,6 +246,6 @@ def test_admin_subscription_reset_expire_and_guard(monkeypatch, tmp_path):
 
     status, reset_body, exp_body, forbid = run(exercise())
     assert status == 200
-    assert reset_body["state"] == "trial" and reset_body["days_left"] == 5
-    assert exp_body["state"] == "expired"
+    assert reset_body["state"] == "new"       # reset → fresh, trial-eligible again
+    assert exp_body["state"] == "expired"     # expire → paywall (trial used)
     assert forbid == 403

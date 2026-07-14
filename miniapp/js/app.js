@@ -71,18 +71,45 @@ window.Ruby = { Store, Api, Telegram, toast, fmtMoney, fmtDate };
 function showPaywallModal(pw = {}) {
   const price = pw.price || 199;
   const jar = pw.jar_url || '';
+  const trialDays = pw.trial_days || 7;
+  const eligible = !!pw.trial_eligible;
   document.getElementById('paywallModal')?.remove();
 
-  const card = el('div', { class: 'paywall-card' },
-    el('div', { class: 'paywall-emoji' }, '🔒'),
-    el('div', { class: 'paywall-title' }, 'Потрібна підписка'),
-    el('div', { class: 'paywall-text' },
-      `Щоб додавати нові операції — ${price} ₴/міс. Переглядати наявні дані та звіти можна й далі, безкоштовно.`),
-    jar ? el('a', { class: 'btn btn-primary paywall-pay', href: jar, target: '_blank', rel: 'noopener' },
-      `💳 Оплатити ${price} ₴`) : null,
-  );
+  const card = el('div', { class: 'paywall-card' });
+  card.appendChild(el('div', { class: 'paywall-emoji' }, eligible ? '🎁' : '🔒'));
+  card.appendChild(el('div', { class: 'paywall-title' },
+    eligible ? 'Як продовжити?' : 'Потрібна підписка'));
+  card.appendChild(el('div', { class: 'paywall-text' }, eligible
+    ? `Спробуйте безкоштовно ${trialDays} днів або оформіть підписку ${price} ₴/міс. Переглядати дані та звіти можна безкоштовно.`
+    : `Щоб додавати операції — ${price} ₴/міс. Переглядати дані та звіти можна безкоштовно.`));
 
-  const paid = el('button', { class: 'btn btn-secondary', type: 'button' }, '✅ Я оплатив');
+  if (eligible) {
+    const trialBtn = el('button', { class: 'btn btn-primary', type: 'button' },
+      `🎁 Спробувати безкоштовно ${trialDays} днів`);
+    trialBtn.addEventListener('click', async () => {
+      trialBtn.disabled = true;
+      try {
+        const r = await Api.trialStart();
+        Telegram.haptic('success');
+        toast(r?.message || `Активовано ${trialDays} днів безкоштовно!`, 4000);
+        document.getElementById('paywallModal')?.remove();
+        await Store.hydrate();
+      } catch (_) {
+        toast('Не вдалося активувати. Спробуйте ще раз.');
+        trialBtn.disabled = false;
+      }
+    });
+    card.appendChild(trialBtn);
+  }
+
+  if (jar) {
+    card.appendChild(el('a', {
+      class: `btn ${eligible ? 'btn-secondary' : 'btn-primary'} paywall-pay`,
+      href: jar, target: '_blank', rel: 'noopener',
+    }, `💳 Оформити підписку ${price} ₴`));
+  }
+
+  const paid = el('button', { class: 'btn btn-ghost', type: 'button' }, '✅ Я оплатив');
   paid.addEventListener('click', async () => {
     paid.disabled = true;
     try {
