@@ -97,7 +97,7 @@ function renderMain(root) {
       <div class="section-head"><div class="section-title">Дані</div></div>
       <div class="row-list">
         <button type="button" class="row row-action" data-go="import"><span class="avatar">↓</span>
-          <span><span class="row-title">Імпорт виписки</span><span class="row-meta">Завантажити операції з CSV банку</span></span>
+          <span><span class="row-title">Імпорт виписки</span><span class="row-meta">Завантажити операції з банку</span></span>
           <span class="row-chevron">›</span></button>
       </div>
     </div>
