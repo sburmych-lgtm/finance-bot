@@ -21,7 +21,7 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: placeholder:test
       ADMIN_IDS: ""
-      DATA_DIR: ${{ runner.temp }}/ruby-finance
+      DATA_DIR: /tmp/ruby-finance
 
     steps:
       - name: Check out repository

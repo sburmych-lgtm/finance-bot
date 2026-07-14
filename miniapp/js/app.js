@@ -127,6 +127,11 @@ function showPaywallModal(pw = {}) {
   later.addEventListener('click', () => document.getElementById('paywallModal')?.remove());
   card.appendChild(later);
 
+  card.appendChild(el('div', { class: 'paywall-legal' },
+    'Оформлюючи підписку, ви приймаєте ',
+    el('a', { href: '/offer', target: '_blank', rel: 'noopener noreferrer' }, 'Публічну оферту'),
+    '.'));
+
   const overlay = el('div', { id: 'paywallModal', class: 'paywall-overlay' }, card);
   overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
   document.body.appendChild(overlay);

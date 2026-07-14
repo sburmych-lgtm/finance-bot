@@ -230,6 +230,7 @@ TRIAL_DAYS = int(os.environ.get('TRIAL_DAYS', '7') or 7)
 SUBSCRIPTION_DAYS = int(os.environ.get('SUBSCRIPTION_DAYS', '30') or 30)
 SUBSCRIPTION_PRICE_UAH = int(os.environ.get('PRICE_UAH', '199') or 199)
 PAYMENT_JAR_URL = os.environ.get('PAYMENT_JAR_URL', '').strip()
+SUPPORT_CONTACT = os.environ.get('SUPPORT_CONTACT', 'sburmych@gmail.com').strip()
 
 
 def _bot_handle():
@@ -477,6 +478,7 @@ def _paywall_bot_text(status=None):
     else:
         lines.append(f"Оформіть підписку — {price} ₴/міс.")
     lines.append(f"\nОплата на банку 👇\n{jar}\nПісля оплати натисніть «✅ Я оплатив».")
+    lines.append("\nОформлюючи підписку, ви приймаєте Публічну оферту (/offer). Питання щодо оплати — /paysupport.")
     return "\n".join(lines)
 
 
@@ -666,8 +668,10 @@ def current_tax_rules_year(*, now: datetime | None = None) -> int:
 
 CURRENT_TAX_RULES_YEAR = current_tax_rules_year()
 TAX_DISCLAIMER = (
-    'Розрахунок інформаційний і не є податковою консультацією. '
-    'ПДВ та спеціальні пільги автоматично не розраховуються.'
+    'Розрахунок орієнтовний та інформаційний — це не податкова консультація. '
+    'ПДВ і спеціальні пільги автоматично не враховуються. '
+    'Ви самі відповідаєте за звітність і сплату податків; перед подачею '
+    'звірте суми в ДПС або з бухгалтером.'
 )
 
 
@@ -3605,6 +3609,29 @@ async def terms_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         '📄 Умови використання Ruby Finance:\n'
         f'{_miniapp_public_url("terms")}'
+    )
+
+
+async def offer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        '📄 Публічна оферта Ruby Finance:\n'
+        f'{_miniapp_public_url("offer")}'
+    )
+
+
+async def paysupport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram-expected support entry point for paid users."""
+    price = SUBSCRIPTION_PRICE_UAH
+    contact = SUPPORT_CONTACT or 'адміністратор бота'
+    await update.message.reply_text(
+        '💳 Підтримка з оплати Ruby Finance\n\n'
+        f'Підписка — {price} ₴ за 30 днів доступу. Оплата переказом на банку, '
+        'після чого ви натискаєте «✅ Я оплатив», а ми підтверджуємо доступ вручну.\n\n'
+        '• Оплатили, але немає доступу? Напишіть нам — перевіримо надходження й активуємо.\n'
+        '• Потрібне повернення? Протягом 14 днів з дати оплати повертаємо кошти, '
+        'якщо сервіс не підійшов.\n\n'
+        f'Умови повернення — у Публічній оферті:\n{_miniapp_public_url("offer")}\n\n'
+        f'Звертайтеся: {contact}'
     )
 
 
@@ -8992,6 +9019,8 @@ def main():
     application.add_handler(CommandHandler("settings", show_settings))
     application.add_handler(CommandHandler("privacy", privacy_command))
     application.add_handler(CommandHandler("terms", terms_command))
+    application.add_handler(CommandHandler("offer", offer_command))
+    application.add_handler(CommandHandler("paysupport", paysupport_command))
     application.add_handler(CommandHandler("clear", clear_account_command))
     application.add_handler(CommandHandler("admin_stats", admin_stats))
     application.add_handler(CommandHandler("stats", admin_stats))  # short alias

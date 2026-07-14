@@ -794,6 +794,7 @@ function renderPrivacy(root) {
       <div class="legal-links" aria-label="Юридичні документи">
         <a href="/privacy" target="_blank" rel="noopener noreferrer">Політика приватності</a>
         <a href="/terms" target="_blank" rel="noopener noreferrer">Умови користування</a>
+        <a href="/offer" target="_blank" rel="noopener noreferrer">Публічна оферта</a>
       </div>
     </div>
     <div class="panel" style="padding: var(--sp-4); margin-top: var(--sp-3);">

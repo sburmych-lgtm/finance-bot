@@ -224,6 +224,10 @@ async def terms(request: web.Request) -> web.Response:
     return _legal_document('terms.html', request['csp_nonce'])
 
 
+async def offer(request: web.Request) -> web.Response:
+    return _legal_document('offer.html', request['csp_nonce'])
+
+
 async def favicon(_request: web.Request) -> web.Response:
     return web.Response(status=204)
 
@@ -263,6 +267,8 @@ def build_app() -> web.Application:
     app.router.add_get('/privacy.html', privacy)
     app.router.add_get('/terms', terms)
     app.router.add_get('/terms.html', terms)
+    app.router.add_get('/offer', offer)
+    app.router.add_get('/offer.html', offer)
     app.router.add_get('/favicon.ico', favicon)
     app.router.add_get('/health', health)
     # JS — through the rewriter so internal imports are also versioned

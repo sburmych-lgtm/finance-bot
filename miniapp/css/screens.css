@@ -690,6 +690,8 @@
 .paywall-text { font-size: var(--fs-13); line-height: 1.5; color: var(--ruby-muted); margin-bottom: var(--sp-2); }
 .paywall-card .btn { width: 100%; }
 .paywall-pay { text-decoration: none; display: flex; align-items: center; justify-content: center; }
+.paywall-legal { font-size: 11px; line-height: 1.4; color: var(--ruby-muted); margin-top: var(--sp-1); }
+.paywall-legal a { color: var(--ruby-gold, #C6A15B); text-decoration: underline; }
 
 /* ── Subscription banner (Крок 5) ─────────────────────────────── */
 .sub-banner { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); margin-bottom: var(--sp-4); border-radius: 14px; border: 1px solid var(--ruby-line); background: rgba(255,255,255,.04); }
