@@ -121,7 +121,7 @@ export const Api = {
 
   // CSV import (Block 4) — preview writes nothing; confirm creates one atomic,
   // rollback-able batch; batches list + per-batch rollback.
-  importPreview:     (csv, currency)     => request('/api/import/preview', { method: 'POST', body: { csv, currency } }),
+  importPreview:     (payload)           => request('/api/import/preview', { method: 'POST', body: payload }),
   importConfirm:     (rows, source)      => request('/api/import/confirm', { method: 'POST', body: { rows, source } }),
   importBatches:     ()                  => request('/api/import/batches'),
   importBatchDelete: (id)                => request(`/api/import/batches/${id}`, { method: 'DELETE' }),

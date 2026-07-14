@@ -863,6 +863,89 @@ def parse_import_csv(text, default_currency='UAH'):
     return rows, errors
 
 
+def parse_import_pdf(pdf_bytes, default_currency='UAH'):
+    """Best-effort parse of a bank-statement PDF -> (rows, errors).
+
+    Extracts bordered tables (pdfplumber), maps columns by Ukrainian header
+    keywords (Дата/час, Напрям, Опис, Сума операції, Валюта) and yields the same
+    {date,type,amount,currency,description,line} rows as the CSV parser. Tuned on
+    Ukrgasbank; returns an error (never raises) if no recognisable table.
+    """
+    import io as _io
+    try:
+        import pdfplumber
+    except Exception:
+        return [], ['Обробка PDF недоступна на сервері.']
+
+    def _norm(s):
+        return ''.join((s or '').split()).lower()
+
+    tables = []
+    try:
+        with pdfplumber.open(_io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                for tbl in (page.extract_tables() or []):
+                    tables.append(tbl)
+    except Exception as exc:
+        return [], [f'Не вдалося прочитати PDF: {type(exc).__name__}']
+    if not tables:
+        return [], ['У PDF не знайдено таблиці операцій (можливо, це скан-картинка).']
+
+    col = None
+    for tbl in tables:
+        for r in tbl:
+            joined = _norm(' '.join(c or '' for c in r))
+            if 'напрям' in joined and 'опис' in joined:
+                mapping = {}
+                for i, c in enumerate(r):
+                    cn = _norm(c)
+                    if 'дата' in cn and 'час' in cn:
+                        mapping['date'] = i
+                    elif 'напрям' in cn:
+                        mapping['dir'] = i
+                    elif 'опис' in cn:
+                        mapping['desc'] = i
+                    elif 'сума' in cn and 'валют' not in cn and 'коміс' not in cn and 'рахунк' not in cn:
+                        mapping.setdefault('amount', i)
+                    elif cn.startswith('валют') and 'рахунк' not in cn:
+                        mapping.setdefault('cur', i)
+                col = mapping
+                break
+        if col:
+            break
+    if not col or 'date' not in col or 'amount' not in col:
+        return [], ['Не вдалося розпізнати формат виписки PDF.']
+
+    date_re = re.compile(r'(\d{2})-(\d{2})-(\d{4})')
+    rows, errors, line = [], [], 0
+    for tbl in tables:
+        for r in tbl:
+            joined = _norm(' '.join(c or '' for c in r))
+            if 'напрям' in joined and 'опис' in joined:
+                continue
+            dcell = r[col['date']] if col['date'] < len(r) else ''
+            match = date_re.search(dcell or '')
+            if not match:
+                continue
+            line += 1
+            dd, mm, yyyy = match.groups()
+            date = f'{yyyy}-{mm}-{dd}'
+            direction = (r[col['dir']] if col.get('dir', 99) < len(r) else '') or ''
+            t_type = 'income' if 'зарах' in _norm(direction) else 'expense'
+            desc = ' '.join(((r[col['desc']] if col.get('desc', 99) < len(r) else '') or '').split())
+            amount = _parse_import_amount(r[col['amount']] if col['amount'] < len(r) else '')
+            if amount is None or amount == 0:
+                errors.append(f'рядок {line}: не вдалося розпізнати суму')
+                continue
+            currency = ((r[col.get('cur', 99)] if col.get('cur', 99) < len(r)
+                         else default_currency) or default_currency).strip().upper()
+            if currency not in ('UAH', 'USD', 'EUR'):
+                currency = default_currency
+            rows.append({'date': date, 'type': t_type, 'amount': abs(amount),
+                         'currency': currency, 'description': desc[:200], 'line': line})
+    return rows, errors
+
+
 # Category labels are currently the relationship key. Keep all dependent-table
 # writes in these registries so a future recurring-operations table can join
 # the same atomic rename/delete transaction with one explicit hook.
@@ -8450,10 +8533,11 @@ async def api_admin_feedback(request: web.Request):
 # ========== CSV IMPORT (Block 4) ==========
 MAX_IMPORT_CSV_CHARS = 200_000
 MAX_IMPORT_ROWS = 2000
+MAX_IMPORT_PDF_BYTES = 12 * 1024 * 1024  # 12 MB
 
 
 async def api_import_preview(request: web.Request):
-    """Parse an uploaded bank-statement CSV and flag likely duplicates.
+    """Parse an uploaded bank-statement CSV or PDF and flag likely duplicates.
 
     Read-only: never writes a transaction or a batch.  The Mini App renders the
     parsed rows for review/correction, then calls POST /api/import/confirm.
@@ -8466,20 +8550,33 @@ async def api_import_preview(request: web.Request):
     if not isinstance(body, dict):
         return _json_response({'detail': 'JSON body must be an object'}, status=400)
 
-    raw = body.get('csv')
-    if not isinstance(raw, str) or not raw.strip():
-        return _json_response({'detail': 'csv required (non-empty string)'}, status=400)
-    if len(raw) > MAX_IMPORT_CSV_CHARS:
-        return _json_response(
-            {'detail': f'csv too large (max {MAX_IMPORT_CSV_CHARS} characters)'},
-            status=400,
-        )
-
     default_currency = str(body.get('currency', 'UAH')).upper()
     if default_currency not in ('UAH', 'USD', 'EUR'):
         default_currency = 'UAH'
 
-    rows, errors = parse_import_csv(raw, default_currency=default_currency)
+    pdf_b64 = body.get('pdf_base64')
+    csv_raw = body.get('csv')
+    if pdf_b64:
+        import base64
+        try:
+            pdf_bytes = base64.b64decode(str(pdf_b64))
+        except Exception:
+            return _json_response({'detail': 'invalid pdf_base64'}, status=400)
+        if not pdf_bytes.startswith(b'%PDF'):
+            return _json_response({'detail': 'not a PDF file'}, status=400)
+        if len(pdf_bytes) > MAX_IMPORT_PDF_BYTES:
+            return _json_response(
+                {'detail': f'PDF too large (max {MAX_IMPORT_PDF_BYTES // (1024 * 1024)} MB)'},
+                status=400)
+        rows, errors = parse_import_pdf(pdf_bytes, default_currency=default_currency)
+    elif isinstance(csv_raw, str) and csv_raw.strip():
+        if len(csv_raw) > MAX_IMPORT_CSV_CHARS:
+            return _json_response(
+                {'detail': f'csv too large (max {MAX_IMPORT_CSV_CHARS} characters)'},
+                status=400)
+        rows, errors = parse_import_csv(csv_raw, default_currency=default_currency)
+    else:
+        return _json_response({'detail': 'csv or pdf_base64 required'}, status=400)
     if len(rows) > MAX_IMPORT_ROWS:
         return _json_response(
             {'detail': f'too many rows (max {MAX_IMPORT_ROWS})'}, status=400

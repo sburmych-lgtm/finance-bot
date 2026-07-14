@@ -13,3 +13,8 @@ venv/
 .idea/
 .vscode/
 .claude/
+
+# Bank statement samples — contain personal data, never commit
+sample_statement.pdf
+*_statement.pdf
+*bank_statement*

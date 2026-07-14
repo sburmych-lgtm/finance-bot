@@ -14,7 +14,7 @@ import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
 import { toast, esc, fmtDate, setHTML } from '../ui.js';
 
-const MAX_FILE_BYTES = 2 * 1024 * 1024; // 2 MB — matches the server's char cap
+const MAX_FILE_BYTES = 12 * 1024 * 1024; // 12 MB — covers multi-page PDF statements
 
 const state = {
   step: 'input',   // 'input' | 'preview'
@@ -54,12 +54,15 @@ function screenRoot(node) {
 }
 
 // ── Preview / confirm / rollback actions ───────────────────────
-async function doPreview(root, csv, source) {
-  if (!csv || !csv.trim()) { toast('Порожній файл або текст'); return; }
+// payload is {csv} for text/CSV or {pdf_base64} for a PDF upload.
+async function doPreview(root, payload, source) {
+  if (!payload || (!payload.pdf_base64 && !(payload.csv || '').trim())) {
+    toast('Порожній файл або текст'); return;
+  }
   state.busy = true;
   renderBody(root);
   try {
-    const res = await Api.importPreview(csv);
+    const res = await Api.importPreview(payload);
     state.rows = (res.rows || []).map((r) => ({
       ...r,
       category: 'Інше',
@@ -177,17 +180,17 @@ async function loadBatches(root) {
 function renderInput(body) {
   setHTML(body, `
     <div class="panel import-intro">
-      <div class="import-intro-title">Імпорт виписки CSV</div>
+      <div class="import-intro-title">Імпорт виписки (CSV або PDF)</div>
       <div class="import-intro-text">
-        Завантажте CSV-виписку з банку (Приват24, монобанк, будь-який експорт).
-        Ми розпізнаємо дату, суму й опис, покажемо для перевірки та позначимо можливі
-        дублікати. Нічого не запишеться, поки ви не підтвердите.
+        Завантажте виписку з банку — <b>CSV</b> або <b>PDF</b> (Укргазбанк, Приват24,
+        монобанк тощо). Ми розпізнаємо дату, суму й опис, покажемо для перевірки та
+        позначимо можливі дублікати. Нічого не запишеться, поки ви не підтвердите.
       </div>
     </div>
 
     <div class="setting-section">
-      <label class="btn btn-primary import-file-btn" for="importFile">📄 Обрати файл CSV</label>
-      <input type="file" id="importFile" accept=".csv,text/csv,text/plain" hidden>
+      <label class="btn btn-primary import-file-btn" for="importFile">📄 Обрати файл (CSV або PDF)</label>
+      <input type="file" id="importFile" accept=".csv,text/csv,text/plain,.pdf,application/pdf" hidden>
     </div>
 
     <div class="setting-section">
@@ -206,15 +209,25 @@ function renderInput(body) {
   fileInput?.addEventListener('change', () => {
     const file = fileInput.files && fileInput.files[0];
     if (!file) return;
-    if (file.size > MAX_FILE_BYTES) { toast('Файл завеликий (макс 2 МБ)'); fileInput.value = ''; return; }
+    if (file.size > MAX_FILE_BYTES) { toast('Файл завеликий (макс 12 МБ)'); fileInput.value = ''; return; }
+    const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
     const reader = new FileReader();
-    reader.onload = () => doPreview(screenRoot(body), String(reader.result || ''), file.name);
     reader.onerror = () => toast('Не вдалося прочитати файл');
-    reader.readAsText(file, 'utf-8');
+    if (isPdf) {
+      reader.onload = () => {
+        const result = String(reader.result || '');
+        const b64 = result.includes('base64,') ? result.split('base64,')[1] : '';
+        doPreview(screenRoot(body), { pdf_base64: b64 }, file.name);
+      };
+      reader.readAsDataURL(file);
+    } else {
+      reader.onload = () => doPreview(screenRoot(body), { csv: String(reader.result || '') }, file.name);
+      reader.readAsText(file, 'utf-8');
+    }
   });
   body.querySelector('#importParseBtn')?.addEventListener('click', () => {
     const txt = body.querySelector('#importPaste')?.value || '';
-    doPreview(screenRoot(body), txt, 'вставлений текст');
+    doPreview(screenRoot(body), { csv: txt }, 'вставлений текст');
   });
 }
 

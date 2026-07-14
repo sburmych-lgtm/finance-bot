@@ -50,3 +50,14 @@ def test_csv_bad_row_is_reported_not_dropped_silently():
 def test_csv_empty():
     rows, errors = bot.parse_import_csv("")
     assert rows == [] and errors
+
+
+def test_pdf_bad_input_is_graceful():
+    # non-PDF bytes must never crash — returns ([], [error])
+    rows, errors = bot.parse_import_pdf(b'this is not a pdf')
+    assert rows == [] and errors
+
+
+def test_pdf_empty_is_graceful():
+    rows, errors = bot.parse_import_pdf(b'')
+    assert rows == [] and errors
