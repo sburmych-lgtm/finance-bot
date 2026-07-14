@@ -553,7 +553,11 @@ async def api_payment_claim(request: web.Request):
     user_id = str(request['user_id'])
     tg_user = request.get('tg_user') or {}
     now = _time.monotonic()
-    if now - _payment_claim_at.get(user_id, 0) < 60:
+    last = _payment_claim_at.get(user_id)
+    # Throttle only against a real prior claim — never against the 0 default,
+    # which on a freshly-booted process (small monotonic) would wrongly gate
+    # a first-time claimant within the first 60s after a deploy.
+    if last is not None and now - last < 60:
         return _json_response({
             'ok': True, 'throttled': True,
             'message': 'Заявку вже надіслано, очікуйте підтвердження.',

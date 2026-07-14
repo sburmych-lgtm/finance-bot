@@ -207,6 +207,34 @@ def test_payment_claim_notifies_then_activation_grants_write(monkeypatch, tmp_pa
     assert allowed in (200, 201)               # activation restored write access
 
 
+def test_first_payment_claim_not_throttled_on_fresh_monotonic_clock(monkeypatch, tmp_path):
+    # Regression: right after a container boot/redeploy time.monotonic() is a
+    # small number, so a first-time claimant (no prior timestamp, default 0)
+    # must NOT be mistaken for a repeat inside the 60s throttle window.
+    use_db(monkeypatch, tmp_path)
+    token = "gate-token"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
+    flags(monkeypatch, paywall=True, admins={"admin1"})
+    monkeypatch.setattr(bot, "TRIAL_DAYS", 0)
+    monkeypatch.setattr("time.monotonic", lambda: 5.0)  # fresh clock, well under 60
+    monkeypatch.setattr(bot, "_tg_http_send", _always_send)
+    bot._payment_claim_at.clear()
+
+    async def exercise():
+        async with TestClient(TestServer(bot.build_api_app())) as client:
+            claim = await client.post("/api/payment/claim", headers=_auth(token, "buyer"))
+            return claim.status, await claim.json()
+
+    status, body = run(exercise())
+    assert status == 200
+    assert body.get("throttled") is not True    # first claim must go through
+    assert body["admins_notified"] == 1
+
+
+async def _always_send(chat_id, text, reply_markup=None):
+    return True
+
+
 def test_admin_paywalled_when_admin_is_vip_off_but_keeps_admin(monkeypatch, tmp_path):
     use_db(monkeypatch, tmp_path)
     flags(monkeypatch, paywall=True, admins={"boss"})
