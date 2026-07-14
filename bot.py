@@ -2344,6 +2344,16 @@ class Database:
             ))
             self.conn.commit()
 
+    async def list_reminder_subscriptions(self):
+        """Trial/paid subscriptions with an expiry — candidates for reminders."""
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT user_id, plan, expires_at FROM subscriptions "
+                "WHERE expires_at IS NOT NULL AND plan IN ('trial', 'active', 'paid')"
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
     async def save_category_rename(
         self, user_id, category_type, old_name, new_name, settings,
         *, removed_subcategories=(),
@@ -7496,6 +7506,70 @@ async def weekly_digest_job(context: ContextTypes.DEFAULT_TYPE, *, today=None):
     logger.info('weekly digest scheduled job complete: %s', result)
 
 
+async def subscription_reminders_job(context: ContextTypes.DEFAULT_TYPE, *, now=None):
+    """Daily: nudge users whose trial/subscription is about to end or just ended.
+    Deduped via notification_deliveries (one message per expiry date + kind)."""
+    if not PAYWALL_ENABLED:
+        return {'sent': 0, 'skipped': 'paywall off'}
+    now = now or _sub_now()
+    try:
+        rows = await db.list_reminder_subscriptions()
+    except Exception as exc:
+        logger.warning('subscription reminders: list failed %s', exc)
+        return {'sent': 0}
+    price, jar = SUBSCRIPTION_PRICE_UAH, PAYMENT_JAR_URL
+    pay_line = f"\nОплата на банку: {jar}" if jar else ""
+    sent = 0
+    for row in rows:
+        uid = str(row.get('user_id'))
+        if is_vip(uid):
+            continue
+        expires = _parse_sub_dt(row.get('expires_at'))
+        if not expires:
+            continue
+        is_trial = (row.get('plan') == 'trial')
+        secs = (expires - now).total_seconds()
+        period_key = str(row.get('expires_at'))[:10]
+        kind = text = None
+        if expires > now:
+            window = 86400 * (1.2 if is_trial else 3.2)
+            if secs <= window:
+                left = max(1, math.ceil(secs / 86400))
+                kind = 'trial_ending' if is_trial else 'sub_ending'
+                text = (
+                    (f"🎁 Ваш безкоштовний період закінчується за {left} дн.\n"
+                     f"Щоб не втратити доступ до додавання операцій — оформіть підписку {price} ₴/міс.")
+                    if is_trial else
+                    (f"🔔 Ваша підписка закінчується за {left} дн.\n"
+                     f"Продовжіть її, щоб не втратити доступ.")
+                ) + pay_line
+        elif secs >= -86400 * 2:  # expired within the last ~2 days
+            kind = 'trial_expired' if is_trial else 'sub_expired'
+            text = (
+                (f"⏳ Безкоштовний період завершився.\n"
+                 f"Оформіть підписку {price} ₴/міс, щоб знову додавати операції. "
+                 f"Переглядати дані та звіти можна далі безкоштовно.")
+                if is_trial else
+                (f"⏳ Підписка завершилась.\n"
+                 f"Продовжіть її, щоб додавати операції.")
+            ) + pay_line
+        if not kind:
+            continue
+        if not await db.claim_notification_delivery(uid, kind, period_key):
+            continue
+        try:
+            msg = await context.bot.send_message(
+                chat_id=int(uid), text=text, disable_web_page_preview=True)
+            await db.finish_notification_delivery(
+                uid, kind, period_key, 'sent', message_id=getattr(msg, 'message_id', None))
+            sent += 1
+        except Exception as exc:
+            await db.finish_notification_delivery(
+                uid, kind, period_key, 'failed', error=str(exc)[:200])
+    logger.info('subscription reminders: sent %s', sent)
+    return {'sent': sent}
+
+
 # ---- reports parity ----
 
 async def api_report_employees(request: web.Request):
@@ -8960,8 +9034,14 @@ def main():
             time=_dt.time(hour=19, minute=0, tzinfo=KYIV_TZ),
             name='weekly_digest',
         )
+        application.job_queue.run_daily(
+            subscription_reminders_job,
+            time=_dt.time(hour=10, minute=0, tzinfo=KYIV_TZ),
+            name='subscription_reminders',
+        )
         logger.info(
-            "Scheduled jobs enabled: backup, recurring operations, weekly digest"
+            "Scheduled jobs enabled: backup, recurring operations, weekly digest, "
+            "subscription reminders"
         )
     elif not ENABLE_SCHEDULED_JOBS:
         logger.info("Scheduled jobs disabled by ENABLE_SCHEDULED_JOBS")

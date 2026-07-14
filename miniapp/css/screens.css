@@ -690,3 +690,13 @@
 .paywall-text { font-size: var(--fs-13); line-height: 1.5; color: var(--ruby-muted); margin-bottom: var(--sp-2); }
 .paywall-card .btn { width: 100%; }
 .paywall-pay { text-decoration: none; display: flex; align-items: center; justify-content: center; }
+
+/* ── Subscription banner (Крок 5) ─────────────────────────────── */
+.sub-banner { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); margin-bottom: var(--sp-4); border-radius: 14px; border: 1px solid var(--ruby-line); background: rgba(255,255,255,.04); }
+.sub-banner-icon { font-size: var(--fs-17); flex: 0 0 auto; }
+.sub-banner-text { flex: 1 1 auto; font-size: var(--fs-13); color: var(--ruby-ivory); line-height: 1.35; }
+.sub-banner-arrow { flex: 0 0 auto; color: var(--ruby-muted); font-size: var(--fs-20); }
+.sub-banner-trial { border-color: var(--ruby-gold-soft); background: linear-gradient(180deg, rgba(212,181,109,.12), rgba(255,255,255,.03)); cursor: pointer; }
+.sub-banner-active { border-color: rgba(111,182,126,.4); background: rgba(111,182,126,.10); }
+.sub-banner-active .sub-banner-icon { color: var(--ruby-success); }
+.sub-banner-cta { border-color: var(--ruby-gold); background: linear-gradient(180deg, rgba(212,181,109,.18), rgba(155,27,48,.10)); cursor: pointer; }

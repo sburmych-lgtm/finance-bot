@@ -3,7 +3,7 @@
 import { Store } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
-import { fmtMoney, fmtAmount, fmtDate, esc, toast, setHTML } from '../ui.js';
+import { fmtMoney, fmtAmount, fmtDate, esc, toast, setHTML, el } from '../ui.js';
 import { normalizeBudgetResponse, paymentSourceLabel, budgetTone } from '../block2-ui.js';
 import { insightPresentation, normalizeInsights } from '../automation-ui.js';
 import { findDirectSectionHead } from '../home-layout.js';
@@ -18,7 +18,52 @@ const CATEGORY_LETTER = {
 function letter(cat) { return CATEGORY_LETTER[cat] || (cat?.[0] || '•').toUpperCase(); }
 let insightGeneration = 0;
 
+function pluralDays(n) {
+  const a = Math.abs(n) % 100, b = a % 10;
+  if (a > 10 && a < 20) return 'днів';
+  if (b === 1) return 'день';
+  if (b >= 2 && b <= 4) return 'дні';
+  return 'днів';
+}
+
+// Subscription banner at the top of Home — only while the paywall is active and
+// the user is not VIP. Tapping opens the paywall (subscribe / start trial).
+function renderSubscriptionBanner() {
+  const host = document.getElementById('screen-home');
+  if (!host) return;
+  document.getElementById('subBanner')?.remove();
+  const sub = Store.user && Store.user.subscription;
+  if (!sub || !sub.paywall_enabled || sub.state === 'vip') return;
+
+  let cls = 'sub-banner', icon = '', text = '', tappable = true;
+  if (sub.state === 'trial') {
+    const d = sub.days_left ?? 0;
+    icon = '🎁'; text = `Безкоштовний період: залишилось ${d} ${pluralDays(d)}`;
+    cls += ' sub-banner-trial';
+  } else if (sub.state === 'active') {
+    icon = '✓'; text = `Підписка активна · ще ${sub.days_left} ${pluralDays(sub.days_left)}`;
+    cls += ' sub-banner-active'; tappable = false;
+  } else if (sub.state === 'new') {
+    icon = '🎁'; text = 'Спробуйте 7 днів безкоштовно або оформіть підписку';
+    cls += ' sub-banner-cta';
+  } else {
+    icon = '🔒'; text = 'Додавання обмежено — оформіть підписку';
+    cls += ' sub-banner-cta';
+  }
+
+  const banner = el('div', { id: 'subBanner', class: cls },
+    el('span', { class: 'sub-banner-icon' }, icon),
+    el('span', { class: 'sub-banner-text' }, text));
+  if (tappable) {
+    banner.appendChild(el('span', { class: 'sub-banner-arrow' }, '›'));
+    banner.addEventListener('click', () => window.dispatchEvent(
+      new CustomEvent('ruby:paywall', { detail: sub })));
+  }
+  host.insertBefore(banner, host.firstChild);
+}
+
 export function renderHome() {
+  renderSubscriptionBanner();
   const card = document.querySelector('#screen-home .balance-card');
   if (!card) return;
 

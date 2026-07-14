@@ -249,3 +249,38 @@ def test_admin_subscription_reset_expire_and_guard(monkeypatch, tmp_path):
     assert reset_body["state"] == "new"       # reset → fresh, trial-eligible again
     assert exp_body["state"] == "expired"     # expire → paywall (trial used)
     assert forbid == 403
+
+
+def test_subscription_reminders_sends_and_dedups(monkeypatch, tmp_path):
+    database = use_db(monkeypatch, tmp_path)
+    flags(monkeypatch, paywall=True, vip={"vipuser"})
+    monkeypatch.setattr(bot, "PAYMENT_JAR_URL", "https://send.monobank.ua/jar/x")
+    now = bot._sub_now()
+
+    def at(delta):
+        return (now + delta).strftime("%Y-%m-%d %H:%M:%S")
+
+    flags(monkeypatch, paywall=True, vip={"5554"})  # real ids are numeric
+    run(database.set_subscription("5551", "trial", at(timedelta(hours=12))))   # ending soon
+    run(database.set_subscription("5552", "trial", at(timedelta(hours=-3))))   # just expired
+    run(database.set_subscription("5553", "trial", at(timedelta(days=5))))     # plenty of time
+    run(database.set_subscription("5554", "trial", at(timedelta(hours=6))))    # VIP → skip
+
+    sent = []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, **kw):
+            sent.append(str(chat_id))
+            return type("M", (), {"message_id": 7})()
+
+    ctx = type("Ctx", (), {"bot": FakeBot()})()
+
+    res = run(bot.subscription_reminders_job(ctx, now=now))
+    ids = set(sent)
+    assert "5551" in ids and "5552" in ids
+    assert "5553" not in ids and "5554" not in ids
+    assert res["sent"] == 2
+
+    sent.clear()  # dedup: nothing re-sends
+    run(bot.subscription_reminders_job(ctx, now=now))
+    assert sent == []
