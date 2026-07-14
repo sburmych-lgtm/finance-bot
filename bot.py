@@ -549,6 +549,33 @@ async def api_payment_claim(request: web.Request):
         'message': 'Дякуємо! Заявку надіслано, очікуйте підтвердження.',
     })
 
+
+async def api_admin_subscription(request: web.Request):
+    """Admin subscription tool: reset (→ fresh/trial), expire (→ paywall), or
+    grant (→ paid). Handy for testing and for comping users."""
+    if not is_admin(request['user_id']):
+        return _json_response({'detail': 'admin only'}, status=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response({'detail': 'Invalid JSON'}, status=400)
+    target = str((body or {}).get('user_id') or '').strip()
+    action = (body or {}).get('action')
+    if not target:
+        return _json_response({'detail': 'user_id required'}, status=400)
+    if action == 'reset':
+        await db.delete_subscription(target)
+    elif action == 'expire':
+        await db.set_subscription(target, 'trial', '2000-01-01 00:00:00')
+    elif action == 'grant':
+        await _activate_paid_subscription(target)
+    else:
+        return _json_response({'detail': 'action must be reset, expire, or grant'}, status=400)
+    status = await subscription_status(target)
+    logger.info(f"admin {request['user_id']} subscription {action} for {target} → {status['state']}")
+    return _json_response({'ok': True, 'user_id': target, 'action': action,
+                          'state': status['state'], 'days_left': status['days_left']})
+
 # Exchange rate cache
 exchange_rates_cache = {
     'USD': None,
@@ -1587,6 +1614,13 @@ class Database:
                     updated_at=CURRENT_TIMESTAMP
             ''', (str(user_id), plan, expires_at))
             self.conn.commit()
+
+    async def delete_subscription(self, user_id):
+        async with db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM subscriptions WHERE user_id = ?", (str(user_id),))
+            self.conn.commit()
+            return cursor.rowcount
 
     async def add_transaction(self, user_id, amount, currency, amount_uah, t_type,
                              category, description, date, timestamp, subcategory=None,
@@ -8693,8 +8727,9 @@ def build_api_app() -> web.Application:
     app.router.add_route('POST', '/api/import/confirm', api_import_confirm)
     app.router.add_route('GET', '/api/import/batches', api_import_batches_list)
     app.router.add_route('DELETE', '/api/import/batches/{id}', api_import_batch_delete)
-    # Monetization (Крок 5) — manual «Я оплатив» claim
+    # Monetization (Крок 5) — manual «Я оплатив» claim + admin subscription tool
     app.router.add_route('POST', '/api/payment/claim', api_payment_claim)
+    app.router.add_route('POST', '/api/admin/subscription', api_admin_subscription)
 
     # Catch-all OPTIONS for CORS preflight on any path
     async def options_handler(_request):

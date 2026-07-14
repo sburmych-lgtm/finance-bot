@@ -215,3 +215,31 @@ def test_admin_paywalled_when_admin_is_vip_off_but_keeps_admin(monkeypatch, tmp_
     monkeypatch.setattr(bot, "ADMIN_IS_VIP", True)
     assert run(bot.has_access("boss")) is True
     assert run(bot.subscription_status("boss"))["state"] == "vip"
+
+
+def test_admin_subscription_reset_expire_and_guard(monkeypatch, tmp_path):
+    database = use_db(monkeypatch, tmp_path)
+    token = "gate-token"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
+    flags(monkeypatch, paywall=True, admins={"boss"})
+    monkeypatch.setattr(bot, "TRIAL_DAYS", 5)
+    monkeypatch.setattr(bot, "ADMIN_IS_VIP", False)
+
+    async def exercise():
+        async with TestClient(TestServer(bot.build_api_app())) as client:
+            await database.set_subscription("boss", "active", future(30))
+            reset = await client.post("/api/admin/subscription", headers=_auth(token, "boss"),
+                                      json={"user_id": "boss", "action": "reset"})
+            reset_body = await reset.json()
+            exp = await client.post("/api/admin/subscription", headers=_auth(token, "boss"),
+                                    json={"user_id": "boss", "action": "expire"})
+            exp_body = await exp.json()
+            forbid = await client.post("/api/admin/subscription", headers=_auth(token, "rando"),
+                                       json={"user_id": "boss", "action": "reset"})
+            return reset.status, reset_body, exp_body, forbid.status
+
+    status, reset_body, exp_body, forbid = run(exercise())
+    assert status == 200
+    assert reset_body["state"] == "trial" and reset_body["days_left"] == 5
+    assert exp_body["state"] == "expired"
+    assert forbid == 403
