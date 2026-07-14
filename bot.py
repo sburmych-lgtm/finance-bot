@@ -223,6 +223,9 @@ ADMIN_IDS = {x.strip() for x in os.environ.get('ADMIN_IDS', '').split(',') if x.
 # Flip it on only after PAYMENT_JAR_URL + PRICE_UAH are set in Railway env.
 PAYWALL_ENABLED = os.environ.get('PAYWALL_ENABLED', '').strip().lower() in ('1', 'true', 'yes', 'on')
 VIP_IDS = {x.strip() for x in os.environ.get('VIP_IDS', '').split(',') if x.strip()}
+# Admins are VIP (paywall-exempt) by default. Set ADMIN_IS_VIP=0 to let an admin
+# hit the paywall too (keeps confirm powers) — handy for self-testing payments.
+ADMIN_IS_VIP = os.environ.get('ADMIN_IS_VIP', '1').strip().lower() not in ('0', 'false', 'no', 'off')
 TRIAL_DAYS = int(os.environ.get('TRIAL_DAYS', '5') or 5)
 SUBSCRIPTION_DAYS = int(os.environ.get('SUBSCRIPTION_DAYS', '30') or 30)
 SUBSCRIPTION_PRICE_UAH = int(os.environ.get('PRICE_UAH', '199') or 199)
@@ -363,8 +366,8 @@ def is_admin(user_id) -> bool:
 
 
 def is_vip(user_id) -> bool:
-    """Free-forever: admins + explicit VIP ids (owner + Olesia)."""
-    return is_admin(user_id) or str(user_id) in VIP_IDS
+    """Free-forever: admins (unless ADMIN_IS_VIP off) + explicit VIP ids."""
+    return (ADMIN_IS_VIP and is_admin(user_id)) or str(user_id) in VIP_IDS
 
 
 def _sub_now():

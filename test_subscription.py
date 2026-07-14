@@ -199,3 +199,19 @@ def test_payment_claim_notifies_then_activation_grants_write(monkeypatch, tmp_pa
     assert body["admins_notified"] == 1        # the one admin was pinged
     assert len(sent) == 1 and sent[0][0] == "admin1"
     assert allowed in (200, 201)               # activation restored write access
+
+
+def test_admin_paywalled_when_admin_is_vip_off_but_keeps_admin(monkeypatch, tmp_path):
+    use_db(monkeypatch, tmp_path)
+    flags(monkeypatch, paywall=True, admins={"boss"})
+    monkeypatch.setattr(bot, "TRIAL_DAYS", 0)
+    monkeypatch.setattr(bot, "ADMIN_IS_VIP", False)
+    # admin no longer VIP → hits the paywall
+    assert run(bot.has_access("boss")) is False
+    assert run(bot.subscription_status("boss"))["state"] == "expired"
+    # but keeps admin powers (can confirm payments)
+    assert bot.is_admin("boss") is True
+    # flip back → admin is VIP again
+    monkeypatch.setattr(bot, "ADMIN_IS_VIP", True)
+    assert run(bot.has_access("boss")) is True
+    assert run(bot.subscription_status("boss"))["state"] == "vip"
