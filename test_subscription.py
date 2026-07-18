@@ -235,6 +235,24 @@ async def _always_send(chat_id, text, reply_markup=None):
     return True
 
 
+def test_plural_days_ukrainian_forms():
+    assert bot._plural_days(1) == 'день'
+    assert bot._plural_days(2) == 'дні'
+    assert bot._plural_days(5) == 'днів'
+    assert bot._plural_days(11) == 'днів'   # 11-19 always «днів»
+    assert bot._plural_days(14) == 'днів'
+    assert bot._plural_days(21) == 'день'   # «21 день», not «21 днів»
+    assert bot._plural_days(22) == 'дні'
+    assert bot._plural_days(25) == 'днів'
+
+
+def test_paywall_text_declines_trial_length_correctly(monkeypatch):
+    monkeypatch.setattr(bot, 'TRIAL_DAYS', 21)
+    text = bot._paywall_bot_text({'trial_eligible': True})
+    assert '21 день' in text
+    assert '21 днів' not in text
+
+
 def test_admin_paywalled_when_admin_is_vip_off_but_keeps_admin(monkeypatch, tmp_path):
     use_db(monkeypatch, tmp_path)
     flags(monkeypatch, paywall=True, admins={"boss"})

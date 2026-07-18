@@ -68,3 +68,12 @@ export function el(tag, attrs = {}, ...children) {
   }
   return node;
 }
+
+// Ukrainian plural for «день»: 1/21 день · 2-4 дні · 5-20 днів.
+export function pluralDays(n) {
+  const a = Math.abs(n) % 100, b = a % 10;
+  if (a > 10 && a < 20) return 'днів';
+  if (b === 1) return 'день';
+  if (b >= 2 && b <= 4) return 'дні';
+  return 'днів';
+}

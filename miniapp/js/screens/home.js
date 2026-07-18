@@ -3,7 +3,7 @@
 import { Store } from '../app.js';
 import { Api } from '../api.js';
 import { Telegram } from '../telegram.js';
-import { fmtMoney, fmtAmount, fmtDate, esc, toast, setHTML, el } from '../ui.js';
+import { fmtMoney, fmtAmount, fmtDate, esc, toast, setHTML, el, pluralDays } from '../ui.js';
 import { normalizeBudgetResponse, paymentSourceLabel, budgetTone } from '../block2-ui.js';
 import { insightPresentation, normalizeInsights } from '../automation-ui.js';
 import { findDirectSectionHead } from '../home-layout.js';
@@ -17,14 +17,6 @@ const CATEGORY_LETTER = {
 
 function letter(cat) { return CATEGORY_LETTER[cat] || (cat?.[0] || '•').toUpperCase(); }
 let insightGeneration = 0;
-
-function pluralDays(n) {
-  const a = Math.abs(n) % 100, b = a % 10;
-  if (a > 10 && a < 20) return 'днів';
-  if (b === 1) return 'день';
-  if (b >= 2 && b <= 4) return 'дні';
-  return 'днів';
-}
 
 // Subscription banner at the top of Home — only while the paywall is active and
 // the user is not VIP. Tapping opens the paywall (subscribe / start trial).
@@ -44,7 +36,8 @@ function renderSubscriptionBanner() {
     icon = '✓'; text = `Підписка активна · ще ${sub.days_left} ${pluralDays(sub.days_left)}`;
     cls += ' sub-banner-active'; tappable = false;
   } else if (sub.state === 'new') {
-    icon = '🎁'; text = 'Спробуйте 7 днів безкоштовно або оформіть підписку';
+    const td = sub.trial_days ?? 21;
+    icon = '🎁'; text = `Спробуйте ${td} ${pluralDays(td)} безкоштовно або оформіть підписку`;
     cls += ' sub-banner-cta';
   } else {
     icon = '🔒'; text = 'Додавання обмежено — оформіть підписку';

@@ -226,7 +226,7 @@ VIP_IDS = {x.strip() for x in os.environ.get('VIP_IDS', '').split(',') if x.stri
 # Admins are VIP (paywall-exempt) by default. Set ADMIN_IS_VIP=0 to let an admin
 # hit the paywall too (keeps confirm powers) — handy for self-testing payments.
 ADMIN_IS_VIP = os.environ.get('ADMIN_IS_VIP', '1').strip().lower() not in ('0', 'false', 'no', 'off')
-TRIAL_DAYS = int(os.environ.get('TRIAL_DAYS', '7') or 7)
+TRIAL_DAYS = int(os.environ.get('TRIAL_DAYS', '21') or 21)
 SUBSCRIPTION_DAYS = int(os.environ.get('SUBSCRIPTION_DAYS', '30') or 30)
 SUBSCRIPTION_PRICE_UAH = int(os.environ.get('PRICE_UAH', '199') or 199)
 PAYMENT_JAR_URL = os.environ.get('PAYMENT_JAR_URL', '').strip()
@@ -466,6 +466,18 @@ def _paywall_api_response(status):
     }, status=402)
 
 
+def _plural_days(n):
+    """Ukrainian plural for «день»: 1/21 день · 2-4 дні · 5-20 днів."""
+    a, b = abs(n) % 100, abs(n) % 10
+    if 10 < a < 20:
+        return 'днів'
+    if b == 1:
+        return 'день'
+    if 2 <= b <= 4:
+        return 'дні'
+    return 'днів'
+
+
 def _paywall_bot_text(status=None):
     """Paywall message for the legacy bot save flows."""
     price = SUBSCRIPTION_PRICE_UAH
@@ -474,7 +486,7 @@ def _paywall_bot_text(status=None):
     lines = ["🔒 Щоб додавати операції, потрібен доступ.",
              "Переглядати наявні дані та звіти можна й далі, безкоштовно.\n"]
     if eligible:
-        lines.append(f"🎁 Спробуйте безкоштовно {TRIAL_DAYS} днів — або оформіть підписку {price} ₴/міс.")
+        lines.append(f"🎁 Спробуйте безкоштовно {TRIAL_DAYS} {_plural_days(TRIAL_DAYS)} — або оформіть підписку {price} ₴/міс.")
     else:
         lines.append(f"Оформіть підписку — {price} ₴/міс.")
     lines.append(f"\nОплата на банку 👇\n{jar}\nПісля оплати натисніть «✅ Я оплатив».")
@@ -486,7 +498,7 @@ def _paywall_bot_markup(status=None):
     rows = []
     if bool((status or {}).get('trial_eligible')):
         rows.append([InlineKeyboardButton(
-            f'🎁 Спробувати безкоштовно {TRIAL_DAYS} днів', callback_data='trial:start')])
+            f'🎁 Спробувати безкоштовно {TRIAL_DAYS} {_plural_days(TRIAL_DAYS)}', callback_data='trial:start')])
     try:
         url = _miniapp_public_url()
         if url:

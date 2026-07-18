@@ -2,7 +2,7 @@
 
 import { Telegram } from './telegram.js';
 import { Api } from './api.js';
-import { fmtMoney, fmtDate, toast, el } from './ui.js';
+import { fmtMoney, fmtDate, toast, el, pluralDays } from './ui.js';
 import { renderHome } from './screens/home.js';
 import { renderAdd } from './screens/add.js';
 import { renderReports } from './screens/reports.js';
@@ -71,7 +71,7 @@ window.Ruby = { Store, Api, Telegram, toast, fmtMoney, fmtDate };
 function showPaywallModal(pw = {}) {
   const price = pw.price || 199;
   const jar = pw.jar_url || '';
-  const trialDays = pw.trial_days || 7;
+  const trialDays = pw.trial_days || 21;
   const eligible = !!pw.trial_eligible;
   document.getElementById('paywallModal')?.remove();
 
@@ -80,18 +80,18 @@ function showPaywallModal(pw = {}) {
   card.appendChild(el('div', { class: 'paywall-title' },
     eligible ? 'Як продовжити?' : 'Потрібна підписка'));
   card.appendChild(el('div', { class: 'paywall-text' }, eligible
-    ? `Спробуйте безкоштовно ${trialDays} днів або оформіть підписку ${price} ₴/міс. Переглядати дані та звіти можна безкоштовно.`
+    ? `Спробуйте безкоштовно ${trialDays} ${pluralDays(trialDays)} або оформіть підписку ${price} ₴/міс. Переглядати дані та звіти можна безкоштовно.`
     : `Щоб додавати операції — ${price} ₴/міс. Переглядати дані та звіти можна безкоштовно.`));
 
   if (eligible) {
     const trialBtn = el('button', { class: 'btn btn-primary', type: 'button' },
-      `🎁 Спробувати безкоштовно ${trialDays} днів`);
+      `🎁 Спробувати безкоштовно ${trialDays} ${pluralDays(trialDays)}`);
     trialBtn.addEventListener('click', async () => {
       trialBtn.disabled = true;
       try {
         const r = await Api.trialStart();
         Telegram.haptic('success');
-        toast(r?.message || `Активовано ${trialDays} днів безкоштовно!`, 4000);
+        toast(r?.message || `Активовано ${trialDays} ${pluralDays(trialDays)} безкоштовно!`, 4000);
         document.getElementById('paywallModal')?.remove();
         await Store.hydrate();
       } catch (_) {
