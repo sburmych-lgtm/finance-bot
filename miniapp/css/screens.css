@@ -693,6 +693,14 @@
 .paywall-legal { font-size: 11px; line-height: 1.4; color: var(--ruby-muted); margin-top: var(--sp-1); }
 .paywall-legal a { color: var(--ruby-gold, #C6A15B); text-decoration: underline; }
 
+/* Counterparty (від кого / кому) on transaction rows */
+.row-party {
+  font-size: var(--fs-12); font-weight: 700;
+  color: var(--ruby-gold, #C6A15B);
+  margin: 1px 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
 /* ── Subscription banner (Крок 5) ─────────────────────────────── */
 .sub-banner { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); margin-bottom: var(--sp-4); border-radius: 14px; border: 1px solid var(--ruby-line); background: rgba(255,255,255,.04); }
 .sub-banner-icon { font-size: var(--fs-17); flex: 0 0 auto; }

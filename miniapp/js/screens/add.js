@@ -20,6 +20,7 @@ const state = {
   category: null,
   subcategory: null,  // optional, only when the chosen category has subcategories
   note: '',
+  counterparty: '',
   empOpen: false,  // employees-submenu collapse state
   submitting: false,
   submitError: '',
@@ -41,6 +42,7 @@ function resetDraftFields(nextMode = 'expense') {
   state.category = null;
   state.subcategory = null;
   state.note = '';
+  state.counterparty = '';
   state.empOpen = false;
 }
 
@@ -287,6 +289,12 @@ function template() {
         </div>`;
     })()}
 
+    ${isTime ? '' : `
+    <div class="field" style="margin-top: var(--sp-4);">
+      <label>${state.mode === 'income' ? 'Від кого (необов\'язково)' : 'Кому (необов\'язково)'}</label>
+      <input class="input" id="counterpartyInput" placeholder="${state.mode === 'income' ? 'напр. Іваненко О. / ТОВ «Ромашка»' : 'напр. орендодавцю, постачальнику'}" value="${esc(state.counterparty)}">
+    </div>`}
+
     <div class="field" style="margin-top: var(--sp-4);">
       <label>${isTime ? 'Опис (необов\'язково)' : 'Коментар (необов\'язково)'}</label>
       <input class="input" id="noteInput" placeholder="${isTime ? 'напр. підготовка позову' : 'напр. кава з клієнтом'}" value="${esc(state.note)}">
@@ -387,6 +395,7 @@ function applyQuickTemplate(item) {
   state.category = draft.category;
   state.subcategory = draft.subcategory;
   state.note = draft.note;
+  state.counterparty = '';  // a repeated template is a new entry — re-enter who
   state.empOpen = Boolean(draft.category?.startsWith(_empPrefix(draft.mode)));
   clearSubmitFeedback();
   Telegram.haptic('selection');
@@ -456,6 +465,7 @@ async function submitAdd(root) {
         currency: state.currency,
         category: state.category,
         subcategory: state.subcategory || undefined,
+        counterparty: state.counterparty || undefined,
         description: state.note || state.category,
         payment_source: state.paymentSource,
         client_request_id: state.clientRequestId,
@@ -567,6 +577,11 @@ function bind(root) {
     }
     syncSubmitDock(root);
   }));
+  root.querySelector('#counterpartyInput')?.addEventListener('input', (event) => {
+    state.counterparty = event.target.value;
+    clearSubmitFeedback();
+    syncSubmitDock(root);
+  });
   root.querySelector('#noteInput')?.addEventListener('input', (event) => {
     state.note = event.target.value;
     clearSubmitFeedback();

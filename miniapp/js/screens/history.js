@@ -168,6 +168,7 @@ function rowsList() {
           <div class="avatar">${esc(letter(t.category))}</div>
           <div>
             <div class="row-title">${esc(t.category || 'Інше')}</div>
+            ${t.counterparty ? `<div class="row-party">👤 ${esc(t.counterparty)}</div>` : ''}
             <div class="row-meta">${esc(String(t.description || '').slice(0, 40))}</div>
             <label class="source-edit-label">
               <span class="sr-only">Джерело коштів</span>

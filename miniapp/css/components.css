@@ -496,21 +496,25 @@ body::before {
 }
 .legend { display: flex; flex-direction: column; gap: 8px; }
 .legend-item {
-  display: grid; grid-template-columns: 10px 1fr auto;
+  display: grid; grid-template-columns: 10px minmax(0, 1fr) auto;
   gap: 10px; align-items: center;
   color: var(--ruby-muted);
   font-size: var(--fs-12); font-weight: 700;
 }
 .legend-item strong { color: var(--ruby-ivory); font-weight: 800; white-space: nowrap; }
+/* Long category names must truncate, never paint over the amount. */
+.legend-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .legend-item .legend-pct { color: var(--ruby-muted); font-weight: 700; margin-left: 2px; }
 .swatch { width: 10px; height: 10px; border-radius: 50%; }
 .bars { display: flex; flex-direction: column; gap: var(--sp-3); }
 .bar-meta {
-  display: flex; justify-content: space-between;
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 8px;
   font-size: var(--fs-12); font-weight: 700;
   color: var(--ruby-muted);
 }
-.bar-meta strong { color: var(--ruby-ivory); }
+.bar-meta strong { color: var(--ruby-ivory); flex: 0 0 auto; white-space: nowrap; }
+.bar-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bar-track {
   margin-top: 6px;
   height: 8px;

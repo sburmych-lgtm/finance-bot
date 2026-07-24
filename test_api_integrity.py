@@ -252,6 +252,32 @@ def test_transaction_rejects_unknown_category_or_wrong_subcategory(monkeypatch, 
     assert wrong_sub.status == 400
 
 
+def test_transaction_counterparty_roundtrips_and_normalizes(monkeypatch, tmp_path):
+    use_database(monkeypatch, tmp_path)
+    monkeypatch.setattr(bot, "get_exchange_rate", lambda currency: asyncio.sleep(0, result=1.0))
+
+    created = run(bot.api_post_transaction(Request(body={
+        "type": "expense", "amount": 500, "category": "Інше",
+        "counterparty": "  Орендодавець  ",
+    })))
+    assert created.status == 201
+    assert payload(created)["counterparty"] == "Орендодавець"   # trimmed
+
+    plain = run(bot.api_post_transaction(Request(body={
+        "type": "expense", "amount": 10, "category": "Інше",
+    })))
+    assert payload(plain)["counterparty"] is None               # absent -> null
+
+    blank = run(bot.api_post_transaction(Request(body={
+        "type": "expense", "amount": 10, "category": "Інше", "counterparty": "   ",
+    })))
+    assert payload(blank)["counterparty"] is None               # whitespace -> null
+
+    listed = run(bot.api_get_transactions(Request()))
+    parties = {r["counterparty"] for r in payload(listed)}
+    assert "Орендодавець" in parties                            # persisted + returned by GET
+
+
 def test_tax_rejects_non_finite_numbers(monkeypatch, tmp_path):
     use_database(monkeypatch, tmp_path)
     for field, value in (("single_tax_rate", "NaN"), ("esv_fixed", "Infinity")):

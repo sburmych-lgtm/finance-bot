@@ -265,7 +265,7 @@ function overviewMarkup(report, sourceSummary = {}, budgets = [], forecastState 
     return `
       <button type="button" class="legend-item drillable drill-row" data-drill="expense" data-drill-cat="${esc(s.name)}" aria-label="${esc(`Деталізувати витрати: ${s.name}, ${amount}`)}">
         <span class="swatch" style="background:${SLICE_COLORS[i % SLICE_COLORS.length]}"></span>
-        <span>${esc(s.name)}</span>
+        <span class="legend-name">${esc(s.name)}</span>
         <strong>${esc(amount)} <span class="legend-pct">(${pct}%)</span></strong>
         <span class="drill-chevron" aria-hidden="true">›</span>
       </button>`;
@@ -274,13 +274,13 @@ function overviewMarkup(report, sourceSummary = {}, budgets = [], forecastState 
     const amount = fmtAmount(v, 'UAH');
     return `
     <button type="button" class="drillable-bar drill-row" data-drill="income" data-drill-cat="${esc(k)}" aria-label="${esc(`Деталізувати дохід: ${k}, ${amount}`)}">
-      <div class="bar-meta"><span>${esc(k)}</span><strong>${esc(amount)}</strong><span class="drill-chevron" aria-hidden="true">›</span></div>
+      <div class="bar-meta"><span class="bar-name">${esc(k)}</span><strong>${esc(amount)}</strong><span class="drill-chevron" aria-hidden="true">›</span></div>
       <div class="bar-track"><div class="bar-fill" style="width:${Math.min(100, (v / (totalIncome || 1)) * 100).toFixed(0)}%"></div></div>
     </button>`;
   }).join('');
   const paymentSourceBars = paymentSources.map(({ label, value }) => `
     <div class="payment-report-row">
-      <div class="bar-meta"><span>${esc(label)}</span><strong>${esc(fmtAmount(value, 'UAH'))}</strong></div>
+      <div class="bar-meta"><span class="bar-name">${esc(label)}</span><strong>${esc(fmtAmount(value, 'UAH'))}</strong></div>
       <div class="bar-track"><div class="bar-fill" style="width:${Math.min(100, value / (paymentSourceTotal || 1) * 100).toFixed(0)}%"></div></div>
     </div>
   `).join('');

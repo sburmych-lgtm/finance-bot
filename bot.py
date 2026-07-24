@@ -1039,6 +1039,7 @@ class Database:
                 category TEXT NOT NULL,
                 subcategory TEXT,
                 description TEXT,
+                counterparty TEXT,
                 date DATE NOT NULL,
                 timestamp DATETIME NOT NULL,
                 client_request_id TEXT,
@@ -1406,6 +1407,22 @@ class Database:
             except Exception as e:
                 logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
 
+        mig = '20260720_add_counterparty'
+        if not applied(mig):
+            try:
+                cursor.execute("PRAGMA table_info(transactions)")
+                cols = {row[1] for row in cursor.fetchall()}
+                if 'counterparty' not in cols:
+                    cursor.execute(
+                        "ALTER TABLE transactions ADD COLUMN counterparty TEXT"
+                    )
+                    logger.info(
+                        f"Migration {mig}: added nullable transactions.counterparty"
+                    )
+                mark(mig)
+            except Exception as e:
+                logger.warning(f"Migration {mig} failed (will retry next boot): {e}")
+
         mig = '20260712_add_request_fingerprint'
         if not applied(mig):
             try:
@@ -1756,7 +1773,8 @@ class Database:
     async def add_transaction(self, user_id, amount, currency, amount_uah, t_type,
                              category, description, date, timestamp, subcategory=None,
                              client_request_id=None, payment_source=None,
-                             request_fingerprint=None, import_batch_id=None):
+                             request_fingerprint=None, import_batch_id=None,
+                             counterparty=None):
         """Add transaction to database"""
         async with db_lock:
             cursor = self.conn.cursor()
@@ -1765,12 +1783,12 @@ class Database:
                     INSERT INTO transactions
                     (user_id, amount, currency, amount_uah, type, category,
                      subcategory, description, date, timestamp, client_request_id,
-                     payment_source, request_fingerprint, import_batch_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     payment_source, request_fingerprint, import_batch_id, counterparty)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     user_id, amount, currency, amount_uah, t_type, category,
                     subcategory, description, date, timestamp, client_request_id,
-                    payment_source, request_fingerprint, import_batch_id,
+                    payment_source, request_fingerprint, import_batch_id, counterparty,
                 ))
                 self.conn.commit()
                 return cursor.lastrowid
@@ -6173,6 +6191,9 @@ async def api_get_transactions(request: web.Request):
                 r['payment_source'] if 'payment_source' in r.keys() else None
             ),
             'description': r['description'],
+            'counterparty': (
+                r['counterparty'] if 'counterparty' in r.keys() else None
+            ),
             'date': r['date'],
             'timestamp': r['timestamp'],
         }
@@ -6306,6 +6327,7 @@ def _transaction_write_response(row: dict, *, duplicate: bool):
         'subcategory': row.get('subcategory'),
         'payment_source': row.get('payment_source'),
         'description': row.get('description'),
+        'counterparty': row.get('counterparty'),
         'date': row['date'],
         'timestamp': row['timestamp'],
         'client_request_id': client_request_id,
@@ -6398,6 +6420,8 @@ async def api_post_transaction(request: web.Request):
     description = _clean_text(body.get('description'), max_len=200, default='')
     # Optional subcategory (hierarchical categories). None when absent/empty.
     subcategory = _clean_text(body.get('subcategory'), max_len=80, default='') or None
+    # Optional counterparty — from/to whom (surname or company). None when empty.
+    counterparty = _clean_text(body.get('counterparty'), max_len=100, default='') or None
     request_fingerprint = _transaction_request_fingerprint(
         amount=amount,
         currency=currency,
@@ -6469,6 +6493,7 @@ async def api_post_transaction(request: web.Request):
             client_request_id=client_request_id,
             payment_source=payment_source,
             request_fingerprint=request_fingerprint,
+            counterparty=counterparty,
         )
     except sqlite3.IntegrityError:
         # Two concurrent retries can both miss the preflight lookup. The
@@ -6519,6 +6544,7 @@ async def api_post_transaction(request: web.Request):
         'subcategory': subcategory,
         'payment_source': payment_source,
         'description': description,
+        'counterparty': counterparty,
         'date': date_str,
         'timestamp': ts_str,
         'client_request_id': client_request_id,
@@ -6559,6 +6585,7 @@ async def api_patch_transaction(request: web.Request):
         'subcategory': row.get('subcategory'),
         'payment_source': row.get('payment_source'),
         'description': row.get('description'),
+        'counterparty': row.get('counterparty'),
         'date': row['date'],
         'timestamp': row['timestamp'],
     })

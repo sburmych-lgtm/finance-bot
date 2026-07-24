@@ -96,6 +96,7 @@ export function renderHome() {
       <div class="avatar">${esc(letter(t.category))}</div>
       <div>
         <div class="row-title">${esc(t.category || 'Інше')}</div>
+        ${t.counterparty ? `<div class="row-party">👤 ${esc(t.counterparty)}</div>` : ''}
         <div class="row-meta">${esc(fmtDate(t.date))} · ${esc(paymentSourceLabel(t.payment_source))} · ${esc(String(t.description || '').slice(0, 32))}</div>
       </div>
       <div class="amount ${t.type === 'expense' ? 'expense' : 'income'}">${esc(fmtMoney(
